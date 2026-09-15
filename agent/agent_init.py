@@ -1990,6 +1990,10 @@ def init_agent(
     agent.session_cache_write_tokens = 0
     agent.session_reasoning_tokens = 0
     agent.session_estimated_cost_usd = 0.0
+    agent.session_actual_cost_usd = 0.0
+    agent.session_upstream_cost_usd = 0.0
+    agent.session_actual_cost_available = False
+    agent.session_usage_calls = []
     agent.session_cost_status = "unknown"
     agent.session_cost_source = "none"
     

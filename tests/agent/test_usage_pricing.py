@@ -39,6 +39,23 @@ def test_normalize_usage_openai_subtracts_cached_prompt_tokens():
     assert normalized.output_tokens == 700
 
 
+def test_normalize_usage_preserves_only_provider_billing_fields():
+    usage = SimpleNamespace(
+        prompt_tokens=10,
+        completion_tokens=2,
+        cost="0.00123",
+        cost_details=SimpleNamespace(upstream_inference_cost="0.00100"),
+        prompt="must not be retained",
+    )
+
+    normalized = normalize_usage(usage, provider="openrouter", api_mode="chat_completions")
+
+    assert normalized.raw_usage == {
+        "cost": "0.00123",
+        "cost_details": {"upstream_inference_cost": "0.00100"},
+    }
+
+
 def test_normalize_usage_openai_reads_top_level_anthropic_cache_fields():
     """Some OpenAI-compatible proxies (OpenRouter, Cline) expose
     Anthropic-style cache token counts at the top level of the usage object when

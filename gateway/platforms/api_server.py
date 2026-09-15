@@ -2059,6 +2059,9 @@ class APIServerAdapter(BasePlatformAdapter):
         system_prompt = body.get("system_message") or body.get("instructions")
         if system_prompt is not None and not isinstance(system_prompt, str):
             return web.json_response(_openai_error("system_message must be a string", code="invalid_system_message"), status=400)
+        provider_user_hash = request.headers.get("X-Atlas-Provider-User", "")
+        if provider_user_hash and not re.fullmatch(r"atlas-(?:system|[0-9a-f]{48})", provider_user_hash):
+            return web.json_response(_openai_error("Invalid provider user attribution", code="invalid_provider_user"), status=400)
         history = self._conversation_history_for_session(session_id)
         result, usage = await self._run_agent(
             user_message=user_message,
@@ -2066,6 +2069,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ephemeral_system_prompt=system_prompt,
             session_id=session_id,
             gateway_session_key=gateway_session_key,
+            provider_user_hash=provider_user_hash or None,
         )
         effective_session_id = result.get("session_id") if isinstance(result, dict) else session_id
         final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
@@ -2101,6 +2105,9 @@ class APIServerAdapter(BasePlatformAdapter):
         system_prompt = body.get("system_message") or body.get("instructions")
         if system_prompt is not None and not isinstance(system_prompt, str):
             return web.json_response(_openai_error("system_message must be a string", code="invalid_system_message"), status=400)
+        provider_user_hash = request.headers.get("X-Atlas-Provider-User", "")
+        if provider_user_hash and not re.fullmatch(r"atlas-(?:system|[0-9a-f]{48})", provider_user_hash):
+            return web.json_response(_openai_error("Invalid provider user attribution", code="invalid_provider_user"), status=400)
 
         loop = asyncio.get_running_loop()
         queue: "asyncio.Queue[Optional[tuple[str, Dict[str, Any]]]]" = asyncio.Queue()
@@ -2155,6 +2162,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     stream_delta_callback=_delta,
                     tool_progress_callback=_tool_progress,
                     gateway_session_key=gateway_session_key,
+                    provider_user_hash=provider_user_hash or None,
                 )
                 final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
                 effective_session_id = result.get("session_id", session_id) if isinstance(result, dict) else session_id
@@ -2545,6 +2553,13 @@ class APIServerAdapter(BasePlatformAdapter):
                 "prompt_tokens": usage.get("input_tokens", 0),
                 "completion_tokens": usage.get("output_tokens", 0),
                 "total_tokens": usage.get("total_tokens", 0),
+                "prompt_tokens_details": {
+                    "cached_tokens": usage.get("cache_read_tokens", 0),
+                    "cache_write_tokens": usage.get("cache_write_tokens", 0),
+                },
+                "completion_tokens_details": {"reasoning_tokens": usage.get("reasoning_tokens", 0)},
+                "cost": usage.get("actual_cost_usd") if usage.get("actual_cost_available") else None,
+                "cost_details": {"upstream_inference_cost": usage.get("upstream_cost_usd", 0)},
             },
         }
         if is_partial or is_failed or not completed:
@@ -4206,6 +4221,7 @@ class APIServerAdapter(BasePlatformAdapter):
         agent_ref: Optional[list] = None,
         gateway_session_key: Optional[str] = None,
         route: Optional[Dict[str, Any]] = None,
+        provider_user_hash: Optional[str] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -4243,6 +4259,10 @@ class APIServerAdapter(BasePlatformAdapter):
                     gateway_session_key=gateway_session_key,
                     route=route,
                 )
+                if provider_user_hash:
+                    overrides = dict(getattr(agent, "request_overrides", {}) or {})
+                    overrides["user"] = provider_user_hash
+                    agent.request_overrides = overrides
                 if agent_ref is not None:
                     agent_ref[0] = agent
                 effective_task_id = session_id or str(uuid.uuid4())
@@ -4256,6 +4276,23 @@ class APIServerAdapter(BasePlatformAdapter):
                     "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
                     "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
                 }
+                # Real AIAgent instances initialize these accounting fields.
+                # Keep lightweight third-party/test agent shims backward
+                # compatible and avoid serializing dynamically-created mocks.
+                if "session_actual_cost_available" in vars(agent):
+                    usage.update({
+                        "cache_read_tokens": getattr(agent, "session_cache_read_tokens", 0) or 0,
+                        "cache_write_tokens": getattr(agent, "session_cache_write_tokens", 0) or 0,
+                        "reasoning_tokens": getattr(agent, "session_reasoning_tokens", 0) or 0,
+                        "estimated_cost_usd": getattr(agent, "session_estimated_cost_usd", 0.0) or 0.0,
+                        "actual_cost_usd": getattr(agent, "session_actual_cost_usd", 0.0) or 0.0,
+                        "actual_cost_available": bool(getattr(agent, "session_actual_cost_available", False)),
+                        "upstream_cost_usd": getattr(agent, "session_upstream_cost_usd", 0.0) or 0.0,
+                        "model": getattr(agent, "model", "") or "",
+                        "provider": getattr(agent, "provider", "") or "",
+                        "request_count": getattr(agent, "session_api_calls", 0) or 0,
+                        "calls": list(getattr(agent, "session_usage_calls", []) or []),
+                    })
                 # Include the effective session ID in the result so callers
                 # (e.g. X-Hermes-Session-Id header) can track compression-
                 # triggered session rotations. (#16938)

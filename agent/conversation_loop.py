@@ -2189,6 +2189,41 @@ def run_conversation(
                     )
                     if cost_result.amount_usd is not None:
                         agent.session_estimated_cost_usd += float(cost_result.amount_usd)
+                    # OpenRouter includes the amount charged to the account in
+                    # response.usage.cost. Preserve that provider fact separately
+                    # from catalog estimates so downstream accounting never has
+                    # to infer billed spend from token prices.
+                    _raw_usage = getattr(aggregator_usage, "raw_usage", None)
+                    if not isinstance(_raw_usage, dict):
+                        _raw_usage = {}
+                    _actual_cost = _raw_usage.get("cost")
+                    _cost_details = _raw_usage.get("cost_details")
+                    if not isinstance(_cost_details, dict):
+                        _cost_details = {}
+                    _upstream_cost = _cost_details.get("upstream_inference_cost")
+                    try:
+                        if _actual_cost is not None:
+                            agent.session_actual_cost_usd += max(0.0, float(_actual_cost))
+                            agent.session_actual_cost_available = True
+                    except (TypeError, ValueError):
+                        _actual_cost = None
+                    try:
+                        if _upstream_cost is not None:
+                            agent.session_upstream_cost_usd += max(0.0, float(_upstream_cost))
+                    except (TypeError, ValueError):
+                        _upstream_cost = None
+                    agent.session_usage_calls.append({
+                        "generation_id": str(getattr(response, "id", "") or ""),
+                        "model": str(getattr(response, "model", "") or _agg_cost_model or agent.model),
+                        "provider": str(_agg_cost_provider or agent.provider or ""),
+                        "input_tokens": canonical_usage.input_tokens,
+                        "output_tokens": canonical_usage.output_tokens,
+                        "cache_read_tokens": canonical_usage.cache_read_tokens,
+                        "cache_write_tokens": canonical_usage.cache_write_tokens,
+                        "reasoning_tokens": canonical_usage.reasoning_tokens,
+                        "actual_cost_usd": float(_actual_cost) if _actual_cost is not None else None,
+                        "upstream_cost_usd": float(_upstream_cost) if _upstream_cost is not None else 0.0,
+                    })
                     # Add MoA advisor cost (already priced per-advisor at each
                     # advisor's own model rate) on top of the aggregator cost.
                     if _moa_ref_cost is not None:
@@ -2236,6 +2271,7 @@ def run_conversation(
                                 cache_write_tokens=canonical_usage.cache_write_tokens,
                                 reasoning_tokens=canonical_usage.reasoning_tokens,
                                 estimated_cost_usd=_cost_delta,
+                                actual_cost_usd=float(_actual_cost) if _actual_cost is not None else None,
                                 cost_status=cost_result.status,
                                 cost_source=cost_result.source,
                                 billing_provider=agent.provider,
