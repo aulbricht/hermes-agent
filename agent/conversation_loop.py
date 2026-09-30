@@ -66,6 +66,7 @@ from agent.retry_utils import (
 )
 from agent.trajectory import has_incomplete_scratchpad
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
+from agent.atlas_sol_budget import openai_usage_fields
 from hermes_constants import PARTIAL_STREAM_STUB_ID
 from hermes_logging import set_session_context
 from tools.skill_provenance import set_current_write_origin
@@ -77,6 +78,23 @@ logger = logging.getLogger(__name__)
 # cancelled while waiting on the provider. Surfaces (ACP, TUI) match on this
 # to treat it as cancellation metadata rather than assistant prose.
 INTERRUPT_WAITING_FOR_MODEL_PREFIX = "Operation interrupted: waiting for model response ("
+
+
+def _atlas_route_usage_fields(agent: Any) -> dict[str, Any]:
+    """Attach request and admission IDs to one provider usage receipt."""
+    fields: dict[str, Any] = {
+        "route_request_id": getattr(agent, "_atlas_route_request_id", None),
+    }
+    admission = getattr(agent, "_atlas_sol_last_call", None)
+    if isinstance(admission, dict):
+        if admission.get("actual_model"):
+            fields["model"] = admission["actual_model"]
+        fields["reservation_id"] = admission.get("reservation_id")
+        if admission.get("max_usd") is not None:
+            fields["maximum_usd"] = admission["max_usd"]
+        if admission.get("settled_usd") is not None:
+            fields["settled_usd"] = admission["settled_usd"]
+    return fields
 
 
 def _image_error_max_dimension(error: Exception) -> Optional[int]:
@@ -1332,9 +1350,14 @@ def run_conversation(
 
                 from hermes_cli.middleware import run_llm_execution_middleware
 
+                from agent.atlas_sol_budget import admitted_call
+
+                # Each provider request appends one usage row; clear the prior
+                # per-call admission metadata before this attempt.
+                agent._atlas_sol_last_call = None
                 response = run_llm_execution_middleware(
                     api_kwargs,
-                    _perform_api_call,
+                    lambda next_api_kwargs: admitted_call(agent, next_api_kwargs, _perform_api_call),
                     original_request=_original_api_kwargs,
                     task_id=effective_task_id,
                     turn_id=turn_id,
@@ -2214,6 +2237,8 @@ def run_conversation(
                         _upstream_cost = None
                     agent.session_usage_calls.append({
                         "generation_id": str(getattr(response, "id", "") or ""),
+                        "service_tier": getattr(response, "service_tier", None),
+                        "usage_available": getattr(response, "usage", None) is not None,
                         "model": str(getattr(response, "model", "") or _agg_cost_model or agent.model),
                         "provider": str(_agg_cost_provider or agent.provider or ""),
                         "input_tokens": canonical_usage.input_tokens,
@@ -2223,6 +2248,8 @@ def run_conversation(
                         "reasoning_tokens": canonical_usage.reasoning_tokens,
                         "actual_cost_usd": float(_actual_cost) if _actual_cost is not None else None,
                         "upstream_cost_usd": float(_upstream_cost) if _upstream_cost is not None else 0.0,
+                        **_atlas_route_usage_fields(agent),
+                        **(openai_usage_fields(response) if os.environ.get("ATLAS_MODEL_ROUTING_ENABLED") == "true" and agent.api_mode == "codex_responses" else {}),
                     })
                     # Add MoA advisor cost (already priced per-advisor at each
                     # advisor's own model rate) on top of the aggregator cost.

@@ -3920,6 +3920,10 @@ class TestModelRoutesParsing:
         )
         assert adapter._model_routes["a"] == {"model": "m", "provider": "p"}
 
+    def test_invalid_reasoning_effort_drops_route(self):
+        adapter = _make_routing_adapter({"bad": {"model": "m", "reasoning_effort": "unbounded"}})
+        assert adapter._model_routes == {}
+
     def test_resolve_route_lookup(self):
         adapter = _make_routing_adapter({"minimax-m2": {"model": "minimax/minimax-m1"}})
         assert adapter._resolve_route("minimax-m2") == {"model": "minimax/minimax-m1"}
@@ -4098,6 +4102,21 @@ class TestModelRoutesAgentCreation:
 
         assert captured["model"] == "global/model"
         assert captured["api_key"] == "sk-global"
+
+    def test_route_reasoning_effort_overrides_global(self, monkeypatch):
+        captured = {}
+
+        class FakeAgent:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+        _patch_create_agent_runtime(monkeypatch, captured, FakeAgent)
+        adapter = _make_routing_adapter({"atlas-sol": {"model": "gpt-6.1-sol", "reasoning_effort": "low", "max_iterations": "4"}})
+        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+        monkeypatch.setattr(adapter, "_session_model_override_for", lambda *_: None)
+        adapter._create_agent(session_id="s1", route=adapter._resolve_route("atlas-sol"))
+        assert captured["reasoning_config"] == {"enabled": True, "effort": "low"}
+        assert captured["max_iterations"] == 4
 
     def test_session_model_override_beats_route(self, monkeypatch):
         """A user-issued /model on the session must win over static route config."""

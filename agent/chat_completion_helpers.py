@@ -1671,6 +1671,27 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
 
 
 
+def _record_atlas_summary_usage(agent, response) -> None:
+    """Include Atlas's otherwise out-of-loop summary requests in receipts."""
+    if os.environ.get("ATLAS_MODEL_ROUTING_ENABLED") != "true":
+        return
+    from agent.atlas_sol_budget import _field, openai_usage_fields
+    calls = getattr(agent, "session_usage_calls", None)
+    if not isinstance(calls, list):
+        calls = []
+        agent.session_usage_calls = calls
+    gate = getattr(agent, "_atlas_sol_last_call", {}) or {}
+    calls.append({
+        "generation_id": str(_field(response, "id", "") or ""),
+        "model": str(_field(response, "model", agent.model) or agent.model),
+        "provider": "openai",
+        **openai_usage_fields(response),
+        "actual_cost_usd": None, "upstream_cost_usd": 0,
+        "route_request_id": getattr(agent, "_atlas_route_request_id", None),
+        "reservation_id": gate.get("reservation_id"), "max_usd": gate.get("max_usd"),
+    })
+
+
 def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
     """Request a summary when max iterations are reached. Returns the final response text."""
     print(f"⚠️  Reached maximum iterations ({agent.max_iterations}). Requesting summary...")
@@ -1772,7 +1793,9 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
         if agent.api_mode == "codex_responses":
             codex_kwargs = agent._build_api_kwargs(api_messages)
             codex_kwargs.pop("tools", None)
-            summary_response = agent._run_codex_stream(codex_kwargs)
+            from agent.atlas_sol_budget import admitted_call
+            summary_response = admitted_call(agent, codex_kwargs, agent._run_codex_stream)
+            _record_atlas_summary_usage(agent, summary_response)
             _ct_sum = agent._get_transport()
             _cnr_sum = _ct_sum.normalize_response(summary_response)
             final_response = (_cnr_sum.content or "").strip()
@@ -1865,7 +1888,9 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
             if agent.api_mode == "codex_responses":
                 codex_kwargs = agent._build_api_kwargs(api_messages)
                 codex_kwargs.pop("tools", None)
-                retry_response = agent._run_codex_stream(codex_kwargs)
+                from agent.atlas_sol_budget import admitted_call
+                retry_response = admitted_call(agent, codex_kwargs, agent._run_codex_stream)
+                _record_atlas_summary_usage(agent, retry_response)
                 _ct_retry = agent._get_transport()
                 _cnr_retry = _ct_retry.normalize_response(retry_response)
                 final_response = (_cnr_retry.content or "").strip()

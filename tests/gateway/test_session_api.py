@@ -94,6 +94,7 @@ async def test_run_agent_binds_api_session_context_for_tool_env(adapter, monkeyp
             from tools.environments.local import _make_run_env
 
             observed["task_id"] = task_id
+            observed["atlas_route_request_id"] = self._atlas_route_request_id
             observed["context_session_id"] = get_session_env("HERMES_SESSION_ID")
             observed["context_platform"] = get_session_env("HERMES_SESSION_PLATFORM")
             observed["context_session_key"] = get_session_env("HERMES_SESSION_KEY")
@@ -110,12 +111,14 @@ async def test_run_agent_binds_api_session_context_for_tool_env(adapter, monkeyp
         conversation_history=[],
         session_id="request-session",
         gateway_session_key="request-key",
+        atlas_route_request_id="atlas-route-123",
     )
 
     assert result["session_id"] == "request-session"
     assert usage == {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
     assert observed == {
         "task_id": "request-session",
+        "atlas_route_request_id": "atlas-route-123",
         "context_session_id": "request-session",
         "context_platform": "api_server",
         "context_session_key": "request-key",
@@ -309,6 +312,32 @@ async def test_session_chat_stream_accepts_multimodal_message(adapter, session_d
 
     assert "event: assistant.completed" in body
     assert captured_kwargs["user_message"] == expected_user_message
+
+
+@pytest.mark.asyncio
+async def test_session_chat_stream_uses_configured_model_route(session_db):
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={"model_routes": {
+        "atlas-sol": {"model": "gpt-6.1-sol", "provider": "openai-api", "reasoning_effort": "low"},
+    }}))
+    adapter._session_db = session_db
+    session_id = session_db.create_session("routed-session", "api_server")
+    captured = {}
+
+    async def fake_run(**kwargs):
+        captured.update(kwargs)
+        return {"final_response": "done", "session_id": session_id}, {"total_tokens": 2}
+
+    with patch.object(adapter, "_run_agent", side_effect=fake_run):
+        async with TestClient(TestServer(_create_session_app(adapter))) as cli:
+            response = await cli.post(
+                f"/api/sessions/{session_id}/chat/stream",
+                headers={"X-Atlas-Route-Request-ID": "atlas-route-abc_123"},
+                json={"message": "hello", "model": "atlas-sol"},
+            )
+            assert response.status == 200
+            await response.text()
+    assert captured["route"] == {"model": "gpt-6.1-sol", "provider": "openai-api", "reasoning_effort": "low"}
+    assert captured["atlas_route_request_id"] == "atlas-route-abc_123"
 
 
 @pytest.mark.asyncio

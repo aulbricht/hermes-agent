@@ -1169,13 +1169,20 @@ class _CodexCompletionsAdapter:
 
             resp_usage = getattr(final, "usage", None)
             if resp_usage:
+                def _usage_value(key: str, default: Any = 0) -> Any:
+                    value = getattr(resp_usage, key, None)
+                    if value is None and isinstance(resp_usage, dict):
+                        value = resp_usage.get(key)
+                    return default if value is None else value
+
                 usage = SimpleNamespace(
-                    prompt_tokens=getattr(resp_usage, "input_tokens", 0)
-                        or (resp_usage.get("input_tokens", 0) if isinstance(resp_usage, dict) else 0),
-                    completion_tokens=getattr(resp_usage, "output_tokens", 0)
-                        or (resp_usage.get("output_tokens", 0) if isinstance(resp_usage, dict) else 0),
-                    total_tokens=getattr(resp_usage, "total_tokens", 0)
-                        or (resp_usage.get("total_tokens", 0) if isinstance(resp_usage, dict) else 0),
+                    input_tokens=_usage_value("input_tokens"),
+                    output_tokens=_usage_value("output_tokens"),
+                    input_tokens_details=_usage_value("input_tokens_details", None),
+                    output_tokens_details=_usage_value("output_tokens_details", None),
+                    prompt_tokens=_usage_value("input_tokens"),
+                    completion_tokens=_usage_value("output_tokens"),
+                    total_tokens=_usage_value("total_tokens"),
                 )
         except Exception as exc:
             if timed_out.is_set():
@@ -1201,7 +1208,9 @@ class _CodexCompletionsAdapter:
         )
         return SimpleNamespace(
             choices=[choice],
-            model=model,
+            id=getattr(final, "id", "") or (final.get("id", "") if isinstance(final, dict) else ""),
+            model=(getattr(final, "model", None) or (final.get("model") if isinstance(final, dict) else None) or model),
+            service_tier=(getattr(final, "service_tier", None) or (final.get("service_tier") if isinstance(final, dict) else None)),
             usage=usage,
         )
 
@@ -6391,6 +6400,69 @@ def _validate_llm_response(response: Any, task: str = None) -> Any:
     return response
 
 
+def _atlas_direct_auxiliary_call(
+    *, task: str, messages: list, temperature: Optional[float], max_tokens: int,
+    tools: list, timeout: float, extra_body: dict, stream: bool = False,
+    stream_options: dict = None, async_mode: bool = False,
+) -> Any:
+    """Run an Atlas auxiliary request on direct OpenAI Luna without fallback."""
+    from urllib.parse import urlsplit
+    from agent.atlas_auxiliary_accounting import LUNA
+
+    if stream:
+        raise RuntimeError("Atlas auxiliary accounting requires a completed non-streaming response")
+
+    client, resolved_model = _get_cached_client(
+        "openai-api", LUNA, async_mode=async_mode,
+        base_url="https://api.openai.com/v1", api_mode="codex_responses",
+        # Deliberately omit main_runtime: Atlas auxiliary calls must never
+        # inherit the primary Sol route or credentials.
+        main_runtime=None, task=task,
+    )
+    base_url = str(getattr(client, "base_url", "") or "") if client is not None else ""
+    if (
+        client is None
+        or resolved_model != LUNA
+        or urlsplit(base_url).hostname != "api.openai.com"
+    ):
+        raise RuntimeError("Atlas auxiliary calls require direct OpenAI API credentials for gpt-6-luna")
+
+    effective_timeout = _effective_aux_timeout(task, timeout)
+    merged_extra = _get_task_extra_body(task)
+    merged_extra.update(extra_body or {})
+    for routed_field in ("temperature", "provider", "models", "plugins"):
+        merged_extra.pop(routed_field, None)
+    reasoning_effort = "low" if task == "title_generation" else "medium"
+    reasoning = dict(merged_extra.get("reasoning") or {})
+    reasoning.update({"enabled": True, "effort": str(reasoning_effort)})
+    merged_extra["reasoning"] = reasoning
+    kwargs = _build_call_kwargs(
+        "openai-api", LUNA, messages, temperature=None,
+        max_tokens=max_tokens, tools=tools, timeout=effective_timeout,
+        extra_body=merged_extra, base_url=base_url,
+    )
+    kwargs.pop("temperature", None)
+
+    if async_mode:
+        async def _perform():
+            raw_response = await client.chat.completions.create(**kwargs)
+            from agent.atlas_auxiliary_accounting import record_completed_response_async
+            try:
+                await record_completed_response_async(raw_response, requested_model=LUNA)
+            except Exception as exc:
+                logger.warning("Atlas auxiliary receipt failed after completed response (error_type=%s)", type(exc).__name__)
+            return _validate_llm_response(raw_response, task)
+        return _perform()
+
+    raw_response = client.chat.completions.create(**kwargs)
+    from agent.atlas_auxiliary_accounting import record_completed_response
+    try:
+        record_completed_response(raw_response, requested_model=LUNA)
+    except Exception as exc:
+        logger.warning("Atlas auxiliary receipt failed after completed response (error_type=%s)", type(exc).__name__)
+    return _validate_llm_response(raw_response, task)
+
+
 def _recover_aux_response_message(response: Any) -> Optional[Any]:
     """Synthesize chat-completions shape from Responses-style text fields.
 
@@ -6500,6 +6572,14 @@ def call_llm(
     Raises:
         RuntimeError: If no provider is configured.
     """
+    from agent.atlas_auxiliary_accounting import atlas_auxiliary_enabled
+    if atlas_auxiliary_enabled():
+        return _atlas_direct_auxiliary_call(
+            task=task or "system_other",
+            messages=messages, temperature=temperature, max_tokens=max_tokens,
+            tools=tools, timeout=timeout, extra_body=extra_body,
+            stream=stream, stream_options=stream_options,
+        )
     resolved_provider, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
         task, provider, model, base_url, api_key)
     if api_mode:
@@ -7119,6 +7199,14 @@ async def async_call_llm(
 
     Same as call_llm() but async. See call_llm() for full documentation.
     """
+    from agent.atlas_auxiliary_accounting import atlas_auxiliary_enabled
+    if atlas_auxiliary_enabled():
+        return await _atlas_direct_auxiliary_call(
+            task=task or "system_other",
+            messages=messages, temperature=temperature, max_tokens=max_tokens,
+            tools=tools, timeout=timeout, extra_body=extra_body,
+            async_mode=True,
+        )
     resolved_provider, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
         task, provider, model, base_url, api_key)
     effective_extra_body = _get_task_extra_body(task)

@@ -376,6 +376,18 @@ def _session_chat_user_message(body: Dict[str, Any], *, param: str = "message") 
         return None, _multimodal_validation_error(exc, param=param)
 
 
+def _atlas_route_request_id(request: "web.Request") -> tuple[str | None, Optional["web.Response"]]:
+    value = request.headers.get("X-Atlas-Route-Request-ID", "")
+    if not value:
+        return None, None
+    if len(value) > 180 or not re.fullmatch(r"[A-Za-z0-9_.:-]+", value):
+        return None, web.json_response(
+            _openai_error("Invalid Atlas route request ID", code="invalid_route_request_id"),
+            status=400,
+        )
+    return value, None
+
+
 def check_api_server_requirements() -> bool:
     """Check if API server dependencies are available."""
     return AIOHTTP_AVAILABLE
@@ -1338,7 +1350,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 )
             return {}
 
-        allowed_keys = ("model", "provider", "api_key", "base_url")
+        allowed_keys = ("model", "provider", "api_key", "base_url", "reasoning_effort", "max_iterations")
         routes: Dict[str, Dict[str, Any]] = {}
         for alias, cfg in raw.items():
             alias_str = str(alias).strip()
@@ -1357,6 +1369,17 @@ class APIServerAdapter(BasePlatformAdapter):
                     "api_server model_routes: route %r has no 'model'; dropping", alias_str
                 )
                 continue
+            if route.get("reasoning_effort") and route["reasoning_effort"] not in {"none", "low", "medium", "high", "xhigh", "max"}:
+                logger.warning("api_server model_routes: dropping route %r with invalid reasoning effort", alias_str)
+                continue
+            if route.get("max_iterations"):
+                try:
+                    bound = int(route["max_iterations"])
+                except ValueError:
+                    bound = 0
+                if not 1 <= bound <= 90:
+                    logger.warning("api_server model_routes: dropping route %r with invalid iteration cap", alias_str)
+                    continue
             routes[alias_str] = route
         return routes
 
@@ -1478,6 +1501,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 runtime_kwargs["api_key"] = route["api_key"]
             if route.get("base_url"):
                 runtime_kwargs["base_url"] = route["base_url"]
+            if route.get("reasoning_effort"):
+                reasoning_config = {
+                    "enabled": route["reasoning_effort"] != "none",
+                    "effort": route["reasoning_effort"],
+                }
             logger.debug(
                 "api_server model route applied: model=%s provider=%s",
                 model,
@@ -1493,6 +1521,8 @@ class APIServerAdapter(BasePlatformAdapter):
         enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
 
         max_iterations = _current_max_iterations()
+        if route and not session_override and route.get("max_iterations"):
+            max_iterations = min(max_iterations, int(route["max_iterations"]))
 
         # Load fallback provider chain so the API server platform has the
         # same fallback behaviour as Telegram/Discord/Slack (fixes #4954).
@@ -2062,6 +2092,14 @@ class APIServerAdapter(BasePlatformAdapter):
         provider_user_hash = request.headers.get("X-Atlas-Provider-User", "")
         if provider_user_hash and not re.fullmatch(r"atlas-(?:system|[0-9a-f]{48})", provider_user_hash):
             return web.json_response(_openai_error("Invalid provider user attribution", code="invalid_provider_user"), status=400)
+        atlas_route_request_id, route_id_err = _atlas_route_request_id(request)
+        if route_id_err is not None:
+            return route_id_err
+        # Session turns need the same per-request model routes as the
+        # OpenAI-compatible endpoints. A route is selected only from the
+        # server's configured alias map; callers cannot supply arbitrary
+        # provider URLs, keys, or reasoning settings.
+        route = self._resolve_route(body.get("model"))
         history = self._conversation_history_for_session(session_id)
         result, usage = await self._run_agent(
             user_message=user_message,
@@ -2070,6 +2108,8 @@ class APIServerAdapter(BasePlatformAdapter):
             session_id=session_id,
             gateway_session_key=gateway_session_key,
             provider_user_hash=provider_user_hash or None,
+            atlas_route_request_id=atlas_route_request_id,
+            route=route,
         )
         effective_session_id = result.get("session_id") if isinstance(result, dict) else session_id
         final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
@@ -2108,6 +2148,10 @@ class APIServerAdapter(BasePlatformAdapter):
         provider_user_hash = request.headers.get("X-Atlas-Provider-User", "")
         if provider_user_hash and not re.fullmatch(r"atlas-(?:system|[0-9a-f]{48})", provider_user_hash):
             return web.json_response(_openai_error("Invalid provider user attribution", code="invalid_provider_user"), status=400)
+        atlas_route_request_id, route_id_err = _atlas_route_request_id(request)
+        if route_id_err is not None:
+            return route_id_err
+        route = self._resolve_route(body.get("model"))
 
         loop = asyncio.get_running_loop()
         queue: "asyncio.Queue[Optional[tuple[str, Dict[str, Any]]]]" = asyncio.Queue()
@@ -2163,6 +2207,8 @@ class APIServerAdapter(BasePlatformAdapter):
                     tool_progress_callback=_tool_progress,
                     gateway_session_key=gateway_session_key,
                     provider_user_hash=provider_user_hash or None,
+                    atlas_route_request_id=atlas_route_request_id,
+                    route=route,
                 )
                 final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
                 effective_session_id = result.get("session_id", session_id) if isinstance(result, dict) else session_id
@@ -4222,6 +4268,7 @@ class APIServerAdapter(BasePlatformAdapter):
         gateway_session_key: Optional[str] = None,
         route: Optional[Dict[str, Any]] = None,
         provider_user_hash: Optional[str] = None,
+        atlas_route_request_id: Optional[str] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -4263,6 +4310,8 @@ class APIServerAdapter(BasePlatformAdapter):
                     overrides = dict(getattr(agent, "request_overrides", {}) or {})
                     overrides["user"] = provider_user_hash
                     agent.request_overrides = overrides
+                if atlas_route_request_id:
+                    agent._atlas_route_request_id = atlas_route_request_id
                 if agent_ref is not None:
                     agent_ref[0] = agent
                 effective_task_id = session_id or str(uuid.uuid4())
