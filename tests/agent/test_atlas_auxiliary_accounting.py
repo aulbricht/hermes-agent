@@ -100,6 +100,79 @@ def test_atlas_title_generation_overrides_openrouter_and_sol_with_direct_luna(mo
     assert "temperature" not in calls[0]
 
 
+def test_atlas_openrouter_auxiliary_pins_openai_responses_and_meters_provider_cost(monkeypatch):
+    monkeypatch.setenv("ATLAS_MODEL_ROUTING_ENABLED", "true")
+    monkeypatch.setenv("ATLAS_MODEL_ROUTING_TRANSPORT", "openrouter")
+    calls = []
+    receipts = []
+
+    class Responses:
+        def create(self, **kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(close=lambda: None)
+
+    final = SimpleNamespace(
+        id="resp-or", model="openai/gpt-6-luna", service_tier="default",
+        usage=SimpleNamespace(
+            input_tokens=100, output_tokens=20,
+            input_tokens_details=SimpleNamespace(cached_tokens=10, cache_write_tokens=5),
+            output_tokens_details=SimpleNamespace(reasoning_tokens=3),
+            cost=0, cost_details=SimpleNamespace(upstream_inference_cost="0.000010"), is_byok=True,
+        ),
+        output=[SimpleNamespace(type="message", content=[SimpleNamespace(type="output_text", text="summary")])],
+    )
+    monkeypatch.setattr("agent.codex_runtime._consume_codex_event_stream", lambda *_args, **_kwargs: final)
+    client = SimpleNamespace(base_url="https://openrouter.ai/api/v1", api_key="fixture", responses=Responses())
+
+    def get_client(provider, model, **kwargs):
+        assert provider == "openrouter"
+        assert model == "openai/gpt-6-luna"
+        assert kwargs["base_url"] == "https://openrouter.ai/api/v1"
+        assert kwargs["api_mode"] == "codex_responses"
+        return auxiliary_client.CodexAuxiliaryClient(client, model), model
+
+    monkeypatch.setattr(auxiliary_client, "_get_cached_client", get_client)
+    monkeypatch.setattr(accounting, "record_completed_response", lambda response, **kw: receipts.append(accounting.receipt_payload(response, **kw)))
+
+    response = auxiliary_client.call_llm(
+        task="title_generation", provider="openai-api", model="gpt-6.1-sol",
+        messages=[{"role": "user", "content": "make title"}], temperature=0.4,
+    )
+
+    assert response.id == "resp-or"
+    assert calls[0]["model"] == "openai/gpt-6-luna"
+    assert calls[0]["provider"] == {
+        "order": ["openai"], "only": ["openai"],
+        "allow_fallbacks": False, "require_parameters": True,
+    }
+    assert calls[0]["service_tier"] == "auto"
+    assert "temperature" not in calls[0]
+    assert len(receipts) == 1
+    assert receipts[0]["provider"] == "openrouter"
+    assert receipts[0]["is_byok"] is True
+    assert receipts[0]["charged_usd"] == "0"
+    assert receipts[0]["upstream_usd"] == "0.000010"
+    assert receipts[0]["cost_basis"] == "byok_split"
+    assert receipts[0]["estimated_total_usd"] == "0"
+
+
+def test_atlas_openrouter_byok_missing_component_keeps_observed_cost_separate(monkeypatch):
+    monkeypatch.setenv("ATLAS_MODEL_ROUTING_TRANSPORT", "openrouter")
+    response = SimpleNamespace(
+        model="openai/gpt-6-luna", service_tier="default",
+        usage=SimpleNamespace(
+            input_tokens=100, output_tokens=20,
+            input_tokens_details=SimpleNamespace(cached_tokens=0),
+            cost=0, cost_details=SimpleNamespace(), is_byok=True,
+        ),
+    )
+    payload = accounting.receipt_payload(response)
+    assert payload["charged_usd"] == "0"
+    assert payload["upstream_usd"] == "0"
+    assert payload["cost_basis"] == "byok_estimated"
+    assert payload["estimated_total_usd"] == "0.0000210"
+
+
 def test_atlas_aux_receipt_cost_is_estimated_and_content_free():
     response = _response()
     payload = accounting.receipt_payload(response)
@@ -138,6 +211,29 @@ def test_responses_adapter_preserves_usage_and_generation_metadata(monkeypatch):
     assert response.usage.output_tokens_details.reasoning_tokens == 3
     assert receipt["provider_generation_id"] == "resp-codex"
     assert receipt["cache_read_tokens"] == 10
+
+
+def test_responses_adapter_forwards_openrouter_provider_pin(monkeypatch):
+    captured = {}
+    final = SimpleNamespace(
+        id="resp-or-adapter", model="openai/gpt-6-luna", service_tier="default",
+        usage=SimpleNamespace(input_tokens=10, output_tokens=2), output=[],
+    )
+    monkeypatch.setattr("agent.codex_runtime._consume_codex_event_stream", lambda *_args, **_kwargs: final)
+
+    class Responses:
+        def create(self, **kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(close=lambda: None)
+
+    client = SimpleNamespace(base_url="https://openrouter.ai/api/v1", responses=Responses())
+    adapter = auxiliary_client._CodexCompletionsAdapter(client, "openai/gpt-6-luna")
+    adapter.create(
+        model="openai/gpt-6-luna", messages=[{"role": "user", "content": "x"}],
+        extra_body={"provider": {"only": ["openai"], "allow_fallbacks": False}, "service_tier": "auto"},
+    )
+    assert captured["provider"] == {"only": ["openai"], "allow_fallbacks": False}
+    assert captured["service_tier"] == "auto"
 
 
 def test_atlas_async_compression_meters_without_retrying_generation(monkeypatch):

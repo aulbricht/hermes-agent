@@ -1681,14 +1681,19 @@ def _record_atlas_summary_usage(agent, response) -> None:
         calls = []
         agent.session_usage_calls = calls
     gate = getattr(agent, "_atlas_sol_last_call", {}) or {}
+    transport = os.environ.get("ATLAS_MODEL_ROUTING_TRANSPORT", "openai").strip().lower()
+    provider = "openrouter" if transport == "openrouter" else "openai"
+    usage_fields = openai_usage_fields(response)
     calls.append({
         "generation_id": str(_field(response, "id", "") or ""),
         "model": str(_field(response, "model", agent.model) or agent.model),
-        "provider": "openai",
-        **openai_usage_fields(response),
-        "actual_cost_usd": None, "upstream_cost_usd": 0,
+        "provider": provider,
+        **usage_fields,
+        **({} if provider == "openrouter" else {"actual_cost_usd": None, "upstream_cost_usd": 0}),
         "route_request_id": getattr(agent, "_atlas_route_request_id", None),
         "reservation_id": gate.get("reservation_id"), "max_usd": gate.get("max_usd"),
+        "settled_usd": gate.get("settled_usd"),
+        "settlement_estimated": gate.get("settlement_estimated"),
     })
 
 

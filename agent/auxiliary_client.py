@@ -953,6 +953,14 @@ class _CodexCompletionsAdapter:
         # same behavior as the main agent's Codex transport.
         extra_body = kwargs.get("extra_body") or {}
         if isinstance(extra_body, dict):
+            # OpenRouter Responses accepts provider selection as a top-level
+            # Responses field. Atlas supplies a hard OpenAI-only pin through
+            # extra_body; forward it here instead of dropping it in this
+            # chat-to-Responses adapter.
+            if isinstance(extra_body.get("provider"), dict):
+                resp_kwargs["provider"] = dict(extra_body["provider"])
+            if extra_body.get("service_tier"):
+                resp_kwargs["service_tier"] = extra_body["service_tier"]
             reasoning_cfg = extra_body.get("reasoning")
             if isinstance(reasoning_cfg, dict):
                 if reasoning_cfg.get("enabled") is False:
@@ -1183,6 +1191,13 @@ class _CodexCompletionsAdapter:
                     prompt_tokens=_usage_value("input_tokens"),
                     completion_tokens=_usage_value("output_tokens"),
                     total_tokens=_usage_value("total_tokens"),
+                    # OpenRouter Responses can include billing attribution
+                    # alongside usage. Preserve it through the adapter so
+                    # Atlas separates platform charges from BYOK upstream.
+                    cost=_usage_value("cost", None),
+                    cost_details=_usage_value("cost_details", None),
+                    is_byok=_usage_value("is_byok", None),
+                    upstream_cost_usd=_usage_value("upstream_cost_usd", None),
                 )
         except Exception as exc:
             if timed_out.is_set():
@@ -6405,16 +6420,22 @@ def _atlas_direct_auxiliary_call(
     tools: list, timeout: float, extra_body: dict, stream: bool = False,
     stream_options: dict = None, async_mode: bool = False,
 ) -> Any:
-    """Run an Atlas auxiliary request on direct OpenAI Luna without fallback."""
+    """Run an Atlas auxiliary request on pinned Luna without provider fallback."""
     from urllib.parse import urlsplit
     from agent.atlas_auxiliary_accounting import LUNA
+    from agent.atlas_sol_budget import OPENROUTER, _pin_openrouter_provider, _transport
 
     if stream:
         raise RuntimeError("Atlas auxiliary accounting requires a completed non-streaming response")
 
+    transport = _transport()
+    provider = OPENROUTER if transport == OPENROUTER else "openai-api"
+    requested_model = f"openai/{LUNA}" if transport == OPENROUTER else LUNA
+    expected_host = "openrouter.ai" if transport == OPENROUTER else "api.openai.com"
+    base_url = "https://openrouter.ai/api/v1" if transport == OPENROUTER else "https://api.openai.com/v1"
     client, resolved_model = _get_cached_client(
-        "openai-api", LUNA, async_mode=async_mode,
-        base_url="https://api.openai.com/v1", api_mode="codex_responses",
+        provider, requested_model, async_mode=async_mode,
+        base_url=base_url, api_mode="codex_responses",
         # Deliberately omit main_runtime: Atlas auxiliary calls must never
         # inherit the primary Sol route or credentials.
         main_runtime=None, task=task,
@@ -6422,10 +6443,11 @@ def _atlas_direct_auxiliary_call(
     base_url = str(getattr(client, "base_url", "") or "") if client is not None else ""
     if (
         client is None
-        or resolved_model != LUNA
-        or urlsplit(base_url).hostname != "api.openai.com"
+        or resolved_model != requested_model
+        or urlsplit(str(getattr(client, "base_url", "") or "")).hostname != expected_host
     ):
-        raise RuntimeError("Atlas auxiliary calls require direct OpenAI API credentials for gpt-6-luna")
+        credential_label = "OpenRouter API" if transport == OPENROUTER else "direct OpenAI API"
+        raise RuntimeError(f"Atlas auxiliary calls require {credential_label} credentials for {requested_model}")
 
     effective_timeout = _effective_aux_timeout(task, timeout)
     merged_extra = _get_task_extra_body(task)
@@ -6436,8 +6458,11 @@ def _atlas_direct_auxiliary_call(
     reasoning = dict(merged_extra.get("reasoning") or {})
     reasoning.update({"enabled": True, "effort": str(reasoning_effort)})
     merged_extra["reasoning"] = reasoning
+    if transport == OPENROUTER:
+        merged_extra["service_tier"] = "auto"
+        merged_extra = _pin_openrouter_provider({"extra_body": merged_extra})["extra_body"]
     kwargs = _build_call_kwargs(
-        "openai-api", LUNA, messages, temperature=None,
+        provider, requested_model, messages, temperature=None,
         max_tokens=max_tokens, tools=tools, timeout=effective_timeout,
         extra_body=merged_extra, base_url=base_url,
     )

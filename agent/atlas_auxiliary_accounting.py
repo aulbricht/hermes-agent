@@ -31,7 +31,10 @@ def _get(value: Any, key: str, default: Any = None) -> Any:
 
 
 def receipt_payload(response: Any, *, requested_model: str = LUNA) -> dict[str, Any]:
-    """Build a content-free OpenAI receipt accepted by Atlas accounting."""
+    """Build a content-free provider receipt accepted by Atlas accounting."""
+    from agent.atlas_sol_budget import OPENROUTER, _transport
+
+    transport = _transport()
     usage = _get(response, "usage")
     input_tokens = _get(usage, "input_tokens")
     if input_tokens is None:
@@ -49,7 +52,7 @@ def receipt_payload(response: Any, *, requested_model: str = LUNA) -> dict[str, 
     normalized_cache_read = min(normalized_input, max(0, int(cache_read)))
     normalized_cache_write = min(normalized_input - normalized_cache_read, max(0, int(cache_write)))
     estimated_cost = Decimal(0)
-    if has_usage and model == LUNA:
+    if has_usage and model.removeprefix("openai/") == LUNA:
         inputs, outputs = normalized_input, normalized_output
         cached, writes = normalized_cache_read, normalized_cache_write
         long_factor = Decimal(2) if inputs > 272_000 else Decimal(1)
@@ -63,6 +66,42 @@ def receipt_payload(response: Any, *, requested_model: str = LUNA) -> dict[str, 
             + Decimal(outputs) * Decimal("0.50") * output_factor
         ) * service_factor / Decimal(1_000_000)
 
+    is_byok_value = _get(usage, "is_byok")
+    is_byok = is_byok_value if isinstance(is_byok_value, bool) else None
+    cost_details = _get(usage, "cost_details") or {}
+    raw_cost = _get(usage, "cost")
+    raw_upstream = _get(cost_details, "upstream_inference_cost")
+    if raw_upstream is None:
+        raw_upstream = _get(usage, "upstream_cost_usd")
+    try:
+        charged = max(Decimal(0), Decimal(str(raw_cost))) if raw_cost is not None else None
+    except Exception:
+        charged = None
+    try:
+        upstream = max(Decimal(0), Decimal(str(raw_upstream))) if raw_upstream is not None else None
+    except Exception:
+        upstream = None
+    estimated_total = Decimal(0)
+    if transport == OPENROUTER:
+        # Only claim an observed BYOK total when OpenRouter explicitly returns
+        # both components. Token-derived combined estimates live in the
+        # separate estimated_total_usd field, never in either component.
+        if is_byok is True and (charged is None or upstream is None) and has_usage and model.removeprefix("openai/") == LUNA:
+            estimated_total = estimated_cost * Decimal("1.05")
+        cost_basis = (
+            "byok_split" if is_byok is True and charged is not None and upstream is not None
+            else "byok_estimated" if is_byok is True and estimated_total
+            else "byok_upstream_missing" if is_byok is True
+            else "openrouter_charge" if charged is not None
+            else "unknown"
+        )
+        verification_state = "provider_response" if charged is not None or upstream is not None else "pending"
+    else:
+        charged = estimated_cost if has_usage and model == LUNA else None
+        upstream = Decimal(0)
+        cost_basis = "estimated" if charged is not None else "unknown"
+        verification_state = "estimated" if charged is not None else "pending"
+
     return {
         "idempotency_key": "hermes-aux:" + uuid.uuid4().hex,
         "occurred_at": datetime.now(UTC).isoformat(),
@@ -74,7 +113,7 @@ def receipt_payload(response: Any, *, requested_model: str = LUNA) -> dict[str, 
         "route_request_id": None,
         "reservation_id": None,
         "model": model,
-        "provider": "openai",
+        "provider": "openrouter" if transport == OPENROUTER else "openai",
         "provider_generation_id": str(_get(response, "id", "") or ""),
         "provider_user_hash": "atlas-system",
         "input_tokens": normalized_input,
@@ -83,9 +122,12 @@ def receipt_payload(response: Any, *, requested_model: str = LUNA) -> dict[str, 
         "cache_write_tokens": normalized_cache_write,
         "reasoning_tokens": max(0, int(_get(_get(usage, "output_tokens_details") or _get(usage, "completion_tokens_details") or {}, "reasoning_tokens", 0) or 0)),
         "request_count": 1,
-        "charged_usd": str(estimated_cost),
-        "upstream_usd": "0",
-        "verification_state": "estimated" if has_usage and model == LUNA else "pending",
+        "charged_usd": str(charged or Decimal(0)),
+        "upstream_usd": str(upstream or Decimal(0)),
+        "is_byok": is_byok if transport == OPENROUTER else None,
+        "cost_basis": cost_basis,
+        "estimated_total_usd": str(estimated_total),
+        "verification_state": verification_state,
         "source": "hermes_auxiliary",
     }
 

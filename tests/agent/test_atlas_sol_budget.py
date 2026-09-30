@@ -29,6 +29,73 @@ def test_sol_call_reserves_before_dispatch_and_settles_estimated_usage(monkeypat
     assert Decimal(events[-1][1]["settled_usd"]) <= Decimal(events[0][1]["max_usd"])
 
 
+def test_openrouter_sol_admission_pins_openai_and_accepts_observed_zero_fee(monkeypatch):
+    events = []
+
+    def post(_socket, _token, path, body):
+        events.append((path, body))
+        return {"status": "reserved"} if path.endswith("reservations") else {"status": "settled"}
+
+    monkeypatch.setenv("ATLAS_MODEL_ROUTING_ENABLED", "true")
+    monkeypatch.setenv("ATLAS_MODEL_ROUTING_TRANSPORT", "openrouter")
+    monkeypatch.setenv("ATLAS_SOL_ACCOUNTING_SOCKET", "/tmp/test-accounting.sock")
+    monkeypatch.setenv("ATLAS_SOL_ACCOUNTING_TOKEN_FILE", "/tmp/test-accounting-token")
+    monkeypatch.setattr(budget, "_read_token", lambda _path: "fixture-token")
+    monkeypatch.setattr(budget, "_post", post)
+    response = SimpleNamespace(
+        id="generation-sol", model="openai/gpt-6.1-sol", service_tier="default",
+        usage=SimpleNamespace(
+            input_tokens=100, output_tokens=25, input_tokens_details=None,
+            cost=0, cost_details=SimpleNamespace(upstream_inference_cost="0.00045"), is_byok=True,
+        ),
+    )
+    agent = SimpleNamespace(model=budget.SOL)
+
+    def perform(payload):
+        assert events[0][0].endswith("reservations")
+        assert payload["model"] == "openai/gpt-6.1-sol"
+        assert payload["service_tier"] == "auto"
+        assert payload["extra_body"]["provider"] == {
+            "order": ["openai"], "only": ["openai"],
+            "allow_fallbacks": False, "require_parameters": True,
+        }
+        return response
+
+    budget.admitted_call(agent, {"model": budget.SOL, "max_output_tokens": 500, "input": "hello"}, perform)
+    reserve = events[0][1]
+    settle = events[1][1]
+    assert Decimal(reserve["max_usd"]) > 0
+    assert settle["settled_usd"] == "0.00045"
+    assert settle["estimated"] is False
+    assert agent._atlas_sol_last_call["actual_cost_usd"] == "0"
+
+
+def test_openrouter_sol_missing_cost_component_settles_estimated_ceiling(monkeypatch):
+    monkeypatch.setenv("ATLAS_MODEL_ROUTING_TRANSPORT", "openrouter")
+    response = {
+        "model": "openai/gpt-6.1-sol", "service_tier": "default",
+        "usage": {"input_tokens": 100, "output_tokens": 25, "cost": 0, "is_byok": True},
+    }
+    parts = budget._cost_components(response, Decimal("1"))
+    expected = budget._estimated_usd(response, Decimal("1"))
+    assert parts["actual_cost_estimated"] is True
+    assert Decimal(parts["byok_total_cost_usd"]) == expected
+    assert expected > 0
+
+
+def test_responses_input_cache_counts_are_excluded_from_canonical_input(monkeypatch):
+    monkeypatch.setenv("ATLAS_MODEL_ROUTING_TRANSPORT", "openrouter")
+    fields = budget.openai_usage_fields({
+        "usage": {"input_tokens": 100, "output_tokens": 25,
+                  "input_tokens_details": {"cached_tokens": 10, "cache_write_tokens": 20}},
+        "service_tier": "default",
+    })
+    assert fields["input_tokens"] == 70
+    assert fields["input_tokens_total"] == 100
+    assert fields["cache_read_tokens"] == 10
+    assert fields["cache_write_tokens"] == 20
+
+
 def test_denied_sol_call_falls_back_to_luna(monkeypatch):
     monkeypatch.setenv("ATLAS_SOL_ACCOUNTING_SOCKET", "/tmp/test-accounting.sock")
     monkeypatch.setenv("ATLAS_SOL_ACCOUNTING_TOKEN_FILE", "/tmp/test-accounting-token")
@@ -156,12 +223,12 @@ def test_sol_stream_transport_failure_does_not_hide_billable_retry(monkeypatch):
     assert len(calls) == 1
 
 
-def test_accounting_token_rejects_group_readable_file(tmp_path):
+def test_accounting_token_rejects_group_writable_file(tmp_path):
     import pytest
 
     token_file = tmp_path / "accounting-token"
     token_file.write_text("fixture-only\n", encoding="utf-8")
-    token_file.chmod(0o640)
+    token_file.chmod(0o660)
     with pytest.raises(ValueError):
         budget._read_token(token_file)
 
@@ -175,5 +242,5 @@ def test_luna_summary_usage_is_included_in_turn_receipts(monkeypatch):
     call = agent.session_usage_calls[0]
     assert call["generation_id"] == "resp-summary"
     assert call["provider"] == "openai" and call["route_request_id"] == "turn-fixture"
-    assert call["input_tokens"] == 100 and call["output_tokens"] == 50
+    assert call["input_tokens"] == 20 and call["input_tokens_total"] == 100 and call["output_tokens"] == 50
     assert call["cache_read_tokens"] == 80 and call["reasoning_tokens"] == 20

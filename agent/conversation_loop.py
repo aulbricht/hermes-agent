@@ -94,6 +94,11 @@ def _atlas_route_usage_fields(agent: Any) -> dict[str, Any]:
             fields["maximum_usd"] = admission["max_usd"]
         if admission.get("settled_usd") is not None:
             fields["settled_usd"] = admission["settled_usd"]
+        if admission.get("settlement_estimated") is not None:
+            fields["settlement_estimated"] = admission["settlement_estimated"]
+        for key in ("actual_cost_usd", "upstream_cost_usd", "byok_total_cost_usd", "actual_cost_estimated", "is_byok"):
+            if key in admission:
+                fields[key] = admission[key]
     return fields
 
 
