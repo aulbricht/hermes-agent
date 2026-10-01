@@ -500,7 +500,7 @@ def init_agent(
     except Exception:
         pass
 
-    # GPT-5.x models usually require the Responses API path, but some
+    # GPT-5.x and GPT-6.x models usually require the Responses API path, but some
     # providers have exceptions (for example Copilot's gpt-5-mini still
     # uses chat completions). Also auto-upgrade for direct OpenAI URLs
     # (api.openai.com) since all newer tool-calling models prefer
@@ -509,7 +509,7 @@ def init_agent(
     # surface.
     # When api_mode was explicitly provided, respect it — the user
     # knows what their endpoint supports (#10473).
-    # Exception: Azure OpenAI serves gpt-5.x on /chat/completions and
+    # Exception: Azure OpenAI may serve these models on /chat/completions and
     # does NOT support the Responses API — skip the upgrade for Azure
     # (openai.azure.com), even though it looks OpenAI-compatible.
     if (

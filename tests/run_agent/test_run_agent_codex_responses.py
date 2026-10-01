@@ -233,6 +233,96 @@ def test_api_mode_uses_explicit_provider_when_codex(monkeypatch):
     assert agent.provider == "openai-codex"
 
 
+@pytest.mark.parametrize(
+    ("model", "effort"),
+    [
+        ("openai/gpt-6-luna", "xhigh"),
+        ("openai/gpt-6.1-sol", "low"),
+    ],
+)
+def test_openrouter_gpt6_main_request_uses_responses_without_sampling_controls(
+    monkeypatch, model, effort,
+):
+    """Exercise real model routing, main kwargs building, and SDK dispatch."""
+    _patch_agent_bootstrap(monkeypatch)
+    monkeypatch.setattr("agent.agent_init.fetch_model_metadata", lambda: None)
+    agent = run_agent.AIAgent(
+        model=model,
+        provider="openrouter",
+        base_url="https://openrouter.ai/api/v1",
+        api_key="test-key",
+        reasoning_config={"enabled": True, "effort": effort},
+        request_overrides={
+            "temperature": 0.2,
+            "top_p": 0.4,
+            "top_logprobs": 2,
+            "logprobs": True,
+            "include": ["message.output_text.logprobs"],
+        },
+        quiet_mode=True,
+        max_iterations=1,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+    assert agent.api_mode == "codex_responses"
+    assert agent.model == model
+    agent.tools = []
+
+    request = agent._build_api_kwargs(
+        [
+            {"role": "system", "content": "You are Hermes."},
+            {"role": "user", "content": "Reply with OK."},
+        ]
+    )
+    request = agent._get_transport().preflight_kwargs(request, allow_stream=True)
+    assert request["model"] == model
+    assert request["reasoning"]["effort"] == effort
+    assert not any(
+        key in request
+        for key in ("temperature", "top_p", "top_logprobs", "logprobs", "tools")
+    )
+    assert "message.output_text.logprobs" not in request.get("include", [])
+
+    captured = {}
+    stream = _FakeCreateStream(
+        [
+            SimpleNamespace(type="response.completed", response=SimpleNamespace(
+                id="resp_test", status="completed", output=[], model=model,
+            )),
+        ]
+    )
+
+    def fake_create(**kwargs):
+        captured.update(kwargs)
+        return stream
+
+    agent.client = SimpleNamespace(responses=SimpleNamespace(create=fake_create))
+    agent._run_codex_stream(request)
+    assert captured["stream"] is True
+    assert captured["model"] == model
+    assert captured["reasoning"]["effort"] == effort
+    assert not any(
+        key in captured
+        for key in ("temperature", "top_p", "top_logprobs", "logprobs", "tools")
+    )
+
+
+def test_gpt6_sampling_filter_preserves_custom_responses_contract():
+    from agent.transports.codex import ResponsesApiTransport
+
+    payload = ResponsesApiTransport().build_kwargs(
+        model="gpt-6-luna",
+        messages=[{"role": "user", "content": "hello"}],
+        tools=[],
+        provider="custom",
+        base_url="https://models.example.test/v1",
+        reasoning_config={"effort": "low"},
+        request_overrides={"temperature": 0.2, "top_p": 0.4},
+    )
+    assert payload["temperature"] == 0.2
+    assert payload["top_p"] == 0.4
+
+
 def test_api_mode_normalizes_provider_case(monkeypatch):
     _patch_agent_bootstrap(monkeypatch)
     agent = run_agent.AIAgent(

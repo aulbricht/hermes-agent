@@ -1373,16 +1373,16 @@ class AIAgent:
     def _model_requires_responses_api(model: str) -> bool:
         """Return True for models that require the Responses API path.
 
-        GPT-5.x models are rejected on /v1/chat/completions by both
-        OpenAI and OpenRouter (error: ``unsupported_api_for_model``).
+        GPT-5.x and GPT-6.x models require the Responses path for tool-capable
+        reasoning on OpenAI and OpenRouter.
         Detect these so the correct api_mode is set regardless of
         which provider is serving the model.
         """
         m = model.lower()
-        # Strip vendor prefix (e.g. "openai/gpt-5.4" → "gpt-5.4")
+        # Strip vendor prefix (e.g. "openai/gpt-6-luna" → "gpt-6-luna")
         if "/" in m:
             m = m.rsplit("/", 1)[-1]
-        return m.startswith("gpt-5")
+        return m.startswith(("gpt-5", "gpt-6"))
 
     @staticmethod
     def _provider_model_requires_responses_api(
