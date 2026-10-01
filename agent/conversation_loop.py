@@ -102,6 +102,12 @@ def _atlas_route_usage_fields(agent: Any) -> dict[str, Any]:
     return fields
 
 
+def _explicit_byok_value(raw_usage: Any) -> bool | None:
+    """Preserve OpenRouter's explicit BYOK declaration when available."""
+    value = raw_usage.get("is_byok") if isinstance(raw_usage, dict) else None
+    return value if isinstance(value, bool) else None
+
+
 def _image_error_max_dimension(error: Exception) -> Optional[int]:
     """Extract a provider-reported image dimension ceiling, if present."""
     parts = []
@@ -2229,6 +2235,7 @@ def run_conversation(
                     if not isinstance(_cost_details, dict):
                         _cost_details = {}
                     _upstream_cost = _cost_details.get("upstream_inference_cost")
+                    _is_byok = _explicit_byok_value(_raw_usage)
                     try:
                         if _actual_cost is not None:
                             agent.session_actual_cost_usd += max(0.0, float(_actual_cost))
@@ -2240,7 +2247,7 @@ def run_conversation(
                             agent.session_upstream_cost_usd += max(0.0, float(_upstream_cost))
                     except (TypeError, ValueError):
                         _upstream_cost = None
-                    agent.session_usage_calls.append({
+                    _call_usage = {
                         "generation_id": str(getattr(response, "id", "") or ""),
                         "service_tier": getattr(response, "service_tier", None),
                         "usage_available": getattr(response, "usage", None) is not None,
@@ -2252,10 +2259,17 @@ def run_conversation(
                         "cache_write_tokens": canonical_usage.cache_write_tokens,
                         "reasoning_tokens": canonical_usage.reasoning_tokens,
                         "actual_cost_usd": float(_actual_cost) if _actual_cost is not None else None,
-                        "upstream_cost_usd": float(_upstream_cost) if _upstream_cost is not None else 0.0,
+                        "upstream_cost_usd": float(_upstream_cost) if _upstream_cost is not None else None,
                         **_atlas_route_usage_fields(agent),
                         **(openai_usage_fields(response) if os.environ.get("ATLAS_MODEL_ROUTING_ENABLED") == "true" and agent.api_mode == "codex_responses" else {}),
-                    })
+                    }
+                    # Preserve the provider's explicit BYOK bit on each call.
+                    # Downstream non-stream API consumers only see aggregate
+                    # usage, so losing this field would make a genuine zero
+                    # OpenRouter fee look like a zero-cost inference.
+                    if isinstance(_is_byok, bool):
+                        _call_usage["is_byok"] = _is_byok
+                    agent.session_usage_calls.append(_call_usage)
                     # Add MoA advisor cost (already priced per-advisor at each
                     # advisor's own model rate) on top of the aggregator cost.
                     if _moa_ref_cost is not None:

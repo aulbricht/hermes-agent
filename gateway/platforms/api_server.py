@@ -39,6 +39,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from functools import wraps
 import logging
+import math
 import os
 import socket as _socket
 import re
@@ -105,6 +106,62 @@ MAX_REQUEST_BYTES = 10_000_000  # 10 MB — accommodates long agent conversation
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
+
+
+def _consistent_usage_byok(usage: dict) -> bool | None:
+    """Return a BYOK flag only when every recorded call agrees explicitly."""
+    direct = usage.get("is_byok")
+    calls = usage.get("calls")
+    if calls is None:
+        return direct if isinstance(direct, bool) else None
+    if not isinstance(calls, list) or not calls:
+        return None
+    values = [call.get("is_byok") for call in calls if isinstance(call, dict)]
+    if len(values) != len(calls) or not values or not all(isinstance(value, bool) for value in values):
+        return None
+    calls_value = values[0] if all(value is values[0] for value in values) else None
+    if calls_value is None or (isinstance(direct, bool) and direct is not calls_value):
+        return None
+    return calls_value
+
+
+def _complete_byok_cost_components(usage: dict) -> tuple[float, float] | None:
+    """Aggregate BYOK cost components only when every call reports both."""
+    calls = usage.get("calls")
+    if not isinstance(calls, list) or not calls:
+        return None
+    charged_total = 0.0
+    upstream_total = 0.0
+    for call in calls:
+        if not isinstance(call, dict) or call.get("provider") != "openrouter" or call.get("is_byok") is not True:
+            return None
+        charged = call.get("actual_cost_usd")
+        upstream = call.get("upstream_cost_usd")
+        if charged is None or upstream is None:
+            return None
+        try:
+            charged_value = float(charged)
+            upstream_value = float(upstream)
+        except (TypeError, ValueError):
+            return None
+        if (not math.isfinite(charged_value) or not math.isfinite(upstream_value)
+                or charged_value < 0 or upstream_value < 0):
+            return None
+        charged_total += charged_value
+        upstream_total += upstream_value
+        if not math.isfinite(charged_total) or not math.isfinite(upstream_total):
+            return None
+    return charged_total, upstream_total
+
+
+def _has_unresolved_openrouter_byok(usage: dict) -> bool:
+    """Detect OpenRouter call records whose BYOK status is missing or mixed."""
+    calls = usage.get("calls")
+    return (
+        isinstance(calls, list)
+        and any(isinstance(call, dict) and call.get("provider") == "openrouter" for call in calls)
+        and _consistent_usage_byok(usage) is None
+    )
 
 
 def _coerce_port(value: Any, default: int = DEFAULT_PORT) -> int:
@@ -2580,6 +2637,23 @@ class APIServerAdapter(BasePlatformAdapter):
         # Soft-partial path: we have *some* text but the run did not complete
         # (e.g. truncation with partial buffered output). Still 200 but signal
         # truncation via finish_reason="length" + Hermes-specific extras.
+        byok_state = _consistent_usage_byok(usage)
+        byok_components = _complete_byok_cost_components(usage) if byok_state is True else None
+        unresolved_byok = _has_unresolved_openrouter_byok(usage)
+        byok_cost_incomplete = (
+            isinstance(usage.get("calls"), list)
+            and (unresolved_byok or (byok_state is True and byok_components is None))
+        )
+        if byok_components is not None:
+            response_cost, response_upstream_cost = byok_components
+        elif byok_cost_incomplete:
+            # A partial aggregate must not turn absent provider metadata into a
+            # confirmed zero. Keep estimates separate from observed components.
+            response_cost, response_upstream_cost = None, None
+        else:
+            response_cost = usage.get("actual_cost_usd") if usage.get("actual_cost_available") else None
+            response_upstream_cost = usage.get("upstream_cost_usd", 0)
+
         response_data = {
             "id": completion_id,
             "object": "chat.completion",
@@ -2604,10 +2678,26 @@ class APIServerAdapter(BasePlatformAdapter):
                     "cache_write_tokens": usage.get("cache_write_tokens", 0),
                 },
                 "completion_tokens_details": {"reasoning_tokens": usage.get("reasoning_tokens", 0)},
-                "cost": usage.get("actual_cost_usd") if usage.get("actual_cost_available") else None,
-                "cost_details": {"upstream_inference_cost": usage.get("upstream_cost_usd", 0)},
+                "cost": response_cost,
+                "cost_details": {"upstream_inference_cost": response_upstream_cost},
             },
         }
+        if byok_state is not None:
+            response_data["usage"]["is_byok"] = byok_state
+        if byok_cost_incomplete:
+            estimated = usage.get("estimated_cost_usd")
+            try:
+                estimated = float(estimated) if estimated is not None else None
+                if estimated is not None and (not math.isfinite(estimated) or estimated < 0):
+                    estimated = None
+                elif estimated is not None and byok_state is True:
+                    estimated *= 1.05
+            except (TypeError, ValueError):
+                estimated = None
+            response_data["usage"]["actual_cost_estimated"] = True
+            if estimated is not None:
+                estimate_key = "byok_total_cost_usd" if byok_state is True else "estimated_total_usd"
+                response_data["usage"][estimate_key] = estimated
         if is_partial or is_failed or not completed:
             response_data["hermes"] = {
                 "completed": completed,

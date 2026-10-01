@@ -1,6 +1,6 @@
 from types import SimpleNamespace
 
-from agent.conversation_loop import _atlas_route_usage_fields
+from agent.conversation_loop import _atlas_route_usage_fields, _explicit_byok_value
 
 
 def test_route_usage_fields_link_denied_sol_fallback_to_luna():
@@ -39,3 +39,10 @@ def test_route_usage_fields_keep_sol_reservation_maximum_and_settlement():
         "maximum_usd": "0.30",
         "settled_usd": "0.12",
     }
+
+
+def test_explicit_byok_value_preserves_both_boolean_states_only():
+    assert _explicit_byok_value({"is_byok": True}) is True
+    assert _explicit_byok_value({"is_byok": False}) is False
+    assert _explicit_byok_value({"is_byok": "true"}) is None
+    assert _explicit_byok_value(None) is None

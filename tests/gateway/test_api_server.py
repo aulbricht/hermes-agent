@@ -3061,6 +3061,130 @@ class TestUsageCounting:
             assert data["usage"]["completion_tokens"] == 80
             assert data["usage"]["total_tokens"] == 280
 
+    @pytest.mark.asyncio
+    async def test_non_stream_usage_preserves_explicit_byok_with_zero_platform_fee(self, adapter):
+        """Support-style callers must receive BYOK metadata with provider costs."""
+        app = _create_app(adapter)
+        usage = {
+            "input_tokens": 11, "output_tokens": 5, "total_tokens": 16,
+            "actual_cost_available": True, "actual_cost_usd": 0.0,
+            "upstream_cost_usd": 0.0000036,
+            "calls": [{"provider": "openrouter", "model": "openai/gpt-6-luna", "is_byok": True,
+                       "actual_cost_usd": 0.0, "upstream_cost_usd": 0.0000036}],
+        }
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = ({"final_response": "Diagnosis", "messages": [], "api_calls": 1}, usage)
+                response = await cli.post("/v1/chat/completions", json={
+                    "model": "hermes", "messages": [{"role": "user", "content": "check"}],
+                })
+            assert response.status == 200
+            data = await response.json()
+
+        assert data["usage"]["is_byok"] is True
+        assert data["usage"]["cost"] == 0.0
+        assert data["usage"]["cost_details"]["upstream_inference_cost"] == 0.0000036
+
+    @pytest.mark.asyncio
+    async def test_non_stream_partial_byok_cost_is_unknown_and_separately_estimated(self, adapter):
+        """Missing per-call upstream data must not be serialized as confirmed $0."""
+        app = _create_app(adapter)
+        usage = {
+            "input_tokens": 11, "output_tokens": 5, "total_tokens": 16,
+            "estimated_cost_usd": 0.0000036,
+            "actual_cost_available": True, "actual_cost_usd": 0.0,
+            "upstream_cost_usd": 0.0,
+            "calls": [
+                {"provider": "openrouter", "is_byok": True,
+                 "actual_cost_usd": 0.0, "upstream_cost_usd": 0.0000036},
+                {"provider": "openrouter", "is_byok": True,
+                 "actual_cost_usd": 0.0, "upstream_cost_usd": None},
+            ],
+        }
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = ({"final_response": "Diagnosis", "messages": [], "api_calls": 2}, usage)
+                response = await cli.post("/v1/chat/completions", json={
+                    "model": "hermes", "messages": [{"role": "user", "content": "check"}],
+                })
+            assert response.status == 200
+            data = await response.json()
+
+        assert data["usage"]["is_byok"] is True
+        assert data["usage"]["cost"] is None
+        assert data["usage"]["cost_details"]["upstream_inference_cost"] is None
+        assert data["usage"]["actual_cost_estimated"] is True
+        assert data["usage"]["byok_total_cost_usd"] == pytest.approx(0.00000378)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("second_call", [
+        {"provider": "openrouter", "is_byok": False, "actual_cost_usd": 0.0, "upstream_cost_usd": None},
+        {"provider": "openrouter", "actual_cost_usd": 0.0, "upstream_cost_usd": None},
+    ])
+    async def test_non_stream_unresolved_byok_calls_do_not_expose_partial_aggregate(self, adapter, second_call):
+        """Missing or conflicting flags cannot make the session aggregate look complete."""
+        from gateway.platforms.api_server import _complete_byok_cost_components
+
+        assert _complete_byok_cost_components({"calls": [
+            {"provider": "openrouter", "is_byok": True, "actual_cost_usd": float("nan"), "upstream_cost_usd": 1},
+        ]}) is None
+        assert _complete_byok_cost_components({"calls": [
+            {"provider": "openrouter", "is_byok": True, "actual_cost_usd": -0.01, "upstream_cost_usd": 1},
+        ]}) is None
+
+        app = _create_app(adapter)
+        usage = {
+            "input_tokens": 11, "output_tokens": 5, "estimated_cost_usd": 0.0000036,
+            "actual_cost_available": True, "actual_cost_usd": 0.0, "upstream_cost_usd": 0.0,
+            "is_byok": True,
+            "calls": [
+                {"provider": "openrouter", "is_byok": True, "actual_cost_usd": 0.0, "upstream_cost_usd": 0.0000036},
+                second_call,
+            ],
+        }
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = ({"final_response": "Diagnosis", "messages": [], "api_calls": 2}, usage)
+                response = await cli.post("/v1/chat/completions", json={
+                    "model": "hermes", "messages": [{"role": "user", "content": "check"}],
+                })
+            assert response.status == 200
+            data = await response.json()
+
+        assert "is_byok" not in data["usage"]
+        assert data["usage"]["cost"] is None
+        assert data["usage"]["cost_details"]["upstream_inference_cost"] is None
+        assert data["usage"]["actual_cost_estimated"] is True
+        assert data["usage"]["estimated_total_usd"] == pytest.approx(0.0000036)
+
+    @pytest.mark.asyncio
+    async def test_non_stream_shared_openrouter_capacity_preserves_known_fee(self, adapter):
+        app = _create_app(adapter)
+        usage = {
+            "actual_cost_available": True, "actual_cost_usd": 0.07,
+            "calls": [{"provider": "openrouter", "is_byok": False, "actual_cost_usd": 0.07}],
+        }
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = ({"final_response": "Diagnosis", "messages": [], "api_calls": 1}, usage)
+                response = await cli.post("/v1/chat/completions", json={
+                    "model": "hermes", "messages": [{"role": "user", "content": "check"}],
+                })
+            assert response.status == 200
+            data = await response.json()
+        assert data["usage"]["is_byok"] is False
+        assert data["usage"]["cost"] == 0.07
+
+    def test_consistent_byok_state_rejects_mixed_or_missing_calls(self):
+        from gateway.platforms.api_server import _consistent_usage_byok
+
+        assert _consistent_usage_byok({"calls": [{"is_byok": True}, {"is_byok": True}]}) is True
+        assert _consistent_usage_byok({"calls": [{"is_byok": True}, {"is_byok": False}]}) is None
+        assert _consistent_usage_byok({"calls": [{"is_byok": True}, {}]}) is None
+        assert _consistent_usage_byok({"is_byok": False, "calls": [{"is_byok": True}]}) is None
+        assert _consistent_usage_byok({"is_byok": True}) is True
+        assert _consistent_usage_byok({"is_byok": True, "calls": []}) is None
+
 
 # ---------------------------------------------------------------------------
 # Truncation
