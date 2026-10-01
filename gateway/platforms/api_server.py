@@ -137,7 +137,7 @@ def _complete_byok_cost_components(usage: dict) -> tuple[float, float] | None:
             return None
         charged = call.get("actual_cost_usd")
         upstream = call.get("upstream_cost_usd")
-        if charged is None or upstream is None:
+        if charged is None or upstream is None or isinstance(charged, bool) or isinstance(upstream, bool):
             return None
         try:
             charged_value = float(charged)

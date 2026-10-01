@@ -3175,6 +3175,14 @@ class TestUsageCounting:
         assert data["usage"]["is_byok"] is False
         assert data["usage"]["cost"] == 0.07
 
+    @pytest.mark.parametrize("charged,upstream", [(True, 0), (0, False), (False, True)])
+    def test_byok_cost_components_reject_boolean_amounts(self, charged, upstream):
+        from gateway.platforms.api_server import _complete_byok_cost_components
+        assert _complete_byok_cost_components({"calls": [{
+            "provider": "openrouter", "is_byok": True,
+            "actual_cost_usd": charged, "upstream_cost_usd": upstream,
+        }]}) is None
+
     def test_consistent_byok_state_rejects_mixed_or_missing_calls(self):
         from gateway.platforms.api_server import _consistent_usage_byok
 
