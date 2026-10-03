@@ -346,6 +346,7 @@ def init_agent(
     checkpoint_max_total_size_mb: int = 500,
     checkpoint_max_file_size_mb: int = 10,
     pass_session_id: bool = False,
+    atlas_delegation_policy: str = None,
 ):
     """
     Initialize the AI Agent.
@@ -396,6 +397,13 @@ def init_agent(
             identity even when skip_context_files=True. Project context files from the cwd
             remain skipped.
     """
+    from agent.atlas_delegation import POLICY_VERSION
+    if atlas_delegation_policy not in (None, POLICY_VERSION):
+        raise ValueError("Unknown Atlas delegation policy")
+    agent._atlas_delegation_policy = atlas_delegation_policy
+    if atlas_delegation_policy is not None:
+        skip_memory = skip_context_files = True
+        load_soul_identity = False
     _install_safe_stdio()
 
     agent.model = model
@@ -1762,7 +1770,7 @@ def init_agent(
     _engine_name = "compressor"  # default
     try:
         _ctx_cfg = _agent_cfg.get("context", {}) if isinstance(_agent_cfg, dict) else {}
-        _engine_name = _ctx_cfg.get("engine", "compressor") or "compressor"
+        _engine_name = "compressor" if atlas_delegation_policy else (_ctx_cfg.get("engine", "compressor") or "compressor")
     except Exception:
         pass
 

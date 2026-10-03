@@ -6470,6 +6470,8 @@ def _atlas_direct_auxiliary_call(
 
     if async_mode:
         async def _perform():
+            from agent.atlas_delegation import validate_auxiliary_dispatch
+            validate_auxiliary_dispatch()
             raw_response = await client.chat.completions.create(**kwargs)
             from agent.atlas_auxiliary_accounting import record_completed_response_async
             try:
@@ -6479,6 +6481,8 @@ def _atlas_direct_auxiliary_call(
             return _validate_llm_response(raw_response, task)
         return _perform()
 
+    from agent.atlas_delegation import validate_auxiliary_dispatch
+    validate_auxiliary_dispatch()
     raw_response = client.chat.completions.create(**kwargs)
     from agent.atlas_auxiliary_accounting import record_completed_response
     try:
@@ -6597,6 +6601,8 @@ def call_llm(
     Raises:
         RuntimeError: If no provider is configured.
     """
+    from agent.atlas_delegation import validate_auxiliary_dispatch
+    validate_auxiliary_dispatch()
     from agent.atlas_auxiliary_accounting import atlas_auxiliary_enabled
     if atlas_auxiliary_enabled():
         return _atlas_direct_auxiliary_call(
@@ -7224,6 +7230,8 @@ async def async_call_llm(
 
     Same as call_llm() but async. See call_llm() for full documentation.
     """
+    from agent.atlas_delegation import validate_auxiliary_dispatch
+    validate_auxiliary_dispatch()
     from agent.atlas_auxiliary_accounting import atlas_auxiliary_enabled
     if atlas_auxiliary_enabled():
         return await _atlas_direct_auxiliary_call(

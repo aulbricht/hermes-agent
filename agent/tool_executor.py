@@ -154,6 +154,9 @@ def _emit_terminal_post_tool_call(
     error_message: str | None = None,
     middleware_trace: Optional[list[dict[str, Any]]] = None,
 ) -> None:
+    from agent.atlas_delegation import is_scoped
+    if is_scoped(agent):
+        return
     try:
         from model_tools import _emit_post_tool_call_hook
         _emit_post_tool_call_hook(
@@ -271,6 +274,9 @@ def _apply_tool_request_middleware_for_agent(
     effective_task_id: str,
     tool_call_id: str,
 ) -> tuple[dict, list[dict[str, Any]]]:
+    from agent.atlas_delegation import is_scoped
+    if is_scoped(agent):
+        return function_args, []
     try:
         from hermes_cli.middleware import apply_tool_request_middleware
 
@@ -299,6 +305,13 @@ def _run_agent_tool_execution_middleware(
     tool_call_id: str,
     execute,
 ) -> tuple[Any, dict]:
+    from agent.atlas_delegation import is_scoped, tool_allowed
+    if is_scoped(agent):
+        if not tool_allowed(agent, function_name):
+            return json.dumps({"error": "Tool is unavailable in this Atlas View As session"}), function_args
+        from agent.atlas_delegation import dispatch_tool
+        return dispatch_tool(agent, function_name, function_args, effective_task_id), function_args
+
     observed_args = function_args
 
     def _execute(next_args: dict) -> Any:
@@ -356,6 +369,11 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     parsed_calls = []  # list of (tool_call, function_name, function_args, middleware_trace, block_result, blocked_by_guardrail)
     for tool_call in tool_calls:
         function_name = tool_call.function.name
+
+        from agent.atlas_delegation import tool_allowed
+        if not tool_allowed(agent, function_name):
+            parsed_calls.append((tool_call, function_name, {}, [], json.dumps({"error": "Tool is unavailable in this Atlas View As session"}), False))
+            continue
 
         function_args, malformed_args_result = _parse_tool_arguments(
             tool_call.function.arguments
@@ -445,7 +463,10 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             )
         else:
             try:
+                from agent.atlas_delegation import is_scoped
                 from hermes_cli.plugins import resolve_pre_tool_block
+                if is_scoped(agent):
+                    resolve_pre_tool_block = lambda *args, **kwargs: None
                 block_message = resolve_pre_tool_block(
                     function_name,
                     function_args,
@@ -1048,6 +1069,11 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
 
         function_name = tool_call.function.name
 
+        from agent.atlas_delegation import tool_allowed
+        if not tool_allowed(agent, function_name):
+            messages.append(make_tool_result_message(function_name, "Tool is unavailable in this Atlas View As session", tool_call.id))
+            continue
+
         function_args, malformed_args_result = _parse_tool_arguments(
             tool_call.function.arguments
         )
@@ -1103,7 +1129,10 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             _block_error_type = "tool_scope_block"
         else:
             try:
+                from agent.atlas_delegation import is_scoped
                 from hermes_cli.plugins import resolve_pre_tool_block
+                if is_scoped(agent):
+                    resolve_pre_tool_block = lambda *args, **kwargs: None
                 _block_msg = resolve_pre_tool_block(
                     function_name,
                     function_args,
@@ -1233,6 +1262,10 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 error_message=getattr(_guardrail_block_decision, "message", None) or "Tool blocked by guardrail policy",
                 middleware_trace=list(middleware_trace),
             )
+        elif getattr(agent, "_atlas_delegation_policy", None) is not None:
+            from agent.atlas_delegation import dispatch_tool
+            function_result = dispatch_tool(agent, function_name, function_args, effective_task_id)
+            tool_duration = time.time() - tool_start_time
         elif function_name == "todo":
             def _execute(next_args: dict) -> Any:
                 from tools.todo_tool import todo_tool as _todo_tool

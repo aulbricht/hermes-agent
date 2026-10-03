@@ -419,6 +419,24 @@ def _multimodal_validation_error(exc: ValueError, *, param: str) -> "web.Respons
     )
 
 
+def _atlas_delegation_context(adapter, request):
+    """Only authenticated server callers can select the fixed View As lane."""
+    from agent.atlas_delegation import POLICY_VERSION
+    version = request.headers.get("X-Atlas-Delegation-Policy")
+    identities = {
+        "actor_user_id": request.headers.get("X-Atlas-Delegated-Actor", ""),
+        "subject_user_id": request.headers.get("X-Atlas-Delegated-Subject", ""),
+        "view_as_session_id": request.headers.get("X-Atlas-Delegated-Session", ""),
+    }
+    if version is None and not any(identities.values()):
+        return None, None
+    if not adapter._api_key:
+        return None, web.json_response(_openai_error("Atlas delegation requires API authentication"), status=401)
+    if version != POLICY_VERSION or any(not re.fullmatch(r"[A-Za-z0-9_.:-]{1,200}", value) for value in identities.values()):
+        return None, web.json_response(_openai_error("Invalid Atlas delegation policy or identity"), status=400)
+    return identities, None
+
+
 def _session_chat_user_message(body: Dict[str, Any], *, param: str = "message") -> tuple[Any, Optional["web.Response"]]:
     """Parse and normalize session chat ``message`` / ``input`` like chat completions."""
     user_message = body.get("message") or body.get("input")
@@ -1477,6 +1495,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_complete_callback=None,
         gateway_session_key: Optional[str] = None,
         route: Optional[Dict[str, Any]] = None,
+        atlas_delegation_context: Optional[Dict[str, str]] = None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -1576,6 +1595,9 @@ class APIServerAdapter(BasePlatformAdapter):
 
         user_config = _load_gateway_config()
         enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
+        if atlas_delegation_context is not None:
+            from agent.atlas_delegation import TOOLSETS
+            enabled_toolsets = list(TOOLSETS)
 
         max_iterations = _current_max_iterations()
         if route and not session_override and route.get("max_iterations"):
@@ -1583,9 +1605,11 @@ class APIServerAdapter(BasePlatformAdapter):
 
         # Load fallback provider chain so the API server platform has the
         # same fallback behaviour as Telegram/Discord/Slack (fixes #4954).
-        fallback_model = GatewayRunner._load_fallback_model()
+        fallback_model = None if atlas_delegation_context is not None else GatewayRunner._load_fallback_model()
 
+        scoped_kwargs = {"atlas_delegation_policy": "view-as-v1", "skip_memory": True, "skip_context_files": True} if atlas_delegation_context is not None else {}
         agent = AIAgent(
+            **scoped_kwargs,
             model=model,
             **runtime_kwargs,
             max_iterations=max_iterations,
@@ -1604,6 +1628,10 @@ class APIServerAdapter(BasePlatformAdapter):
             reasoning_config=reasoning_config,
             gateway_session_key=gateway_session_key,
         )
+        if atlas_delegation_context is not None:
+            from agent.atlas_delegation import bind_policy, validate_dispatch
+            bind_policy(agent, atlas_delegation_context)
+            validate_dispatch(agent)
         return agent
 
     # ------------------------------------------------------------------
@@ -1818,6 +1846,19 @@ class APIServerAdapter(BasePlatformAdapter):
             "object": "list",
             "data": skills,
         })
+
+    async def _handle_atlas_delegation_policy(self, request):
+        auth_error = self._check_auth(request)
+        if auth_error is not None:
+            return auth_error
+        if not self._api_key:
+            return web.json_response(_openai_error("Atlas delegation requires API authentication"), status=401)
+        from agent.atlas_delegation import capability
+        try:
+            result = await asyncio.to_thread(capability)
+        except Exception:
+            return web.json_response(_openai_error("Atlas delegation readers are unavailable"), status=503)
+        return web.json_response(result, headers={"Cache-Control": "no-store"})
 
     async def _handle_toolsets(self, request: "web.Request") -> "web.Response":
         """GET /v1/toolsets — list toolsets and their resolved tools.
@@ -2130,6 +2171,9 @@ class APIServerAdapter(BasePlatformAdapter):
     @_admit_api_agent_request
     async def _handle_session_chat(self, request: "web.Request") -> "web.Response":
         """POST /api/sessions/{session_id}/chat — one synchronous agent turn."""
+        delegation_context, policy_error = _atlas_delegation_context(self, request)
+        if policy_error is not None:
+            return policy_error
         gateway_session_key, key_err = self._parse_session_key_header(request)
         if key_err is not None:
             return key_err
@@ -2166,6 +2210,7 @@ class APIServerAdapter(BasePlatformAdapter):
             gateway_session_key=gateway_session_key,
             provider_user_hash=provider_user_hash or None,
             atlas_route_request_id=atlas_route_request_id,
+            **({"atlas_delegation_context": delegation_context} if delegation_context is not None else {}),
             route=route,
         )
         effective_session_id = result.get("session_id") if isinstance(result, dict) else session_id
@@ -2186,6 +2231,9 @@ class APIServerAdapter(BasePlatformAdapter):
     @_admit_api_agent_request
     async def _handle_session_chat_stream(self, request: "web.Request") -> "web.StreamResponse":
         """POST /api/sessions/{session_id}/chat/stream — SSE wrapper over _run_agent."""
+        delegation_context, policy_error = _atlas_delegation_context(self, request)
+        if policy_error is not None:
+            return policy_error
         gateway_session_key, key_err = self._parse_session_key_header(request)
         if key_err is not None:
             return key_err
@@ -2265,6 +2313,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     gateway_session_key=gateway_session_key,
                     provider_user_hash=provider_user_hash or None,
                     atlas_route_request_id=atlas_route_request_id,
+                    **({"atlas_delegation_context": delegation_context} if delegation_context is not None else {}),
                     route=route,
                 )
                 final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
@@ -4359,6 +4408,7 @@ class APIServerAdapter(BasePlatformAdapter):
         route: Optional[Dict[str, Any]] = None,
         provider_user_hash: Optional[str] = None,
         atlas_route_request_id: Optional[str] = None,
+        atlas_delegation_context: Optional[Dict[str, str]] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -4395,6 +4445,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     tool_complete_callback=tool_complete_callback,
                     gateway_session_key=gateway_session_key,
                     route=route,
+                    **({"atlas_delegation_context": atlas_delegation_context} if atlas_delegation_context is not None else {}),
                 )
                 if provider_user_hash:
                     overrides = dict(getattr(agent, "request_overrides", {}) or {})
@@ -4405,11 +4456,13 @@ class APIServerAdapter(BasePlatformAdapter):
                 if agent_ref is not None:
                     agent_ref[0] = agent
                 effective_task_id = session_id or str(uuid.uuid4())
-                result = agent.run_conversation(
-                    user_message=user_message,
-                    conversation_history=conversation_history,
-                    task_id=effective_task_id,
-                )
+                from agent.atlas_delegation import dispatch_context
+                with dispatch_context(agent):
+                    result = agent.run_conversation(
+                        user_message=user_message,
+                        conversation_history=conversation_history,
+                        task_id=effective_task_id,
+                    )
                 usage = {
                     "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
                     "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
@@ -5156,6 +5209,7 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/v1/capabilities", self._handle_capabilities)
             self._app.router.add_get("/v1/skills", self._handle_skills)
             self._app.router.add_get("/v1/toolsets", self._handle_toolsets)
+            self._app.router.add_get("/v1/atlas-delegation-policy", self._handle_atlas_delegation_policy)
             # Session/client control surface (thin wrappers over SessionDB + _run_agent)
             self._app.router.add_get("/api/sessions", self._handle_list_sessions)
             self._app.router.add_post("/api/sessions", self._handle_create_session)

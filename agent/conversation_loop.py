@@ -393,7 +393,9 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     # session is created (not on continuation).  Plugins can use this
     # to initialise session-scoped state (e.g. warm a memory cache).
     try:
-        from hermes_cli.plugins import invoke_hook as _invoke_hook
+        from hermes_cli.plugins import invoke_hook as _raw_invoke_hook
+        from agent.atlas_delegation import is_scoped
+        _invoke_hook = (lambda *args, **kwargs: []) if is_scoped(agent) else _raw_invoke_hook
         _invoke_hook(
             "on_session_start",
             session_id=agent.session_id,
@@ -1212,6 +1214,10 @@ def run_conversation(
                 try:
                     from hermes_cli.middleware import apply_llm_request_middleware
 
+                    from agent.atlas_delegation import is_scoped
+                    if is_scoped(agent):
+                        from types import SimpleNamespace
+                        apply_llm_request_middleware = lambda payload, **kwargs: SimpleNamespace(payload=payload, original_payload=dict(payload), trace=[])
                     _llm_request_mw = apply_llm_request_middleware(
                         api_kwargs,
                         task_id=effective_task_id,
@@ -1237,7 +1243,8 @@ def run_conversation(
                         has_hook,
                         invoke_hook as _invoke_hook,
                     )
-                    if has_hook("pre_api_request"):
+                    from agent.atlas_delegation import is_scoped
+                    if not is_scoped(agent) and has_hook("pre_api_request"):
                         request_messages = api_kwargs.get("messages")
                         if not isinstance(request_messages, list):
                             request_messages = api_kwargs.get("input")
@@ -1360,6 +1367,9 @@ def run_conversation(
                     return agent._interruptible_api_call(next_api_kwargs)
 
                 from hermes_cli.middleware import run_llm_execution_middleware
+                from agent.atlas_delegation import is_scoped
+                if is_scoped(agent):
+                    run_llm_execution_middleware = lambda payload, execute, **kwargs: execute(payload)
 
                 from agent.atlas_sol_budget import admitted_call
 
@@ -4395,7 +4405,8 @@ def run_conversation(
                     has_hook,
                     invoke_hook as _invoke_hook,
                 )
-                if has_hook("post_api_request"):
+                from agent.atlas_delegation import is_scoped
+                if not is_scoped(agent) and has_hook("post_api_request"):
                     _assistant_tool_calls = (
                         getattr(assistant_message, "tool_calls", None) or []
                     )

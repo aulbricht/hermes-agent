@@ -1,0 +1,245 @@
+"""Runtime View As policy tests: dispatch authority, provenance and isolation."""
+import base64
+import hashlib
+import hmac
+import json
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
+import pytest
+from agent import atlas_delegation as policy
+from tools.registry import registry
+from tests.run_agent.test_tool_call_guardrail_runtime import _make_agent, _mock_tool_call
+
+
+def scoped_agent(monkeypatch):
+    agent = _make_agent("web_search", "terminal")
+    schema = {"name": "web_search", "parameters": {"type": "object"}}
+    handler = MagicMock(return_value=json.dumps({"ok": True}))
+    entry = SimpleNamespace(handler=handler, schema=schema, max_result_size_chars=None, is_async=False)
+    monkeypatch.setitem(registry._tools, "web_search", entry)
+    agent._atlas_delegation_policy = policy.POLICY_VERSION
+    agent._atlas_delegation_allowed_tools = policy.ALLOWED_TOOLS
+    agent._atlas_delegation_entries = {"web_search": (handler, json.dumps(schema, sort_keys=True), False)}
+    agent._atlas_delegation_fingerprints = {"reader": "protected"}
+    agent._atlas_delegation_identities = {"actor_user_id": "actor", "subject_user_id": "subject", "view_as_session_id": "session"}
+    monkeypatch.setattr(policy, "_live_reader_fingerprints", lambda: {"reader": "protected"})
+    return agent, handler
+
+
+@pytest.mark.parametrize("concurrent", [False, True])
+def test_both_executors_reject_fabricated_and_out_of_scope_tools(monkeypatch, concurrent):
+    agent, handler = scoped_agent(monkeypatch)
+    monkeypatch.setattr(policy, "validate_dispatch", lambda agent: None)
+    msg = SimpleNamespace(content="", tool_calls=[_mock_tool_call(name) for name in ["terminal", "invented_reader", "web_search"]])
+    messages = []
+    with patch("run_agent.handle_function_call") as broad_dispatch, patch("hermes_cli.plugins.resolve_pre_tool_block") as plugin:
+        executor = agent._execute_tool_calls_concurrent if concurrent else agent._execute_tool_calls_sequential
+        executor(msg, messages, "task")
+    assert len(messages) == 3
+    assert all("unavailable" in m["content"] for m in messages[:2])
+    assert json.loads(messages[2]["content"]) == {"ok": True}
+    handler.assert_called_once()
+    broad_dispatch.assert_not_called()
+    plugin.assert_not_called()
+
+
+@pytest.mark.parametrize("mutation", ["handler", "schema", "transport", "expired"])
+def test_dispatch_fails_closed_after_hot_refresh_or_revocation(monkeypatch, mutation):
+    agent, handler = scoped_agent(monkeypatch)
+    monkeypatch.setattr(policy, "validate_dispatch", lambda agent: None)
+    if mutation == "handler":
+        monkeypatch.setitem(registry._tools, "web_search", SimpleNamespace(handler=MagicMock(), schema=registry._tools["web_search"].schema))
+    elif mutation == "schema":
+        registry._tools["web_search"].schema = {"name": "web_search", "parameters": {"type": "object", "dangerous": True}}
+    elif mutation == "transport":
+        monkeypatch.setattr(policy, "_live_reader_fingerprints", lambda: {"reader": "changed"})
+    else:
+        monkeypatch.setattr(policy, "validate_dispatch", MagicMock(side_effect=policy.DelegationDenied("expired")))
+    assert "unavailable" in policy.dispatch_tool(agent, "web_search", {}, "task")
+    handler.assert_not_called()
+
+
+def test_normal_requests_retain_existing_dispatch_behavior():
+    assert policy.tool_allowed(SimpleNamespace(), "terminal") is True
+    policy.validate_dispatch(SimpleNamespace())
+
+
+def test_scoped_mcp_refresh_cannot_expand_grants(monkeypatch):
+    from tools import mcp_tool
+    agent, _ = scoped_agent(monkeypatch)
+    tools_before = agent.tools
+    with patch("model_tools.get_tool_definitions") as refresh:
+        mcp_tool.refresh_agent_mcp_tools(agent, enabled_override=["untrusted"])
+    refresh.assert_not_called()
+    assert agent.tools is tools_before
+
+
+@pytest.mark.parametrize("payload,status", [({"allowed": True}, 200), ({"allowed": 1}, 200), ({"valid": True}, 200), ({"allowed": True}, 403)])
+def test_fresh_signed_callback_strict_allow_response(monkeypatch, payload, status):
+    agent, _ = scoped_agent(monkeypatch)
+    key = b"fixture-only-credential-1234567890"
+    monkeypatch.setattr(policy, "_read_dispatch_key", lambda: key)
+    response = MagicMock()
+    response.__enter__.return_value = response
+    response.status = status
+    response.read.return_value = json.dumps(payload).encode()
+    opener = MagicMock()
+    opener.open.return_value = response
+    with patch("urllib.request.build_opener", return_value=opener):
+        if payload.get("allowed") is True and status == 200:
+            policy.validate_dispatch(agent)
+            policy.validate_dispatch(agent)
+        else:
+            with pytest.raises(policy.DelegationDenied):
+                policy.validate_dispatch(agent)
+    request = opener.open.call_args.args[0]
+    encoded = request.get_header("X-atlas-delegation")
+    envelope = json.loads(base64.urlsafe_b64decode(encoded))
+    assert envelope["subject_user_id"] == "subject"
+    assert envelope["method"] == "GET"
+    assert envelope["body_sha256"] == hashlib.sha256(b"").hexdigest()
+    assert request.get_header("X-atlas-delegation-signature") == hmac.new(key, encoded.encode(), hashlib.sha256).hexdigest()
+    assert opener.open.call_args.kwargs == {"timeout": 3}
+    if opener.open.call_count == 2:
+        first = json.loads(base64.urlsafe_b64decode(opener.open.call_args_list[0].args[0].get_header("X-atlas-delegation")))
+        assert first["nonce"] != envelope["nonce"]
+
+
+@pytest.mark.parametrize("url", ["https://127.0.0.1:8243/api/v1/internal/view-as/validate", "http://evil:8243/api/v1/internal/view-as/validate", "http://127.0.0.1:8243/api/v1/internal/view-as/validate?override=1", "http://127.0.0.1:9999/api/v1/internal/view-as/validate"])
+def test_callback_url_cannot_escape_loopback_validator(monkeypatch, url):
+    agent, _ = scoped_agent(monkeypatch)
+    monkeypatch.setattr(policy, "_read_dispatch_key", lambda: b"fixture-key")
+    monkeypatch.setenv("ATLAS_VIEW_AS_AUTHORIZATION_URL", url)
+    with patch("urllib.request.build_opener") as opener, pytest.raises(policy.DelegationDenied):
+        policy.validate_dispatch(agent)
+    opener.assert_not_called()
+
+
+def test_auxiliary_context_expires_before_model_dispatch(monkeypatch):
+    agent, _ = scoped_agent(monkeypatch)
+    with patch("agent.atlas_auxiliary_accounting.atlas_auxiliary_enabled", return_value=True), patch.object(policy, "validate_dispatch", side_effect=policy.DelegationDenied("expired")) as check:
+        with policy.dispatch_context(agent), pytest.raises(policy.DelegationDenied):
+            policy.validate_auxiliary_dispatch()
+        check.assert_called_once_with(agent)
+        policy.validate_auxiliary_dispatch()  # context cleaned after failed turn
+        assert check.call_count == 1
+
+
+def test_scope_binding_removes_memory_and_freezes_only_approved_schemas(monkeypatch):
+    agent = SimpleNamespace(context_compressor=SimpleNamespace(), tools=[{"unsafe": True}], _memory_store=object(), _memory_manager=object())
+    schemas = [{"function": {"name": name}} for name in policy.ALLOWED_TOOLS]
+    monkeypatch.setattr(policy, "resolve_policy", lambda: (schemas, {}, {}))
+    policy.bind_policy(agent, {"subject_user_id": "subject"})
+    assert agent.tools == schemas
+    assert agent.valid_tool_names == policy.ALLOWED_TOOLS
+    assert agent._memory_store is None and agent._memory_manager is None
+    assert agent._memory_enabled is False and agent._skill_nudge_interval == 0
+    with pytest.raises(TypeError):
+        agent._atlas_delegation_entries["terminal"] = object()
+
+
+def test_transport_attestation_rejects_writable_or_write_capable_server(monkeypatch):
+    protected = MagicMock(side_effect=lambda path: path)
+    monkeypatch.setattr(policy, "_protected", protected)
+    config = {"enabled": True, "command": "/usr/bin/sudo", "args": ["-n", "-H", "-u", "acrefm", "--", "/usr/local/libexec/acre-filemaker-mcp"], "sampling": {"enabled": False}, "elicitation": {"enabled": False}, "tools": {"resources": False, "prompts": False}}
+    assert policy._transport_fingerprint("acre-filemaker", config)
+    for changed in [{**config, "args": ["node", "writable.js"]}, {**config, "env": {"NODE_OPTIONS": "--require=evil"}}, {**config, "sampling": {"enabled": True}}]:
+        with pytest.raises(policy.DelegationDenied):
+            policy._transport_fingerprint("acre-filemaker", changed)
+    protected.side_effect = policy.DelegationDenied("unprotected")
+    with pytest.raises(policy.DelegationDenied):
+        policy._transport_fingerprint("acre-filemaker", config)
+
+
+def test_capability_requires_real_live_reader_resolution(monkeypatch):
+    monkeypatch.setattr(policy, "resolve_policy", MagicMock(side_effect=policy.DelegationDenied("disconnected")))
+    with pytest.raises(policy.DelegationDenied):
+        policy.capability()
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_expired_session_blocks_primary_model_before_sdk_call(monkeypatch, streaming):
+    agent, _ = scoped_agent(monkeypatch)
+    monkeypatch.setattr(policy, "validate_dispatch", MagicMock(side_effect=policy.DelegationDenied("expired")))
+    with patch("agent.chat_completion_helpers.interruptible_api_call") as ordinary, patch("agent.chat_completion_helpers.interruptible_streaming_api_call") as stream:
+        with pytest.raises(policy.DelegationDenied):
+            (agent._interruptible_streaming_api_call if streaming else agent._interruptible_api_call)({})
+        ordinary.assert_not_called()
+        stream.assert_not_called()
+
+
+def test_expired_session_blocks_compressor_summary():
+    from tests.agent.test_context_compressor_summary_continuity import _compressor
+    compressor = _compressor()
+    compressor._atlas_dispatch_validator = MagicMock(side_effect=policy.DelegationDenied("expired"))
+    with patch("agent.context_compressor.call_llm") as call:
+        compressor._generate_summary([{"role": "user", "content": "history"}])
+        call.assert_not_called()
+    assert compressor._atlas_dispatch_validator.call_count >= 1
+
+
+def test_expiry_between_auxiliary_resolution_and_send_blocks_real_sdk_call(monkeypatch):
+    from agent import auxiliary_client, atlas_auxiliary_accounting as accounting
+    agent, _ = scoped_agent(monkeypatch)
+    monkeypatch.setenv("ATLAS_MODEL_ROUTING_ENABLED", "true")
+    client = MagicMock()
+    client.base_url = "https://api.openai.com/v1"
+    monkeypatch.setattr(auxiliary_client, "_get_cached_client", lambda *a, **kw: (client, accounting.LUNA))
+    checks = MagicMock(side_effect=[None, policy.DelegationDenied("expired")])
+    monkeypatch.setattr(policy, "validate_dispatch", checks)
+    with policy.dispatch_context(agent), pytest.raises(policy.DelegationDenied):
+        auxiliary_client.call_llm(task="compression", messages=[{"role": "user", "content": "history"}])
+    assert checks.call_count == 2
+    client.chat.completions.create.assert_not_called()
+
+
+def test_live_resolution_filters_unknown_tools_and_accepts_actual_async_web_reader(monkeypatch):
+    from tools import mcp_tool
+    schemas = []
+    for name in policy.ALLOWED_TOOLS:
+        def reader(args, **kwargs):
+            return {"ok": True}
+        reader.__module__ = "tools.web_tools" if name.startswith("web_") else "tools.mcp_tool"
+        schema = {"name": name, "parameters": {"type": "object"}}
+        entry = SimpleNamespace(handler=reader, schema=schema, is_async=name == "web_extract")
+        monkeypatch.setitem(registry._tools, name, entry)
+        if name.startswith("mcp__"):
+            monkeypatch.setitem(mcp_tool._mcp_tool_server_names, name, "acre_filemaker" if "acre_filemaker" in name else "atlas_vault")
+        schemas.append({"type": "function", "function": schema})
+    schemas.append({"function": {"name": "terminal"}})
+    monkeypatch.setattr(policy, "_live_reader_fingerprints", lambda: {"reader": "protected"})
+    with patch("model_tools.get_tool_definitions", return_value=schemas):
+        resolved, entries, fingerprints = policy.resolve_policy()
+    assert {s["function"]["name"] for s in resolved} == policy.ALLOWED_TOOLS
+    assert entries["web_extract"][2] is True
+    assert "terminal" not in entries
+    monkeypatch.setitem(mcp_tool._mcp_tool_server_names, "mcp__atlas_vault__vault_read", "untrusted")
+    with patch("model_tools.get_tool_definitions", return_value=schemas), pytest.raises(policy.DelegationDenied):
+        policy.resolve_policy()
+
+
+def test_frozen_async_reader_dispatches_through_existing_bridge(monkeypatch):
+    agent, _ = scoped_agent(monkeypatch)
+    async def reader(args, **kwargs):
+        return json.dumps({"ok": args["value"]})
+    schema = {"name": "web_extract"}
+    monkeypatch.setitem(registry._tools, "web_extract", SimpleNamespace(handler=reader, schema=schema, is_async=True))
+    agent._atlas_delegation_entries["web_extract"] = (reader, json.dumps(schema, sort_keys=True), True)
+    monkeypatch.setattr(policy, "validate_dispatch", lambda agent: None)
+    assert json.loads(policy.dispatch_tool(agent, "web_extract", {"value": "read"}, "task")) == {"ok": "read"}
+
+
+def test_codex_connection_retry_rechecks_expiry_before_second_billable_request(monkeypatch):
+    import httpx
+    from agent.codex_runtime import run_codex_stream
+    agent, _ = scoped_agent(monkeypatch)
+    client = MagicMock()
+    client.responses.create.side_effect = httpx.ConnectError("fixture connection reset")
+    checks = MagicMock(side_effect=[None, policy.DelegationDenied("expired")])
+    monkeypatch.setattr(policy, "validate_dispatch", checks)
+    monkeypatch.delenv("ATLAS_SOL_ACCOUNTING_SOCKET", raising=False)
+    with pytest.raises(policy.DelegationDenied):
+        run_codex_stream(agent, {"model": "fixture"}, client=client)
+    assert checks.call_count == 2
+    client.responses.create.assert_called_once()

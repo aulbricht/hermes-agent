@@ -5264,6 +5264,10 @@ def refresh_agent_mcp_tools(
     explicit user consent; the late-binding and between-turns paths only rebuild
     at a turn boundary, before that turn's ``tools=`` prefix is assembled).
     """
+    from agent.atlas_delegation import is_scoped
+    if is_scoped(agent):
+        return set()  # Scoped turn schemas/grants remain fixed after authentication.
+
     from model_tools import get_tool_definitions
     from tools.registry import registry
 

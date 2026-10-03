@@ -2163,6 +2163,10 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
     tools. Used by the concurrent execution path; the sequential path retains
     its own inline invocation for backward-compatible display handling.
     """
+    from agent.atlas_delegation import is_scoped, dispatch_tool
+    if is_scoped(agent):
+        return dispatch_tool(agent, function_name, function_args if isinstance(function_args, dict) else {}, effective_task_id)
+
     if not isinstance(function_args, dict):
         function_args = {}
 

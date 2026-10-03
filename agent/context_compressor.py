@@ -2117,6 +2117,9 @@ This compaction should PRIORITISE preserving all information related to the focu
             # marker, losing the real handoff (#23975). Re-entrant: a main-model
             # retry (_generate_summary recursion) re-enters harmlessly.
             with aux_interrupt_protection():
+                validator = getattr(self, "_atlas_dispatch_validator", None)
+                if validator is not None:
+                    validator()
                 response = call_llm(**call_kwargs)
             # ``_validate_llm_response`` only guarantees ``choices[0].message``
             # exists, not that it's an object with ``.content``. Some
