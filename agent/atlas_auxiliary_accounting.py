@@ -194,10 +194,32 @@ async def record_completed_response_async(response: Any, *, requested_model: str
 def collect_delegated_response(agent, response, *, requested_model=LUNA, attempt=None):
     """Keep completed usage for durable broker settlement, even after revocation."""
     import hashlib
-    payload = receipt_payload(response, requested_model=requested_model)
     context = agent._atlas_delegation_identities
     actor = context["actor_user_id"]
     usage = _get(response, "usage") or {}
+    input_tokens = _get(usage, "input_tokens")
+    if input_tokens is None:
+        input_tokens = _get(usage, "prompt_tokens")
+    output_tokens = _get(usage, "output_tokens")
+    if output_tokens is None:
+        output_tokens = _get(usage, "completion_tokens")
+    if not all(type(value) is int and value >= 0 for value in (input_tokens, output_tokens)):
+        # Do not normalize incomplete provider evidence into zero-token/cost
+        # receipts. The already-admitted attempt retains its generation and
+        # unknown hold; no subsequent paid dispatch may pass that hold.
+        call = {"usage_available": False, "dispatch_status": "uncertain",
+            "generation_id": str(_get(response, "id", "") or ""),
+            "model": str(_get(response, "model", "") or requested_model),
+            "service_tier": _get(response, "service_tier")}
+        if attempt is not None:
+            from agent.atlas_delegation import finish_paid_attempt
+            finish_paid_attempt(agent, attempt, call)
+        else:
+            with agent._atlas_paid_dispatch_lock:
+                agent._atlas_paid_uncertain = True
+                agent._atlas_auxiliary_usage_calls.append(call)
+        return
+    payload = receipt_payload(response, requested_model=requested_model)
     details = _get(usage, "cost_details") or {}
     def observed_cost(value):
         try:
@@ -217,7 +239,7 @@ def collect_delegated_response(agent, response, *, requested_model=LUNA, attempt
         "generation_id": payload["provider_generation_id"],
         "model": payload["model"], "provider": payload["provider"],
         "route_request_id": getattr(agent, "_atlas_route_request_id", None),
-        "reservation_id": None, "usage_available": (_get(usage, "input_tokens", _get(usage, "prompt_tokens")) is not None and _get(usage, "output_tokens", _get(usage, "completion_tokens")) is not None),
+        "reservation_id": None, "usage_available": True,
         "input_tokens": max(0, payload["input_tokens"] - payload["cache_read_tokens"] - payload["cache_write_tokens"]),
         "input_tokens_total": payload["input_tokens"], "output_tokens": payload["output_tokens"],
         "cache_read_tokens": payload["cache_read_tokens"], "cache_write_tokens": payload["cache_write_tokens"],

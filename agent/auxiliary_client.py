@@ -1188,7 +1188,11 @@ class _CodexCompletionsAdapter:
 
             resp_usage = getattr(final, "usage", None)
             if resp_usage:
-                def _usage_value(key: str, default: Any = 0) -> Any:
+                from agent.atlas_delegation import current_dispatch_agent
+                # Scoped accounting must distinguish omitted/null provider counts
+                # from an explicitly reported zero. Keep ordinary adapter defaults.
+                usage_default = None if current_dispatch_agent() is not None else 0
+                def _usage_value(key: str, default: Any = usage_default) -> Any:
                     value = getattr(resp_usage, key, None)
                     if value is None and isinstance(resp_usage, dict):
                         value = resp_usage.get(key)

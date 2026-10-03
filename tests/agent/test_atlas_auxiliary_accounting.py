@@ -410,3 +410,92 @@ def test_denied_or_closed_auxiliary_starts_no_sdk_or_credential_work(monkeypatch
         sdk.assert_not_called()
         cache.assert_not_called()
         pool.assert_not_called()
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+@pytest.mark.parametrize("wire_usage,complete", [
+    ({"input_tokens": 17}, False),
+    ({"output_tokens": 5}, False),
+    ({"input_tokens": 17, "output_tokens": None}, False),
+    ({"input_tokens": None, "output_tokens": 5}, False),
+    ({"input_tokens": None, "output_tokens": None}, False),
+    ({"input_tokens": 0, "output_tokens": 0}, True),
+    ({"input_tokens": 17, "output_tokens": 0}, True),
+    ({"input_tokens": 0, "output_tokens": 5}, True),
+])
+def test_actual_sdk_scoped_auxiliary_partial_usage_keeps_unknown_hold(monkeypatch, async_mode, wire_usage, complete):
+    """Real SDK/SSE/adapter/call_llm/terminal accounting, with no real network."""
+    import hashlib
+    import httpx
+    import json
+    import threading
+    from agent import atlas_delegation as policy
+    real_client = httpx.Client
+    sent, raw_responses = [], []
+    def provider(request):
+        sent.append(request)
+        assert request.url.host == "api.openai.com"
+        assert request.headers["authorization"] == "Bearer synthetic-process-key"
+        event = {"type": "response.completed", "response": {
+            "id": "synthetic-partial-usage", "object": "response", "created_at": 1,
+            "model": accounting.LUNA, "status": "completed", "output": [], "usage": wire_usage}}
+        stream = ('event: response.output_text.delta\ndata: ' + json.dumps({"type": "response.output_text.delta", "delta": "summary"}) +
+            '\n\nevent: response.completed\ndata: ' + json.dumps(event) + '\n\n')
+        return httpx.Response(200, content=stream.encode(), headers={"content-type": "text/event-stream"})
+    class MockTransportClient(real_client):
+        def __init__(self, **kwargs):
+            super().__init__(transport=httpx.MockTransport(provider), **kwargs)
+    monkeypatch.setattr(httpx, "Client", MockTransportClient)
+    monkeypatch.setenv("OPENAI_API_KEY", "synthetic-process-key")
+    monkeypatch.setenv("ATLAS_MODEL_ROUTING_ENABLED", "true")
+    monkeypatch.setenv("ATLAS_MODEL_ROUTING_TRANSPORT", "openai")
+    agent = SimpleNamespace(_atlas_delegation_policy=policy.POLICY_VERSION,
+        _atlas_delegation_identities={"actor_user_id": "actor", "subject_user_id": "subject",
+            "view_as_session_id": "session", "resource_type": "chat", "resource_id": "turn_fixture", "receipt_limit": "256"},
+        _atlas_paid_dispatch_lock=threading.Lock(), _atlas_paid_dispatch_count=0)
+    monkeypatch.setattr(policy, "validate_dispatch", lambda agent: policy.check_admission_open(agent))
+    collect = accounting.collect_delegated_response
+    def capture(agent, response, **kwargs):
+        raw_responses.append(response)
+        return collect(agent, response, **kwargs)
+    monkeypatch.setattr(accounting, "collect_delegated_response", capture)
+    with policy.dispatch_context(agent):
+        response = auxiliary_client.async_call_llm(task="compression", messages=[{"role": "user", "content": "history"}]) if async_mode else auxiliary_client.call_llm(task="compression", messages=[{"role": "user", "content": "history"}])
+        if async_mode:
+            response = asyncio.run(response)
+        assert response.choices[0].message.content == "summary"
+        assert raw_responses[0].usage.input_tokens == wire_usage.get("input_tokens")
+        assert raw_responses[0].usage.output_tokens == wire_usage.get("output_tokens")
+        if not complete:
+            with pytest.raises(policy.DelegationDenied, match="unsettled"):
+                policy.admit_paid_dispatch(agent)
+        else:
+            assert not getattr(agent, "_atlas_paid_uncertain", False)
+    row, = policy.terminal_usage_calls(agent)
+    assert row["generation_id"] == "synthetic-partial-usage"
+    assert row["actor_user_id"] == row["user_id"] == "actor"
+    assert row["subject_user_id"] == "subject" and row["view_as_session_id"] == "session"
+    assert row["provider_user_hash"] == "atlas-user-" + hashlib.sha256(b"actor").hexdigest()
+    assert row["usage_available"] is complete
+    assert row["dispatch_status"] == ("completed" if complete else "uncertain")
+    if complete:
+        assert row["input_tokens_total"] == wire_usage["input_tokens"]
+        assert row["output_tokens"] == wire_usage["output_tokens"]
+    else:
+        assert not any(name in row for name in ("input_tokens", "output_tokens", "input_tokens_total", "actual_cost_usd", "estimated_cost_usd"))
+    assert len(sent) == 1 and agent._atlas_paid_dispatch_count == 1
+
+
+@pytest.mark.parametrize("wire_usage", [{"input_tokens": 17}, {"input_tokens": 17, "output_tokens": None}])
+def test_actual_sdk_ordinary_auxiliary_keeps_existing_default_usage(monkeypatch, wire_usage):
+    import httpx
+    import json
+    from openai import OpenAI
+    event = {"type": "response.completed", "response": {"id": "ordinary-usage", "object": "response", "created_at": 1,
+        "model": accounting.LUNA, "status": "completed", "output": [], "usage": wire_usage}}
+    stream = ('event: response.output_text.delta\ndata: ' + json.dumps({"type": "response.output_text.delta", "delta": "summary"}) +
+        '\n\nevent: response.completed\ndata: ' + json.dumps(event) + '\n\n')
+    with OpenAI(api_key="synthetic-key", base_url="https://api.openai.com/v1", max_retries=0,
+            http_client=httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(200, content=stream.encode(), headers={"content-type": "text/event-stream"})))) as client:
+        response = auxiliary_client._CodexCompletionsAdapter(client, accounting.LUNA).create(messages=[{"role": "user", "content": "history"}])
+    assert response.usage.input_tokens == 17 and response.usage.output_tokens == 0
