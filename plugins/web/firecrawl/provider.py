@@ -228,6 +228,31 @@ def _get_firecrawl_client() -> Any:
     :func:`_is_tool_gateway_ready`.
     """
     import tools.web_tools as _wt
+    from agent.atlas_delegation import current_dispatch_agent, check_admission_open, readonly_web_env
+    if current_dispatch_agent() is not None:
+        check_admission_open(current_dispatch_agent())
+        key = readonly_web_env("FIRECRAWL_API_KEY")
+        if not key:
+            raise ValueError("Scoped Firecrawl requires a direct process credential; managed OAuth is unavailable")
+        kwargs = {"api_key": key, "max_retries": 0}
+        url = readonly_web_env("FIRECRAWL_API_URL")
+        if url:
+            kwargs["api_url"] = url
+        # Import an already installed SDK directly: no lazy-deps installer/proxy.
+        from firecrawl import Firecrawl as ScopedFirecrawl
+        check_admission_open(current_dispatch_agent())
+        client = ScopedFirecrawl(**kwargs)
+        transport = client._v2_client.http_client
+        def post(endpoint, data, headers=None, timeout=None, **options):
+            from agent.atlas_delegation import scoped_requests_post, DelegationDenied
+            name = "web_search" if endpoint.rstrip("/").endswith("/search") else "web_extract" if endpoint.rstrip("/").endswith("/scrape") else None
+            if name is None:
+                raise DelegationDenied("Atlas delegation Firecrawl endpoint is unavailable")
+            return scoped_requests_post(transport._build_url(endpoint), name,
+                credential_env="FIRECRAWL_API_KEY", json=data, headers=headers or transport._prepare_headers(), timeout=timeout or 60)
+        # Replace only this instance's v2 transport. SDK parsing stays intact.
+        transport.post = post
+        return client
 
     direct_config = _get_direct_firecrawl_config()
     if direct_config is not None and not _wt.prefers_gateway("web"):
@@ -412,6 +437,8 @@ class FirecrawlWebSearchProvider(WebSearchProvider):
         # let it propagate so the dispatcher emits the legacy envelope shape.
         client = _get_firecrawl_client()
         try:
+            from agent.atlas_delegation import validate_web_send
+            validate_web_send("web_search")
             response = client.search(query=query, limit=limit)
             web_results = _extract_web_search_results(response)
             logger.info("Firecrawl: found %d search results", len(web_results))
@@ -486,12 +513,14 @@ class FirecrawlWebSearchProvider(WebSearchProvider):
             try:
                 logger.info("Firecrawl scraping: %s", url)
                 try:
+                    def scrape_in_worker():
+                        from agent.atlas_delegation import check_admission_open, current_dispatch_agent, validate_web_send
+                        check_admission_open(current_dispatch_agent())
+                        client = _get_firecrawl_client()
+                        validate_web_send()  # Fresh for each URL and after worker queuing.
+                        return client.scrape(url=url, formats=formats)
                     scrape_result = await asyncio.wait_for(
-                        asyncio.to_thread(
-                            _get_firecrawl_client().scrape,
-                            url=url,
-                            formats=formats,
-                        ),
+                        asyncio.to_thread(scrape_in_worker),
                         timeout=60,
                     )
                 except asyncio.TimeoutError:

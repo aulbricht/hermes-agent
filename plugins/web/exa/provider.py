@@ -46,6 +46,29 @@ def _get_exa_client() -> Any:
     ``ValueError`` when ``EXA_API_KEY`` is unset.
     """
     import tools.web_tools as _wt
+    from agent.atlas_delegation import current_dispatch_agent, check_admission_open, readonly_web_env
+    if current_dispatch_agent() is not None:
+        check_admission_open(current_dispatch_agent())
+        key = readonly_web_env("EXA_API_KEY")
+        if not key:
+            raise ValueError("Scoped Exa requires a direct process credential")
+        from exa_py import Exa
+        check_admission_open(current_dispatch_agent())
+        client = Exa(api_key=key)
+        client.headers["x-exa-integration"] = "hermes-agent"
+        def request(endpoint, data=None, method="POST", params=None, headers=None):
+            from agent.atlas_delegation import scoped_requests_post, DelegationDenied
+            from exa_py.api import ExaJSONEncoder
+            import json
+            name = "web_search" if endpoint == "/search" else "web_extract" if endpoint == "/contents" else None
+            if method != "POST" or name is None:
+                raise DelegationDenied("Atlas delegation Exa endpoint is unavailable")
+            response = scoped_requests_post(client.base_url + endpoint, name,
+                credential_env="EXA_API_KEY", data=json.dumps(data, cls=ExaJSONEncoder), headers={**client.headers, **(headers or {})}, timeout=60)
+            response.raise_for_status()
+            return response.json()
+        client.request = request
+        return client
 
     cached = getattr(_wt, "_exa_client", None)
     if cached is not None:
@@ -126,7 +149,10 @@ class ExaWebSearchProvider(WebSearchProvider):
                 return {"success": False, "error": "Interrupted"}
 
             logger.info("Exa search: '%s' (limit=%d)", query, limit)
-            response = _get_exa_client().search(
+            client = _get_exa_client()
+            from agent.atlas_delegation import validate_web_send
+            validate_web_send("web_search")
+            response = client.search(
                 query,
                 num_results=limit,
                 contents={"highlights": True},
@@ -170,7 +196,10 @@ class ExaWebSearchProvider(WebSearchProvider):
                 ]
 
             logger.info("Exa extract: %d URL(s)", len(urls))
-            response = _get_exa_client().get_contents(urls, text=True)
+            client = _get_exa_client()
+            from agent.atlas_delegation import validate_web_send
+            validate_web_send()
+            response = client.get_contents(urls, text=True)
 
             results: List[Dict[str, Any]] = []
             for result in response.results or []:

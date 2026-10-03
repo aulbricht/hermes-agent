@@ -486,6 +486,7 @@ class AIAgent:
         checkpoint_max_total_size_mb: int = 500,
         checkpoint_max_file_size_mb: int = 10,
         pass_session_id: bool = False,
+        atlas_delegation_policy: str = None,
     ):
         """Forwarder — see ``agent.agent_init.init_agent``."""
         from agent.agent_init import init_agent
@@ -562,6 +563,7 @@ class AIAgent:
             checkpoint_max_total_size_mb=checkpoint_max_total_size_mb,
             checkpoint_max_file_size_mb=checkpoint_max_file_size_mb,
             pass_session_id=pass_session_id,
+            atlas_delegation_policy=atlas_delegation_policy,
         )
 
     def _get_session_db_for_recall(self):
@@ -2464,6 +2466,9 @@ class AIAgent:
         retryable: Optional[bool] = None,
         reason: Optional[str] = None,
     ) -> None:
+        from agent.atlas_delegation import is_scoped
+        if is_scoped(self):
+            return
         # Lazy module import (not from-import) so tests that
         # ``monkeypatch.setattr("hermes_cli.plugins.has_hook", ...)`` still
         # take effect on this call site. After first call the import is a
@@ -4563,6 +4568,8 @@ class AIAgent:
         return pool.has_available()
 
     def _anthropic_messages_create(self, api_kwargs: dict):
+        from agent.atlas_delegation import validate_dispatch
+        validate_dispatch(self)
         if self.api_mode == "anthropic_messages":
             self._try_refresh_anthropic_client_credentials()
         # Defensive: strip Responses-only kwargs that can leak in under an
@@ -4604,6 +4611,8 @@ class AIAgent:
 
     def _interruptible_api_call(self, api_kwargs: dict):
         """Forwarder — see ``agent.chat_completion_helpers.interruptible_api_call``."""
+        from agent.atlas_delegation import validate_dispatch
+        validate_dispatch(self)
         from agent.chat_completion_helpers import interruptible_api_call
         return interruptible_api_call(self, api_kwargs)
 
@@ -4777,6 +4786,8 @@ class AIAgent:
         self, api_kwargs: dict, *, on_first_delta: callable = None
     ):
         """Forwarder — see ``agent.chat_completion_helpers.interruptible_streaming_api_call``."""
+        from agent.atlas_delegation import validate_dispatch
+        validate_dispatch(self)
         from agent.chat_completion_helpers import interruptible_streaming_api_call
         return interruptible_streaming_api_call(self, api_kwargs, on_first_delta=on_first_delta)
 

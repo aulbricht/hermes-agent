@@ -1270,13 +1270,14 @@ class TestChatCompletionsEndpoint:
         import asyncio
         import gateway.platforms.api_server as api_server_mod
 
+        keepalive_observed = asyncio.Event()
         app = _create_app(adapter)
         async with TestClient(TestServer(app)) as cli:
             async def _mock_run_agent(**kwargs):
                 cb = kwargs.get("stream_delta_callback")
                 if cb:
                     cb("Working")
-                    await asyncio.sleep(0.65)
+                    await asyncio.wait_for(keepalive_observed.wait(), timeout=10)
                     cb("...done")
                 return (
                     {"final_response": "Working...done", "messages": [], "api_calls": 1},
@@ -1296,7 +1297,17 @@ class TestChatCompletionsEndpoint:
                     },
                 )
                 assert resp.status == 200
-                body = await resp.text()
+                async def read_until_complete():
+                    chunks = []
+                    while True:
+                        chunk = await resp.content.readline()
+                        if not chunk:
+                            break
+                        chunks.append(chunk)
+                        if b": keepalive" in chunk:
+                            keepalive_observed.set()
+                    return b"".join(chunks).decode()
+                body = await asyncio.wait_for(read_until_complete(), timeout=15)
                 assert ": keepalive" in body
                 assert "Working" in body
                 assert "...done" in body

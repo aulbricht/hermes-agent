@@ -39,6 +39,8 @@ from hermes_cli.auth import (
     write_credential_pool,
 )
 
+from agent.atlas_delegation import deny_shared_credentials
+
 logger = logging.getLogger(__name__)
 
 
@@ -570,28 +572,34 @@ class CredentialPool:
         self._max_concurrent = DEFAULT_MAX_CONCURRENT_PER_CREDENTIAL
 
     def has_credentials(self) -> bool:
+        deny_shared_credentials()
         return bool(self._entries)
 
     def has_available(self) -> bool:
         """True if at least one entry is not currently in exhaustion cooldown."""
+        deny_shared_credentials()
         return bool(self._available_entries())
 
     def entries(self) -> List[PooledCredential]:
+        deny_shared_credentials()
         return list(self._entries)
 
     def current(self) -> Optional[PooledCredential]:
+        deny_shared_credentials()
         if not self._current_id:
             return None
         return next((entry for entry in self._entries if entry.id == self._current_id), None)
 
     def _replace_entry(self, old: PooledCredential, new: PooledCredential) -> None:
         """Swap an entry in-place by id, preserving sort order."""
+        deny_shared_credentials()
         for idx, entry in enumerate(self._entries):
             if entry.id == old.id:
                 self._entries[idx] = new
                 return
 
     def _persist(self, *, removed_ids: Optional[List[str]] = None) -> None:
+        deny_shared_credentials()
         write_credential_pool(
             self.provider,
             [entry.to_dict() for entry in self._entries],
@@ -1014,6 +1022,7 @@ class CredentialPool:
             logger.debug("Failed to sync %s pool entry back to auth store: %s", self.provider, exc)
 
     def _refresh_entry(self, entry: PooledCredential, *, force: bool) -> Optional[PooledCredential]:
+        deny_shared_credentials()
         if entry.auth_type != AUTH_TYPE_OAUTH or not entry.refresh_token:
             if force:
                 self._mark_exhausted(entry, None)
@@ -1047,6 +1056,7 @@ class CredentialPool:
     def _refresh_entry_impl(
         self, entry: PooledCredential, *, force: bool
     ) -> Optional[PooledCredential]:
+        deny_shared_credentials()
         try:
             if self.provider == "anthropic":
                 from agent.anthropic_adapter import refresh_anthropic_oauth_pure
@@ -1417,10 +1427,12 @@ class CredentialPool:
         return False
 
     def select(self) -> Optional[PooledCredential]:
+        deny_shared_credentials()
         with self._lock:
             return self._select_unlocked()
 
     def _available_entries(self, *, clear_expired: bool = False, refresh: bool = False) -> List[PooledCredential]:
+        deny_shared_credentials()
         """Return entries not currently in exhaustion cooldown.
 
         When *clear_expired* is True, entries whose cooldown has elapsed are
@@ -1574,6 +1586,7 @@ class CredentialPool:
         return entry
 
     def peek(self) -> Optional[PooledCredential]:
+        deny_shared_credentials()
         current = self.current()
         if current is not None:
             return current
@@ -1587,6 +1600,7 @@ class CredentialPool:
         error_context: Optional[Dict[str, Any]] = None,
         api_key_hint: Optional[str] = None,
     ) -> Optional[PooledCredential]:
+        deny_shared_credentials()
         with self._lock:
             entry = None
             if api_key_hint:
@@ -1634,6 +1648,7 @@ class CredentialPool:
         a stable tie-breaker. When every credential is already at the soft cap,
         still return the least-leased one instead of blocking.
         """
+        deny_shared_credentials()
         with self._lock:
             if credential_id:
                 self._active_leases[credential_id] = self._active_leases.get(credential_id, 0) + 1
@@ -1659,6 +1674,7 @@ class CredentialPool:
 
     def release_lease(self, credential_id: str) -> None:
         """Release a previously acquired credential lease."""
+        deny_shared_credentials()
         with self._lock:
             count = self._active_leases.get(credential_id, 0)
             if count <= 1:
@@ -1667,6 +1683,7 @@ class CredentialPool:
                 self._active_leases[credential_id] = count - 1
 
     def try_refresh_current(self) -> Optional[PooledCredential]:
+        deny_shared_credentials()
         with self._lock:
             return self._try_refresh_current_unlocked()
 
@@ -1680,6 +1697,7 @@ class CredentialPool:
         return refreshed
 
     def reset_statuses(self) -> int:
+        deny_shared_credentials()
         count = 0
         new_entries = []
         for entry in self._entries:
@@ -1704,6 +1722,7 @@ class CredentialPool:
         return count
 
     def remove_index(self, index: int) -> Optional[PooledCredential]:
+        deny_shared_credentials()
         if index < 1 or index > len(self._entries):
             return None
         removed = self._entries.pop(index - 1)
@@ -1746,6 +1765,7 @@ class CredentialPool:
         return None, None, f'No credential matching "{raw}".'
 
     def add_entry(self, entry: PooledCredential) -> PooledCredential:
+        deny_shared_credentials()
         entry = replace(entry, priority=_next_priority(self._entries))
         self._entries.append(entry)
         self._persist()
@@ -2396,6 +2416,7 @@ def _seed_custom_pool(pool_key: str, entries: List[PooledCredential]) -> Tuple[b
 
 
 def load_pool(provider: str) -> CredentialPool:
+    deny_shared_credentials()
     provider = (provider or "").strip().lower()
     raw_entries = read_credential_pool(provider)
     disk_ids = {

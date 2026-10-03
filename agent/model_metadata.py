@@ -21,6 +21,8 @@ from utils import atomic_json_write, base_url_host_matches, base_url_hostname
 
 from hermes_constants import OPENROUTER_MODELS_URL
 
+from agent.atlas_delegation import credential_scope_active, deny_shared_credentials
+
 logger = logging.getLogger(__name__)
 
 
@@ -162,6 +164,7 @@ def _load_model_metadata_disk_cache() -> Dict[str, Dict[str, Any]]:
 
 def _save_model_metadata_disk_cache(data: Dict[str, Dict[str, Any]]) -> None:
     """Save processed OpenRouter metadata cache to disk atomically."""
+    deny_shared_credentials()
     try:
         atomic_json_write(
             _get_model_metadata_cache_path(),
@@ -857,6 +860,8 @@ def _add_model_aliases(cache: Dict[str, Dict[str, Any]], model_id: str, entry: D
 def fetch_model_metadata(force_refresh: bool = False) -> Dict[str, Dict[str, Any]]:
     """Fetch model metadata from OpenRouter (cached for 1 hour)."""
     global _model_metadata_cache, _model_metadata_cache_time
+    if credential_scope_active():
+        return {}  # No live probes/cache writes; unknown pricing remains unknown.
 
     if not force_refresh and _model_metadata_cache and (time.time() - _model_metadata_cache_time) < _MODEL_CACHE_TTL:
         return _model_metadata_cache
@@ -924,6 +929,8 @@ def fetch_endpoint_model_metadata(
     This is used for explicit custom endpoints where hardcoded global model-name
     defaults are unreliable. Results are cached in memory per base URL.
     """
+    if credential_scope_active():
+        return {}
     normalized = _normalize_base_url(base_url)
     if not normalized or _is_openrouter_base_url(normalized):
         return {}
@@ -1117,6 +1124,7 @@ def save_context_length(model: str, base_url: str, length: int) -> None:
     Cache key is ``model@base_url`` so the same model name served from
     different providers can have different limits.
     """
+    deny_shared_credentials()
     key = _context_cache_key(model, base_url)
     cache = _load_context_cache()
     if cache.get(key) == length:
@@ -1134,6 +1142,8 @@ def save_context_length(model: str, base_url: str, length: int) -> None:
 
 def get_cached_context_length(model: str, base_url: str) -> Optional[int]:
     """Look up a previously discovered context length for model+provider."""
+    if credential_scope_active():
+        return None
     key = _context_cache_key(model, base_url)
     cache = _load_context_cache()
     hit = cache.get(key)
@@ -1154,6 +1164,7 @@ def get_cached_context_length(model: str, base_url: str) -> Optional[int]:
 
 def _invalidate_cached_context_length(model: str, base_url: str) -> None:
     """Drop a stale cache entry so it gets re-resolved on the next lookup."""
+    deny_shared_credentials()
     key = _context_cache_key(model, base_url)
     cache = _load_context_cache()
     # Invalidation must also drop the in-memory TTL probe entries for this
@@ -2066,6 +2077,12 @@ def get_model_context_length(
     7. Local server query (before hardcoded defaults for local endpoints)
     8. Hardcoded defaults (broad family patterns, longest-key-first)
     9. Default fallback (256K)"""
+    if credential_scope_active():
+        # Bound the governed lane to Hermes's supported minimum, not the 256K
+        # unknown-model fallback or the deployed profile's larger 100K window.
+        # Keep a smaller explicit limit visible so the constructor still rejects
+        # unsupported configurations; never probe metadata to raise it.
+        return min(config_context_length, MINIMUM_CONTEXT_LENGTH) if isinstance(config_context_length, int) and config_context_length > 0 else MINIMUM_CONTEXT_LENGTH
     # 0. Explicit config override — user knows best
     if config_context_length is not None and isinstance(config_context_length, int) and config_context_length > 0:
         return config_context_length

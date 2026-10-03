@@ -3016,16 +3016,20 @@ class SessionDB:
         ).fetchone()
         return row is not None
 
-    def set_session_title(self, session_id: str, title: str) -> bool:
+    def set_session_title(self, session_id: str, title: str, *, before_write: Optional[Callable[[], None]] = None) -> bool:
         """Set or update a session's title.
 
         Returns True if session was found and title was set.
         Raises ValueError if title is already in use by another session,
         or if the title fails validation (too long, invalid characters).
         Empty/whitespace-only strings are normalized to None (clearing the title).
+        Optional before_write runs after the Python and SQLite write locks are
+        acquired on every transaction attempt, before any title transfer/update.
         """
         title = self.sanitize_title(title)
         def _do(conn):
+            if before_write is not None:
+                before_write()
             if title:
                 # Check uniqueness (allow the same session to keep its own title)
                 cursor = conn.execute(

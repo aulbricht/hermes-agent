@@ -43,20 +43,34 @@ def _tavily_request(endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
 
     from agent.web_search_provider import get_provider_env
 
-    api_key = get_provider_env("TAVILY_API_KEY")
+    from agent.atlas_delegation import current_dispatch_agent, check_admission_open, readonly_web_env
+    check_admission_open(current_dispatch_agent())
+    lookup = readonly_web_env if current_dispatch_agent() is not None else get_provider_env
+    api_key = lookup("TAVILY_API_KEY")
     if not api_key:
         raise ValueError(
             "TAVILY_API_KEY environment variable not set. "
             "Get your API key at https://app.tavily.com/home"
         )
 
-    base_url = get_provider_env("TAVILY_BASE_URL") or "https://api.tavily.com"
+    base_url = lookup("TAVILY_BASE_URL") or "https://api.tavily.com"
     payload = dict(payload)  # don't mutate caller's dict
     payload["api_key"] = api_key
     url = f"{base_url}/{endpoint.lstrip('/')}"
     logger.info("Tavily %s request to %s", endpoint, url)
 
-    response = httpx.post(url, json=payload, timeout=60)
+    from agent.atlas_delegation import validate_web_send
+    validate_web_send("web_extract" if endpoint.lstrip("/") == "extract" else "web_search")
+    if current_dispatch_agent() is not None:
+        from agent.atlas_delegation import validate_prepared_web_auth
+        def authorize(request):
+            validate_prepared_web_auth(request.headers, "TAVILY_API_KEY", body=request.content)
+            validate_web_send("web_extract" if endpoint.lstrip("/") == "extract" else "web_search")
+        with httpx.Client(trust_env=False, follow_redirects=False,
+                event_hooks={"request": [authorize]}) as client:
+            response = client.post(url, json=payload, timeout=60)
+    else:
+        response = httpx.post(url, json=payload, timeout=60)
     response.raise_for_status()
     return response.json()
 

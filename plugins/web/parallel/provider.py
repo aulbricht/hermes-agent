@@ -68,6 +68,21 @@ def _get_sync_client() -> Any:
     tests that reset that name between cases keep working.
     """
     import tools.web_tools as _wt
+    from agent.atlas_delegation import current_dispatch_agent, check_admission_open, readonly_web_env
+    if current_dispatch_agent() is not None:
+        check_admission_open(current_dispatch_agent())
+        key = readonly_web_env("PARALLEL_API_KEY")
+        if not key:
+            raise ValueError("Scoped Parallel requires a direct process credential")
+        from parallel import Parallel
+        check_admission_open(current_dispatch_agent())
+        import httpx
+        from agent.atlas_delegation import validate_web_send, validate_prepared_web_auth
+        def authorize(request):
+            validate_prepared_web_auth(request.headers, "PARALLEL_API_KEY")
+            validate_web_send("web_search")
+        transport = httpx.Client(follow_redirects=False, trust_env=False, event_hooks={"request": [authorize]})
+        return Parallel(api_key=key, max_retries=0, http_client=transport)
 
     cached = getattr(_wt, "_parallel_client", None)
     if cached is not None:
@@ -96,6 +111,21 @@ def _get_async_client() -> Any:
     Cache lives on :mod:`tools.web_tools` (as ``_async_parallel_client``).
     """
     import tools.web_tools as _wt
+    from agent.atlas_delegation import current_dispatch_agent, check_admission_open, readonly_web_env
+    if current_dispatch_agent() is not None:
+        check_admission_open(current_dispatch_agent())
+        key = readonly_web_env("PARALLEL_API_KEY")
+        if not key:
+            raise ValueError("Scoped Parallel requires a direct process credential")
+        from parallel import AsyncParallel
+        check_admission_open(current_dispatch_agent())
+        import httpx
+        from agent.atlas_delegation import validate_web_send, validate_prepared_web_auth
+        async def authorize(request):
+            validate_prepared_web_auth(request.headers, "PARALLEL_API_KEY")
+            validate_web_send("web_extract")
+        transport = httpx.AsyncClient(follow_redirects=False, trust_env=False, event_hooks={"request": [authorize]})
+        return AsyncParallel(api_key=key, max_retries=0, http_client=transport)
 
     cached = getattr(_wt, "_async_parallel_client", None)
     if cached is not None:
@@ -184,7 +214,12 @@ class ParallelWebSearchProvider(WebSearchProvider):
             logger.info(
                 "Parallel search: '%s' (mode=%s, limit=%d)", query, mode, limit
             )
-            response = _get_sync_client().beta.search(
+            client = _get_sync_client()
+            from agent.atlas_delegation import current_dispatch_agent, validate_web_send
+            if current_dispatch_agent() is not None:
+                client = client.with_options(max_retries=0)
+            validate_web_send("web_search")
+            response = client.beta.search(
                 search_queries=[query],
                 objective=query,
                 mode=mode,
@@ -234,7 +269,12 @@ class ParallelWebSearchProvider(WebSearchProvider):
                 ]
 
             logger.info("Parallel extract: %d URL(s)", len(urls))
-            response = await _get_async_client().beta.extract(
+            client = _get_async_client()
+            from agent.atlas_delegation import current_dispatch_agent, validate_web_send
+            if current_dispatch_agent() is not None:
+                client = client.with_options(max_retries=0)
+            validate_web_send()
+            response = await client.beta.extract(
                 urls=urls,
                 full_content=True,
             )

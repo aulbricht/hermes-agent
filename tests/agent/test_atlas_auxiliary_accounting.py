@@ -258,3 +258,244 @@ def test_atlas_async_compression_meters_without_retrying_generation(monkeypatch)
     assert response.choices[0].message.content == "summary"
     assert len(creates) == 1
     assert len(receipts) == 1
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+def test_delegated_aux_usage_actor_bound_and_retained_after_revocation(monkeypatch, async_mode):
+    import hashlib
+    import threading
+    from agent import atlas_delegation as policy
+    monkeypatch.setenv("ATLAS_MODEL_ROUTING_ENABLED", "true")
+    agent = SimpleNamespace(_atlas_delegation_policy=policy.POLICY_VERSION,
+        _atlas_delegation_identities={"actor_user_id": "actor", "subject_user_id": "subject", "view_as_session_id": "session", "resource_type": "chat", "resource_id": "turn_fixture", "receipt_limit": "256"},
+        _atlas_route_request_id="route_fixture", _atlas_paid_dispatch_lock=threading.Lock(),
+        _atlas_paid_dispatch_count=0, _atlas_auxiliary_usage_calls=[])
+    authorized = [True]
+    sent = []
+    def check(agent):
+        if not authorized[0]:
+            raise policy.DelegationDenied("expired")
+    monkeypatch.setattr(policy, "validate_dispatch", check)
+    def create(**kwargs):
+        sent.append(kwargs)
+        authorized[0] = False
+        return _response()
+    async def async_create(**kwargs):
+        return create(**kwargs)
+    client = SimpleNamespace(base_url="https://api.openai.com/v1", chat=SimpleNamespace(completions=SimpleNamespace(create=async_create if async_mode else create)))
+    monkeypatch.setattr(auxiliary_client, "_get_scoped_atlas_auxiliary_client", lambda *args, **kwargs: (client, accounting.LUNA))
+    monkeypatch.setattr(accounting, "record_completed_response", lambda *args, **kwargs: pytest.fail("delegated usage must use durable terminal settlement"))
+    monkeypatch.setattr(accounting, "record_completed_response_async", lambda *args, **kwargs: pytest.fail("delegated usage must use durable terminal settlement"))
+    with policy.dispatch_context(agent):
+        result = auxiliary_client.async_call_llm(task="compression", messages=[{"role": "user", "content": "history"}]) if async_mode else auxiliary_client.call_llm(task="compression", messages=[{"role": "user", "content": "history"}])
+        if async_mode:
+            result = asyncio.run(result)
+        with pytest.raises(policy.DelegationDenied):
+            policy.admit_paid_dispatch(agent)
+    assert result.id == "resp-test"
+    assert agent._atlas_paid_dispatch_count == 1
+    receipt, = policy.terminal_usage_calls(agent)
+    assert receipt["user_id"] == receipt["actor_user_id"] == "actor"
+    assert receipt["subject_user_id"] == "subject" and receipt["view_as_session_id"] == "session"
+    assert receipt["resource_id"] == "turn_fixture" and receipt["route_request_id"] == "route_fixture"
+    assert sent[0]["user"] == receipt["provider_user_hash"] == "atlas-user-" + hashlib.sha256(b"actor").hexdigest()
+    assert receipt["input_tokens"] == 85 and receipt["input_tokens_total"] == 100 and receipt["generation_id"] == "resp-test"
+
+
+def test_responses_adapter_keeps_actor_hash_on_actual_provider_request(monkeypatch):
+    final = SimpleNamespace(id="resp", model=accounting.LUNA, usage=SimpleNamespace(input_tokens=1, output_tokens=1), output=[])
+    monkeypatch.setattr("agent.codex_runtime._consume_codex_event_stream", lambda *args, **kwargs: final)
+    requests = []
+    client = SimpleNamespace(base_url="https://api.openai.com/v1", responses=SimpleNamespace(create=lambda **kwargs: requests.append(kwargs) or SimpleNamespace(close=lambda: None)))
+    auxiliary_client._CodexCompletionsAdapter(client, accounting.LUNA).create(messages=[{"role": "user", "content": "read"}], user="atlas-user-fixture")
+    assert requests[0]["user"] == "atlas-user-fixture"
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+def test_failed_delegated_auxiliary_attempt_retains_observed_generation(monkeypatch, async_mode):
+    import threading
+    from agent import atlas_delegation as policy
+    monkeypatch.setenv("ATLAS_MODEL_ROUTING_ENABLED", "true")
+    agent = SimpleNamespace(_atlas_delegation_policy=policy.POLICY_VERSION,
+        _atlas_delegation_identities={"actor_user_id": "actor", "subject_user_id": "subject", "view_as_session_id": "session", "resource_type": "chat", "resource_id": "turn_fixture", "receipt_limit": "256"},
+        _atlas_paid_dispatch_lock=threading.Lock(), _atlas_paid_dispatch_count=0)
+    monkeypatch.setattr(policy, "validate_dispatch", lambda agent: None)
+    def create(**kwargs):
+        policy.observe_paid_event(SimpleNamespace(response=SimpleNamespace(id="aux-failed", model=accounting.LUNA)))
+        raise TimeoutError("provider may have charged")
+    async def async_create(**kwargs):
+        return create(**kwargs)
+    client = SimpleNamespace(base_url="https://api.openai.com/v1", chat=SimpleNamespace(completions=SimpleNamespace(create=async_create if async_mode else create)))
+    monkeypatch.setattr(auxiliary_client, "_get_scoped_atlas_auxiliary_client", lambda *args, **kwargs: (client, accounting.LUNA))
+    with policy.dispatch_context(agent), pytest.raises(TimeoutError):
+        if async_mode:
+            asyncio.run(auxiliary_client.async_call_llm(task="compression", messages=[]))
+        else:
+            auxiliary_client.call_llm(task="compression", messages=[])
+    with pytest.raises(policy.DelegationDenied, match="unsettled"):
+        policy.admit_paid_dispatch(agent)
+    assert agent._atlas_paid_dispatch_count == 1
+    row, = policy.terminal_usage_calls(agent)
+    assert row["generation_id"] == "aux-failed" and row["auxiliary"] is True
+    assert row["dispatch_status"] == "uncertain" and row["usage_available"] is False
+    assert "input_tokens" not in row and "cost_usd" not in row
+    with pytest.raises(policy.DelegationDenied, match="closed"):
+        policy.admit_paid_dispatch(agent)
+    assert agent._atlas_paid_dispatch_count == 1
+
+
+@pytest.mark.parametrize('async_mode', [False, True])
+@pytest.mark.parametrize('has_key', [False, True])
+def test_scoped_auxiliary_uses_isolated_process_client_no_pool_or_cache(monkeypatch, async_mode, has_key):
+    import threading
+    from unittest.mock import patch
+    from agent import atlas_delegation as policy
+    monkeypatch.setenv('ATLAS_MODEL_ROUTING_ENABLED', 'true')
+    monkeypatch.setenv('ATLAS_MODEL_ROUTING_TRANSPORT', 'openai')
+    monkeypatch.delenv('OPENAI_API_KEY', raising=False)
+    if has_key:
+        monkeypatch.setenv('OPENAI_API_KEY', 'synthetic-process-key')
+    agent = SimpleNamespace(_atlas_delegation_policy=policy.POLICY_VERSION,
+        _atlas_delegation_identities={'actor_user_id': 'actor', 'subject_user_id': 'subject', 'view_as_session_id': 'session', 'resource_type': 'chat', 'resource_id': 'turn_fixture', 'receipt_limit': '256'},
+        _atlas_paid_dispatch_lock=threading.Lock(), _atlas_paid_dispatch_count=0)
+    monkeypatch.setattr(policy, 'validate_dispatch', lambda agent: policy.check_admission_open(agent))
+    final = SimpleNamespace(id='response-process', model=accounting.LUNA, service_tier='standard',
+        usage=SimpleNamespace(input_tokens=100, output_tokens=20),
+        output=[SimpleNamespace(type='message', content=[SimpleNamespace(type='output_text', text='summary')])])
+    monkeypatch.setattr('agent.codex_runtime._consume_codex_event_stream', lambda *args, **kwargs: final)
+    sends = []
+    real = SimpleNamespace(api_key='synthetic-process-key', base_url='https://api.openai.com/v1', close=lambda: None,
+        responses=SimpleNamespace(create=lambda **kwargs: sends.append(kwargs) or SimpleNamespace(close=lambda: None)))
+    with patch('openai.OpenAI', return_value=real) as sdk, patch.object(auxiliary_client, '_get_cached_client') as cache, patch('agent.credential_pool.load_pool') as pool, patch('hermes_cli.auth._save_auth_store') as write:
+        with policy.dispatch_context(agent):
+            if not has_key:
+                with pytest.raises(policy.DelegationDenied, match='process model credential'):
+                    result = auxiliary_client.async_call_llm(task='compression', messages=[]) if async_mode else auxiliary_client.call_llm(task='compression', messages=[])
+                    if async_mode:
+                        asyncio.run(result)
+                sdk.assert_not_called()
+                assert not sends and agent._atlas_paid_dispatch_count == 0
+            else:
+                result = auxiliary_client.async_call_llm(task='compression', messages=[]) if async_mode else auxiliary_client.call_llm(task='compression', messages=[])
+                if async_mode:
+                    result = asyncio.run(result)
+                assert result.id == 'response-process'
+                assert sdk.call_args.kwargs['api_key'] == 'synthetic-process-key'
+                assert sdk.call_args.kwargs['default_headers'] == {}
+                assert len(sends) == 1 and agent._atlas_paid_dispatch_count == 1
+                assert sends[0]['user'].startswith('atlas-user-')
+                row, = policy.terminal_usage_calls(agent)
+                assert row['dispatch_status'] == 'completed' and row['generation_id'] == 'response-process'
+                sdk.call_args.kwargs['http_client'].close()
+        cache.assert_not_called()
+        pool.assert_not_called()
+        write.assert_not_called()
+
+
+@pytest.mark.parametrize('closed', [False, True])
+def test_denied_or_closed_auxiliary_starts_no_sdk_or_credential_work(monkeypatch, closed):
+    import threading
+    from unittest.mock import patch
+    from agent import atlas_delegation as policy
+    monkeypatch.setenv('ATLAS_MODEL_ROUTING_ENABLED', 'true')
+    agent = SimpleNamespace(_atlas_delegation_policy=policy.POLICY_VERSION,
+        _atlas_admission_closed=closed, _atlas_paid_dispatch_lock=threading.Lock())
+    def validate(agent):
+        policy.check_admission_open(agent)
+        raise policy.DelegationDenied('revoked')
+    monkeypatch.setattr(policy, 'validate_dispatch', validate)
+    with policy.dispatch_context(agent), patch('openai.OpenAI') as sdk, patch.object(auxiliary_client, '_get_cached_client') as cache, patch('agent.credential_pool.load_pool') as pool:
+        with pytest.raises(policy.DelegationDenied):
+            auxiliary_client.call_llm(task='compression', messages=[])
+        sdk.assert_not_called()
+        cache.assert_not_called()
+        pool.assert_not_called()
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+@pytest.mark.parametrize("wire_usage,complete", [
+    ({"input_tokens": 17}, False),
+    ({"output_tokens": 5}, False),
+    ({"input_tokens": 17, "output_tokens": None}, False),
+    ({"input_tokens": None, "output_tokens": 5}, False),
+    ({"input_tokens": None, "output_tokens": None}, False),
+    ({"input_tokens": 0, "output_tokens": 0}, True),
+    ({"input_tokens": 17, "output_tokens": 0}, True),
+    ({"input_tokens": 0, "output_tokens": 5}, True),
+])
+def test_actual_sdk_scoped_auxiliary_partial_usage_keeps_unknown_hold(monkeypatch, async_mode, wire_usage, complete):
+    """Real SDK/SSE/adapter/call_llm/terminal accounting, with no real network."""
+    import hashlib
+    import httpx
+    import json
+    import threading
+    from agent import atlas_delegation as policy
+    real_client = httpx.Client
+    sent, raw_responses = [], []
+    def provider(request):
+        sent.append(request)
+        assert request.url.host == "api.openai.com"
+        assert request.headers["authorization"] == "Bearer synthetic-process-key"
+        event = {"type": "response.completed", "response": {
+            "id": "synthetic-partial-usage", "object": "response", "created_at": 1,
+            "model": accounting.LUNA, "status": "completed", "output": [], "usage": wire_usage}}
+        stream = ('event: response.output_text.delta\ndata: ' + json.dumps({"type": "response.output_text.delta", "delta": "summary"}) +
+            '\n\nevent: response.completed\ndata: ' + json.dumps(event) + '\n\n')
+        return httpx.Response(200, content=stream.encode(), headers={"content-type": "text/event-stream"})
+    class MockTransportClient(real_client):
+        def __init__(self, **kwargs):
+            super().__init__(transport=httpx.MockTransport(provider), **kwargs)
+    monkeypatch.setattr(httpx, "Client", MockTransportClient)
+    monkeypatch.setenv("OPENAI_API_KEY", "synthetic-process-key")
+    monkeypatch.setenv("ATLAS_MODEL_ROUTING_ENABLED", "true")
+    monkeypatch.setenv("ATLAS_MODEL_ROUTING_TRANSPORT", "openai")
+    agent = SimpleNamespace(_atlas_delegation_policy=policy.POLICY_VERSION,
+        _atlas_delegation_identities={"actor_user_id": "actor", "subject_user_id": "subject",
+            "view_as_session_id": "session", "resource_type": "chat", "resource_id": "turn_fixture", "receipt_limit": "256"},
+        _atlas_paid_dispatch_lock=threading.Lock(), _atlas_paid_dispatch_count=0)
+    monkeypatch.setattr(policy, "validate_dispatch", lambda agent: policy.check_admission_open(agent))
+    collect = accounting.collect_delegated_response
+    def capture(agent, response, **kwargs):
+        raw_responses.append(response)
+        return collect(agent, response, **kwargs)
+    monkeypatch.setattr(accounting, "collect_delegated_response", capture)
+    with policy.dispatch_context(agent):
+        response = auxiliary_client.async_call_llm(task="compression", messages=[{"role": "user", "content": "history"}]) if async_mode else auxiliary_client.call_llm(task="compression", messages=[{"role": "user", "content": "history"}])
+        if async_mode:
+            response = asyncio.run(response)
+        assert response.choices[0].message.content == "summary"
+        assert raw_responses[0].usage.input_tokens == wire_usage.get("input_tokens")
+        assert raw_responses[0].usage.output_tokens == wire_usage.get("output_tokens")
+        if not complete:
+            with pytest.raises(policy.DelegationDenied, match="unsettled"):
+                policy.admit_paid_dispatch(agent)
+        else:
+            assert not getattr(agent, "_atlas_paid_uncertain", False)
+    row, = policy.terminal_usage_calls(agent)
+    assert row["generation_id"] == "synthetic-partial-usage"
+    assert row["actor_user_id"] == row["user_id"] == "actor"
+    assert row["subject_user_id"] == "subject" and row["view_as_session_id"] == "session"
+    assert row["provider_user_hash"] == "atlas-user-" + hashlib.sha256(b"actor").hexdigest()
+    assert row["usage_available"] is complete
+    assert row["dispatch_status"] == ("completed" if complete else "uncertain")
+    if complete:
+        assert row["input_tokens_total"] == wire_usage["input_tokens"]
+        assert row["output_tokens"] == wire_usage["output_tokens"]
+    else:
+        assert not any(name in row for name in ("input_tokens", "output_tokens", "input_tokens_total", "actual_cost_usd", "estimated_cost_usd"))
+    assert len(sent) == 1 and agent._atlas_paid_dispatch_count == 1
+
+
+@pytest.mark.parametrize("wire_usage", [{"input_tokens": 17}, {"input_tokens": 17, "output_tokens": None}])
+def test_actual_sdk_ordinary_auxiliary_keeps_existing_default_usage(monkeypatch, wire_usage):
+    import httpx
+    import json
+    from openai import OpenAI
+    event = {"type": "response.completed", "response": {"id": "ordinary-usage", "object": "response", "created_at": 1,
+        "model": accounting.LUNA, "status": "completed", "output": [], "usage": wire_usage}}
+    stream = ('event: response.output_text.delta\ndata: ' + json.dumps({"type": "response.output_text.delta", "delta": "summary"}) +
+        '\n\nevent: response.completed\ndata: ' + json.dumps(event) + '\n\n')
+    with OpenAI(api_key="synthetic-key", base_url="https://api.openai.com/v1", max_retries=0,
+            http_client=httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(200, content=stream.encode(), headers={"content-type": "text/event-stream"})))) as client:
+        response = auxiliary_client._CodexCompletionsAdapter(client, accounting.LUNA).create(messages=[{"role": "user", "content": "history"}])
+    assert response.usage.input_tokens == 17 and response.usage.output_tokens == 0

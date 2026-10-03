@@ -562,6 +562,10 @@ def _apply_user_default_headers(headers: dict | None) -> dict | None:
     Returns the merged dict, or the original ``headers`` (possibly ``None``)
     when nothing is configured. No allocation when there are no overrides.
     """
+    from agent.atlas_delegation import credential_scope_active, reject_auth_headers
+    if credential_scope_active():
+        reject_auth_headers(headers)
+        return None
     try:
         from hermes_cli.config import cfg_get, load_config
         _cfg = load_config()
@@ -935,6 +939,9 @@ class _CodexCompletionsAdapter:
             "store": False,
         }
 
+        if kwargs.get("user"):
+            resp_kwargs["user"] = kwargs["user"]
+
         # Preserve the chat.completions timeout contract. This adapter is used
         # by auxiliary calls such as context compression; if the timeout is not
         # forwarded and enforced, a Codex Responses stream can sit behind a
@@ -1127,10 +1134,14 @@ class _CodexCompletionsAdapter:
             stream_kwargs["stream"] = True
 
             def _on_each_event(_event: Any) -> None:
+                from agent.atlas_delegation import observe_paid_event
+                observe_paid_event(_event)
                 # Re-check timeout/cancellation per event, matching the
                 # cadence the old in-line ``_check_cancelled()`` used.
                 _check_cancelled()
 
+            from agent.atlas_delegation import validate_auxiliary_dispatch
+            validate_auxiliary_dispatch()
             event_stream = self._client.responses.create(**stream_kwargs)
             try:
                 final = _consume_codex_event_stream(
@@ -1177,7 +1188,11 @@ class _CodexCompletionsAdapter:
 
             resp_usage = getattr(final, "usage", None)
             if resp_usage:
-                def _usage_value(key: str, default: Any = 0) -> Any:
+                from agent.atlas_delegation import current_dispatch_agent
+                # Scoped accounting must distinguish omitted/null provider counts
+                # from an explicitly reported zero. Keep ordinary adapter defaults.
+                usage_default = None if current_dispatch_agent() is not None else 0
+                def _usage_value(key: str, default: Any = usage_default) -> Any:
                     value = getattr(resp_usage, key, None)
                     if value is None and isinstance(resp_usage, dict):
                         value = resp_usage.get(key)
@@ -6415,6 +6430,14 @@ def _validate_llm_response(response: Any, task: str = None) -> Any:
     return response
 
 
+def _get_scoped_atlas_auxiliary_client(provider, model, *, async_mode=False):
+    from agent.atlas_delegation import scoped_model_client, current_dispatch_agent
+    # No ordinary cache, resolver, pool, recovery, profile headers, or auth refresh.
+    real = scoped_model_client(provider, agent=current_dispatch_agent())
+    client = CodexAuxiliaryClient(real, model)
+    return (AsyncCodexAuxiliaryClient(client) if async_mode else client), model
+
+
 def _atlas_direct_auxiliary_call(
     *, task: str, messages: list, temperature: Optional[float], max_tokens: int,
     tools: list, timeout: float, extra_body: dict, stream: bool = False,
@@ -6433,13 +6456,18 @@ def _atlas_direct_auxiliary_call(
     requested_model = f"openai/{LUNA}" if transport == OPENROUTER else LUNA
     expected_host = "openrouter.ai" if transport == OPENROUTER else "api.openai.com"
     base_url = "https://openrouter.ai/api/v1" if transport == OPENROUTER else "https://api.openai.com/v1"
-    client, resolved_model = _get_cached_client(
-        provider, requested_model, async_mode=async_mode,
-        base_url=base_url, api_mode="codex_responses",
-        # Deliberately omit main_runtime: Atlas auxiliary calls must never
-        # inherit the primary Sol route or credentials.
-        main_runtime=None, task=task,
-    )
+    from agent.atlas_delegation import current_dispatch_agent, validate_auxiliary_dispatch
+    delegated_agent = current_dispatch_agent()
+    if delegated_agent is not None:
+        validate_auxiliary_dispatch()  # Before SDK setup, not just before the send.
+        client, resolved_model = _get_scoped_atlas_auxiliary_client(
+            provider, requested_model, async_mode=async_mode)
+    else:
+        client, resolved_model = _get_cached_client(
+            provider, requested_model, async_mode=async_mode,
+            base_url=base_url, api_mode="codex_responses",
+            main_runtime=None, task=task,
+        )
     base_url = str(getattr(client, "base_url", "") or "") if client is not None else ""
     if (
         client is None
@@ -6467,10 +6495,32 @@ def _atlas_direct_auxiliary_call(
         extra_body=merged_extra, base_url=base_url,
     )
     kwargs.pop("temperature", None)
+    from agent.atlas_delegation import current_dispatch_agent, admit_paid_dispatch, paid_attempt_context, finish_paid_attempt, observe_paid_event
+    delegated_agent = current_dispatch_agent()
+    if delegated_agent is not None:
+        import hashlib
+        actor = delegated_agent._atlas_delegation_identities["actor_user_id"]
+        kwargs["user"] = "atlas-user-" + hashlib.sha256(actor.encode()).hexdigest()
 
     if async_mode:
         async def _perform():
-            raw_response = await client.chat.completions.create(**kwargs)
+            from agent.atlas_delegation import validate_auxiliary_dispatch
+            attempt = None
+            try:
+                validate_auxiliary_dispatch()
+                attempt = admit_paid_dispatch(delegated_agent, model=requested_model, auxiliary=True)
+                with paid_attempt_context(attempt):
+                    raw_response = await client.chat.completions.create(**kwargs)
+                if delegated_agent is not None:
+                    observe_paid_event({"response": raw_response}, attempt)
+                    from agent.atlas_auxiliary_accounting import collect_delegated_response
+                    collect_delegated_response(delegated_agent, raw_response, requested_model=LUNA, attempt=attempt)
+                    return _validate_llm_response(raw_response, task)
+            finally:
+                if attempt is not None and attempt.get("dispatch_status") != "completed":
+                    finish_paid_attempt(delegated_agent, attempt)
+                if delegated_agent is not None and hasattr(client, "_real_client"):
+                    client._real_client.close()
             from agent.atlas_auxiliary_accounting import record_completed_response_async
             try:
                 await record_completed_response_async(raw_response, requested_model=LUNA)
@@ -6479,7 +6529,23 @@ def _atlas_direct_auxiliary_call(
             return _validate_llm_response(raw_response, task)
         return _perform()
 
-    raw_response = client.chat.completions.create(**kwargs)
+    from agent.atlas_delegation import validate_auxiliary_dispatch
+    attempt = None
+    try:
+        validate_auxiliary_dispatch()
+        attempt = admit_paid_dispatch(delegated_agent, model=requested_model, auxiliary=True)
+        with paid_attempt_context(attempt):
+            raw_response = client.chat.completions.create(**kwargs)
+        if delegated_agent is not None:
+            observe_paid_event({"response": raw_response}, attempt)
+            from agent.atlas_auxiliary_accounting import collect_delegated_response
+            collect_delegated_response(delegated_agent, raw_response, requested_model=LUNA, attempt=attempt)
+            return _validate_llm_response(raw_response, task)
+    finally:
+        if attempt is not None and attempt.get("dispatch_status") != "completed":
+            finish_paid_attempt(delegated_agent, attempt)
+        if delegated_agent is not None and hasattr(client, "_real_client"):
+            client._real_client.close()
     from agent.atlas_auxiliary_accounting import record_completed_response
     try:
         record_completed_response(raw_response, requested_model=LUNA)
@@ -6597,6 +6663,8 @@ def call_llm(
     Raises:
         RuntimeError: If no provider is configured.
     """
+    from agent.atlas_delegation import validate_auxiliary_dispatch
+    validate_auxiliary_dispatch()
     from agent.atlas_auxiliary_accounting import atlas_auxiliary_enabled
     if atlas_auxiliary_enabled():
         return _atlas_direct_auxiliary_call(
@@ -7224,6 +7292,8 @@ async def async_call_llm(
 
     Same as call_llm() but async. See call_llm() for full documentation.
     """
+    from agent.atlas_delegation import validate_auxiliary_dispatch
+    validate_auxiliary_dispatch()
     from agent.atlas_auxiliary_accounting import atlas_auxiliary_enabled
     if atlas_auxiliary_enabled():
         return await _atlas_direct_auxiliary_call(

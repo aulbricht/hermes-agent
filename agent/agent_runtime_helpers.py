@@ -1675,6 +1675,10 @@ def anthropic_prompt_cache_policy(
 
 
 def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: bool) -> Any:
+    from agent.atlas_delegation import is_scoped, scoped_model_client
+    if is_scoped(agent):
+        return scoped_model_client(agent.provider, agent=agent,
+            headers=client_kwargs.get("default_headers"), timeout=client_kwargs.get("timeout", 60))
     from agent.auxiliary_client import _validate_base_url, _validate_proxy_env_urls
     from agent.ssl_verify import resolve_httpx_verify
     # Treat client_kwargs as read-only. Callers pass agent._client_kwargs (or shallow
@@ -2163,6 +2167,10 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
     tools. Used by the concurrent execution path; the sequential path retains
     its own inline invocation for backward-compatible display handling.
     """
+    from agent.atlas_delegation import is_scoped, dispatch_tool
+    if is_scoped(agent):
+        return dispatch_tool(agent, function_name, function_args if isinstance(function_args, dict) else {}, effective_task_id)
+
     if not isinstance(function_args, dict):
         function_args = {}
 
