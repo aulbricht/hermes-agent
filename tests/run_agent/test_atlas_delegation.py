@@ -333,3 +333,83 @@ def test_delegated_error_hook_never_even_looks_up_plugins(monkeypatch):
         agent._invoke_api_request_error_hook(task_id="task", turn_id="turn", api_request_id="api", api_call_count=1, api_start_time=0, api_kwargs={}, error_type="Timeout", error_message="failed")
     lookup.assert_not_called()
     invoke.assert_not_called()
+
+
+
+def test_terminal_closure_rejects_authorization_waiter_without_new_receipt(monkeypatch):
+    import threading
+    agent, _ = scoped_agent(monkeypatch)
+    entered, release = threading.Event(), threading.Event()
+    sent, errors = [], []
+    def authorize(agent):
+        entered.set()
+        assert release.wait(5)
+    monkeypatch.setattr(policy, "validate_dispatch", authorize)
+    def worker():
+        try:
+            policy.admit_paid_dispatch(agent)
+            sent.append(True)
+        except policy.DelegationDenied as error:
+            errors.append(str(error))
+    thread = threading.Thread(target=worker)
+    thread.start()
+    assert entered.wait(5)
+    assert policy.terminal_usage_calls(agent) == []
+    release.set()
+    thread.join(5)
+    assert not thread.is_alive() and not sent and errors == ["Atlas delegation dispatch is closed"]
+    assert policy.terminal_usage_calls(agent) == [] and agent._atlas_paid_dispatch_count == 0
+
+
+def test_terminal_drain_captures_finishing_attempt_without_sleep(monkeypatch):
+    import threading
+    agent, _ = scoped_agent(monkeypatch)
+    monkeypatch.setattr(policy, "validate_dispatch", lambda agent: None)
+    attempt = policy.admit_paid_dispatch(agent)
+    condition = agent._atlas_paid_condition = threading.Condition(agent._atlas_paid_dispatch_lock)
+    waiting = threading.Event()
+    real_wait = condition.wait
+    def wait(timeout=None):
+        waiting.set()
+        return real_wait(timeout)
+    monkeypatch.setattr(condition, "wait", wait)
+    def finish():
+        assert waiting.wait(5)
+        policy.finish_paid_attempt(agent, attempt, {"generation_id": "late-known", "usage_available": True, "input_tokens": 3, "output_tokens": 2})
+    worker = threading.Thread(target=finish)
+    worker.start()
+    row, = policy.terminal_usage_calls(agent)
+    worker.join(5)
+    assert not worker.is_alive() and row["generation_id"] == "late-known" and row["dispatch_status"] == "completed"
+    assert policy.terminal_usage_calls(agent) == [row]
+    with pytest.raises(policy.DelegationDenied, match="closed"):
+        policy.admit_paid_dispatch(agent)
+
+
+def test_terminal_drain_timeout_keeps_active_uncertain_attempt(monkeypatch):
+    agent, _ = scoped_agent(monkeypatch)
+    monkeypatch.setattr(policy, "validate_dispatch", lambda agent: None)
+    attempt = policy.admit_paid_dispatch(agent)
+    policy.observe_paid_event(SimpleNamespace(response=SimpleNamespace(id="observed-pending")), attempt, agent)
+    ticks = iter([0.0, 4.0])
+    monkeypatch.setattr(policy.time, "monotonic", lambda: next(ticks))
+    row, = policy.terminal_usage_calls(agent)
+    assert row["generation_id"] == "observed-pending" and row["dispatch_status"] == "uncertain"
+    assert row["usage_available"] is False and "input_tokens" not in row
+    assert attempt["attempt_id"] in agent._atlas_paid_active
+
+
+def test_callback_rechecks_closure_after_authorization(monkeypatch):
+    agent, _ = scoped_agent(monkeypatch)
+    monkeypatch.setattr(policy, "_read_dispatch_key", lambda: b"fixture-key")
+    response = MagicMock()
+    response.__enter__.return_value = response
+    response.status = 200
+    def read(size):
+        agent._atlas_admission_closed = True
+        return b'{"allowed":true}'
+    response.read.side_effect = read
+    with patch("urllib.request.build_opener") as opener:
+        opener.return_value.open.return_value = response
+        with pytest.raises(policy.DelegationDenied):
+            policy.validate_dispatch(agent)

@@ -126,6 +126,7 @@ def resolve_policy():
 
 def capability():
     resolve_policy()
+    resolve_web_readers()
     _read_dispatch_key()
     return {"policy_version": POLICY_VERSION, "executor_enforced": True, "allowed_tools": sorted(ALLOWED_TOOLS)}
 
@@ -147,6 +148,10 @@ def bind_policy(agent, identities):
     agent._atlas_primary_usage_calls = []
     agent._atlas_paid_attempts = []
     agent._atlas_paid_uncertain = False
+    agent._atlas_admission_closed = False
+    agent._atlas_paid_active = set()
+    agent._atlas_paid_condition = threading.Condition(agent._atlas_paid_dispatch_lock)
+    agent._atlas_web_readers = MappingProxyType(resolve_web_readers())
     agent.tools = schemas
     agent.valid_tool_names = ALLOWED_TOOLS
     agent._skip_mcp_refresh = True
@@ -154,6 +159,50 @@ def bind_policy(agent, identities):
     agent._memory_enabled = agent._user_profile_enabled = False
     agent._memory_nudge_interval = agent._skill_nudge_interval = 0
     agent.context_compressor._atlas_dispatch_validator = lambda: validate_dispatch(agent)
+
+
+def resolve_web_readers():
+    """Capture approved implementations without plugin discovery/credential probes."""
+    from tools import web_tools
+    import importlib
+    classes = {"firecrawl": "FirecrawlWebSearchProvider", "exa": "ExaWebSearchProvider",
+        "parallel": "ParallelWebSearchProvider", "tavily": "TavilyWebSearchProvider"}
+    config = web_tools._load_web_config()
+    readers = {}
+    for capability in ("search", "extract"):
+        backend = str(config.get(capability + "_backend") or config.get("backend") or "").lower().strip()
+        if not backend:
+            backend = next((name for name, key in (("tavily", "TAVILY_API_KEY"), ("exa", "EXA_API_KEY"), ("parallel", "PARALLEL_API_KEY"), ("firecrawl", "FIRECRAWL_API_KEY")) if web_tools._has_env(key)), "firecrawl")
+        if backend not in classes:
+            raise DelegationDenied("Atlas delegation web provider is not governed")
+        module = importlib.import_module("plugins.web." + backend + ".provider")
+        implementation = getattr(module, classes[backend])
+        instance = implementation()
+        method = getattr(implementation, capability)
+        if method.__module__ != module.__name__:
+            raise DelegationDenied("Atlas delegation web provider implementation changed")
+        readers["web_" + capability] = (instance, method.__get__(instance, implementation))
+    return readers
+
+
+def scoped_web_reader(name):
+    agent = current_dispatch_agent()
+    check_admission_open(agent)
+    reader = getattr(agent, "_atlas_web_readers", {}).get(name)
+    if reader is None:
+        raise DelegationDenied("Atlas delegation web provider is unavailable")
+    return reader
+
+
+def _check_admission_open_locked(agent):
+    if getattr(agent, "_atlas_admission_closed", False) or getattr(agent, "_interrupt_requested", False):
+        raise DelegationDenied("Atlas delegation dispatch is closed")
+
+
+def check_admission_open(agent):
+    if is_scoped(agent):
+        with agent._atlas_paid_dispatch_lock:
+            _check_admission_open_locked(agent)
 
 
 def _read_dispatch_key():
@@ -171,6 +220,7 @@ def _read_dispatch_key():
 def validate_dispatch(agent):
     if not is_scoped(agent):
         return
+    check_admission_open(agent)
     context = agent._atlas_delegation_identities
     if not valid_resource(context.get("resource_type"), context.get("resource_id")):
         raise DelegationDenied("Atlas delegation requires a scoped resource")
@@ -201,6 +251,7 @@ def validate_dispatch(agent):
             payload = json.loads(response.read(4097))
             if response.status != 200 or not isinstance(payload, dict) or payload.get("allowed") is not True:
                 raise DelegationDenied("Atlas delegation is no longer authorized")
+        check_admission_open(agent)  # The callback can outlive terminal collection.
     except Exception as error:
         raise DelegationDenied("Atlas delegation is no longer authorized") from error
 
@@ -219,6 +270,7 @@ def tool_allowed(agent, name):
         if _live_reader_fingerprints() != dict(agent._atlas_delegation_fingerprints):
             return False
         validate_dispatch(agent)
+        check_admission_open(agent)
         return True
     except Exception:
         return False
@@ -278,6 +330,7 @@ def admit_paid_dispatch(agent, *, model=None, auxiliary=False):
     if limit != "256":
         raise DelegationDenied("Atlas delegation receipt capacity is invalid")
     with agent._atlas_paid_dispatch_lock:
+        _check_admission_open_locked(agent)
         if agent._atlas_paid_dispatch_count >= int(limit):
             raise DelegationDenied("Atlas delegation receipt capacity is exhausted")
         if getattr(agent, "_atlas_paid_uncertain", False):
@@ -291,14 +344,19 @@ def admit_paid_dispatch(agent, *, model=None, auxiliary=False):
         if not hasattr(agent, "_atlas_paid_attempts"):
             agent._atlas_paid_attempts = []
         agent._atlas_paid_attempts.append(call)
+        if not hasattr(agent, "_atlas_paid_active"):
+            agent._atlas_paid_active = set()
+        agent._atlas_paid_active.add(call["attempt_id"])
         agent._atlas_paid_dispatch_count += 1
         return call
 
 
 def validate_web_send(name="web_extract"):
     agent = current_dispatch_agent()
+    check_admission_open(agent)
     if agent is not None and not tool_allowed(agent, name):
         raise DelegationDenied("Atlas delegation web reader is no longer authorized")
+    check_admission_open(agent)
 
 
 _paid_attempt = ContextVar("atlas_delegation_paid_attempt", default=None)
@@ -337,6 +395,10 @@ def finish_paid_attempt(agent, attempt, fields=None):
     if attempt is None:
         return
     with agent._atlas_paid_dispatch_lock:
+        getattr(agent, "_atlas_paid_active", set()).discard(attempt["attempt_id"])
+        condition = getattr(agent, "_atlas_paid_condition", None)
+        if condition is not None:
+            condition.notify_all()
         if fields:
             # Unknown usage must never become fabricated zero-token/zero-cost evidence.
             if fields.get("usage_available") is True:
@@ -360,6 +422,7 @@ def validate_mcp_send(agent, server_name, server):
     if _live_reader_fingerprints() != dict(agent._atlas_delegation_fingerprints):
         raise DelegationDenied("Atlas delegation MCP transport changed")
     validate_dispatch(agent)
+    check_admission_open(agent)
 
 
 def collect_primary_response(agent, response, model, attempt=None):
@@ -386,6 +449,16 @@ def terminal_usage_calls(agent):
     """Merge loop settlement into every completed dispatch, without reauthorizing."""
     recorded = list(getattr(agent, "session_usage_calls", []) or [])
     with agent._atlas_paid_dispatch_lock:
+        agent._atlas_admission_closed = True
+        condition = getattr(agent, "_atlas_paid_condition", None)
+        if condition is None:
+            condition = agent._atlas_paid_condition = threading.Condition(agent._atlas_paid_dispatch_lock)
+        deadline = time.monotonic() + 3.0
+        while getattr(agent, "_atlas_paid_active", set()):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            condition.wait(timeout=remaining)
         attempts = [dict(row) for row in getattr(agent, "_atlas_paid_attempts", []) or []]
         completed = attempts if attempts else [dict(row) for row in getattr(agent, "_atlas_primary_usage_calls", []) or []]
     if not completed:

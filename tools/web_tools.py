@@ -676,51 +676,57 @@ def web_search_tool(query: str, limit: int = 5) -> str:
         # (brave-free, ddgs, searxng, exa, parallel, tavily, firecrawl)
         # now live as plugins; the dispatcher is just a registry lookup +
         # delegation. Sync only — every provider's search() is sync.
-        _ensure_web_plugins_loaded()
-        from agent.web_search_registry import (
-            get_active_search_provider,
-            get_provider as _wsp_get_provider,
-            _disabled_web_plugin_for,
-        )
-
-        backend = _get_search_backend()
-        provider = _wsp_get_provider(backend) if backend else None
-        if provider is None or not provider.supports_search():
-            # Fall back to availability-walked active provider when the
-            # configured backend isn't a registered search provider (typo,
-            # uninstalled plugin, or capability mismatch).
-            provider = get_active_search_provider()
-
-        if provider is None:
-            # A bundled web plugin the user explicitly disabled looks
-            # identical to "no provider" here — point at the real cause
-            # (re-enable the plugin) rather than a generic setup hint.
-            disabled_key = _disabled_web_plugin_for(capability="search")
-            if disabled_key:
-                _vendor = disabled_key.split("/", 1)[-1]
-                response_data = {
-                    "success": False,
-                    "error": (
-                        f"web.search_backend is set to '{_vendor}', but its "
-                        f"plugin ('{disabled_key}') is disabled in config. "
-                        f"Re-enable it with `hermes plugins enable {disabled_key}` "
-                        "(or remove it from plugins.disabled)."
-                    ),
-                }
-            else:
-                response_data = {
-                    "success": False,
-                    "error": (
-                        "No web search provider configured. "
-                        "Run `hermes tools` to set one up."
-                    ),
-                }
+        from agent.atlas_delegation import current_dispatch_agent, scoped_web_reader, validate_web_send
+        if current_dispatch_agent() is not None:
+            provider, search = scoped_web_reader("web_search")
+            validate_web_send("web_search")
+            response_data = search(query, limit)
         else:
-            logger.info(
-                "Web search via %s: '%s' (limit: %d)",
-                provider.name, query, limit,
+            _ensure_web_plugins_loaded()
+            from agent.web_search_registry import (
+                get_active_search_provider,
+                get_provider as _wsp_get_provider,
+                _disabled_web_plugin_for,
             )
-            response_data = provider.search(query, limit)
+
+            backend = _get_search_backend()
+            provider = _wsp_get_provider(backend) if backend else None
+            if provider is None or not provider.supports_search():
+                # Fall back to availability-walked active provider when the
+                # configured backend isn't a registered search provider (typo,
+                # uninstalled plugin, or capability mismatch).
+                provider = get_active_search_provider()
+
+            if provider is None:
+                # A bundled web plugin the user explicitly disabled looks
+                # identical to "no provider" here — point at the real cause
+                # (re-enable the plugin) rather than a generic setup hint.
+                disabled_key = _disabled_web_plugin_for(capability="search")
+                if disabled_key:
+                    _vendor = disabled_key.split("/", 1)[-1]
+                    response_data = {
+                        "success": False,
+                        "error": (
+                            f"web.search_backend is set to '{_vendor}', but its "
+                            f"plugin ('{disabled_key}') is disabled in config. "
+                            f"Re-enable it with `hermes plugins enable {disabled_key}` "
+                            "(or remove it from plugins.disabled)."
+                        ),
+                    }
+                else:
+                    response_data = {
+                        "success": False,
+                        "error": (
+                            "No web search provider configured. "
+                            "Run `hermes tools` to set one up."
+                        ),
+                    }
+            else:
+                logger.info(
+                    "Web search via %s: '%s' (limit: %d)",
+                    provider.name, query, limit,
+                )
+                response_data = provider.search(query, limit)
 
         debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
         result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
@@ -855,77 +861,83 @@ async def web_extract_tool(
         if not safe_urls:
             results = []
         else:
-            backend = _get_extract_backend()
+            from agent.atlas_delegation import current_dispatch_agent, scoped_web_reader
+            if current_dispatch_agent() is not None:
+                provider, extract = scoped_web_reader("web_extract")
+            else:
+                backend = _get_extract_backend()
 
-            # All seven providers (brave-free, ddgs, searxng, exa, parallel,
-            # tavily, firecrawl) now live as plugins. The dispatcher is a
-            # registry lookup + delegation. Some providers' extract() is
-            # async (parallel, firecrawl), others sync (exa, tavily) — we
-            # detect coroutine functions and await; sync functions run
-            # inline (the policy gate, SSRF re-check, etc. live inside the
-            # provider itself for the firecrawl per-URL loop).
-            _ensure_web_plugins_loaded()
-            from agent.web_search_registry import (
-                get_active_extract_provider,
-                get_provider as _wsp_get_provider,
-                _disabled_web_plugin_for,
-            )
+                # All seven providers (brave-free, ddgs, searxng, exa, parallel,
+                # tavily, firecrawl) now live as plugins. The dispatcher is a
+                # registry lookup + delegation. Some providers' extract() is
+                # async (parallel, firecrawl), others sync (exa, tavily) — we
+                # detect coroutine functions and await; sync functions run
+                # inline (the policy gate, SSRF re-check, etc. live inside the
+                # provider itself for the firecrawl per-URL loop).
+                _ensure_web_plugins_loaded()
+                from agent.web_search_registry import (
+                    get_active_extract_provider,
+                    get_provider as _wsp_get_provider,
+                    _disabled_web_plugin_for,
+                )
 
-            provider = _wsp_get_provider(backend) if backend else None
-            if provider is None or not provider.supports_extract():
-                # When the configured name IS registered but doesn't support
-                # extract (search-only providers like brave-free / ddgs /
-                # searxng), surface that as a typed "search-only" error
-                # rather than silently switching backends. When the name
-                # isn't registered at all (typo / uninstalled plugin), fall
-                # through to the active-provider walk.
-                if provider is not None and not provider.supports_extract():
-                    return json.dumps(
-                        {
-                            "success": False,
-                            "error": (
-                                f"{provider.display_name} is a search-only "
-                                "backend and cannot extract URL content. "
-                                "Set web.extract_backend to firecrawl, "
-                                "tavily, exa, or parallel."
-                            ),
-                        },
-                        ensure_ascii=False,
-                    )
-                provider = get_active_extract_provider()
-                if provider is None:
-                    # If the configured backend is a bundled web plugin the
-                    # user explicitly disabled, the backend is set correctly
-                    # and the real fix is to re-enable the plugin — say so
-                    # instead of telling them to set web.extract_backend
-                    # (which they already did). #40190 follow-up.
-                    disabled_key = _disabled_web_plugin_for(capability="extract")
-                    if disabled_key:
-                        _vendor = disabled_key.split("/", 1)[-1]
+                provider = _wsp_get_provider(backend) if backend else None
+                if provider is None or not provider.supports_extract():
+                    # When the configured name IS registered but doesn't support
+                    # extract (search-only providers like brave-free / ddgs /
+                    # searxng), surface that as a typed "search-only" error
+                    # rather than silently switching backends. When the name
+                    # isn't registered at all (typo / uninstalled plugin), fall
+                    # through to the active-provider walk.
+                    if provider is not None and not provider.supports_extract():
                         return json.dumps(
                             {
                                 "success": False,
                                 "error": (
-                                    f"web.extract_backend is set to '{_vendor}', "
-                                    f"but its plugin ('{disabled_key}') is disabled "
-                                    "in config. Re-enable it with "
-                                    f"`hermes plugins enable {disabled_key}` "
-                                    "(or remove it from plugins.disabled)."
+                                    f"{provider.display_name} is a search-only "
+                                    "backend and cannot extract URL content. "
+                                    "Set web.extract_backend to firecrawl, "
+                                    "tavily, exa, or parallel."
                                 ),
                             },
                             ensure_ascii=False,
                         )
-                    return json.dumps(
-                        {
-                            "success": False,
-                            "error": (
-                                "No web extract provider configured. "
-                                "Set web.extract_backend to firecrawl, "
-                                "tavily, exa, or parallel."
-                            ),
-                        },
-                        ensure_ascii=False,
-                    )
+                    provider = get_active_extract_provider()
+                    if provider is None:
+                        # If the configured backend is a bundled web plugin the
+                        # user explicitly disabled, the backend is set correctly
+                        # and the real fix is to re-enable the plugin — say so
+                        # instead of telling them to set web.extract_backend
+                        # (which they already did). #40190 follow-up.
+                        disabled_key = _disabled_web_plugin_for(capability="extract")
+                        if disabled_key:
+                            _vendor = disabled_key.split("/", 1)[-1]
+                            return json.dumps(
+                                {
+                                    "success": False,
+                                    "error": (
+                                        f"web.extract_backend is set to '{_vendor}', "
+                                        f"but its plugin ('{disabled_key}') is disabled "
+                                        "in config. Re-enable it with "
+                                        f"`hermes plugins enable {disabled_key}` "
+                                        "(or remove it from plugins.disabled)."
+                                    ),
+                                },
+                                ensure_ascii=False,
+                            )
+                        return json.dumps(
+                            {
+                                "success": False,
+                                "error": (
+                                    "No web extract provider configured. "
+                                    "Set web.extract_backend to firecrawl, "
+                                    "tavily, exa, or parallel."
+                                ),
+                            },
+                            ensure_ascii=False,
+                        )
+
+                extract = provider.extract
 
             logger.info(
                 "Web extract via %s: %d URL(s)", provider.name, len(safe_urls)
@@ -935,15 +947,15 @@ async def web_extract_tool(
             # extract(); exa + tavily are sync.
             import inspect
             from agent.atlas_delegation import validate_web_send
-            if inspect.iscoroutinefunction(provider.extract):
+            if inspect.iscoroutinefunction(extract):
                 validate_web_send()
-                results = await provider.extract(safe_urls, format=format)
+                results = await extract(safe_urls, format=format)
             else:
                 # Run sync extract() in a thread so we don't block the
                 # event loop on network I/O.
                 def extract_in_worker():
                     validate_web_send()  # After waiting for the thread pool, not before enqueue.
-                    return provider.extract(safe_urls, format=format)
+                    return extract(safe_urls, format=format)
                 results = await asyncio.to_thread(extract_in_worker)
 
         # Reconstruct the original input order across invalid, blocked, and
