@@ -419,6 +419,17 @@ def _multimodal_validation_error(exc: ValueError, *, param: str) -> "web.Respons
     )
 
 
+def _has_atlas_delegation_headers(request):
+    return any(str(name).lower().startswith("x-atlas-delegat") for name in request.headers)
+
+
+def _atlas_delegation_route_error(request):
+    if (_has_atlas_delegation_headers(request)
+            and not (request.method == "POST" and re.fullmatch(r"/api/sessions/[^/]+/chat(?:/stream)?", request.path))):
+        return web.json_response(_openai_error("Atlas delegation is unsupported on this route", code="unsupported_atlas_delegation_route"), status=400)
+    return None
+
+
 def _atlas_delegation_context(adapter, request):
     """Only authenticated server callers can select the fixed View As lane."""
     from agent.atlas_delegation import POLICY_VERSION
@@ -428,12 +439,20 @@ def _atlas_delegation_context(adapter, request):
         "subject_user_id": request.headers.get("X-Atlas-Delegated-Subject", ""),
         "view_as_session_id": request.headers.get("X-Atlas-Delegated-Session", ""),
     }
-    if version is None and not any(identities.values()):
+    identities.update({
+        "resource_type": request.headers.get("X-Atlas-Delegated-Resource-Type", ""),
+        "resource_id": request.headers.get("X-Atlas-Delegated-Resource-ID", ""),
+        "receipt_limit": request.headers.get("X-Atlas-Delegated-Receipt-Limit", ""),
+    })
+    if not _has_atlas_delegation_headers(request):
         return None, None
     if not adapter._api_key:
         return None, web.json_response(_openai_error("Atlas delegation requires API authentication"), status=401)
     if version != POLICY_VERSION or any(not re.fullmatch(r"[A-Za-z0-9_.:-]{1,200}", value) for value in identities.values()):
         return None, web.json_response(_openai_error("Invalid Atlas delegation policy or identity"), status=400)
+    from agent.atlas_delegation import valid_resource
+    if not valid_resource(identities["resource_type"], identities["resource_id"]) or identities["receipt_limit"] != "256":
+        return None, web.json_response(_openai_error("Invalid Atlas delegated resource or receipt capacity"), status=400)
     return identities, None
 
 
@@ -774,6 +793,9 @@ def _admit_api_agent_request(handler):
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
+        delegation_error = _atlas_delegation_route_error(request)
+        if delegation_error is not None:
+            return delegation_error
         draining = self._draining_response()
         if draining is not None:
             return draining
@@ -852,6 +874,11 @@ _SECURITY_HEADERS = {
 
 if AIOHTTP_AVAILABLE:
     @web.middleware
+    async def atlas_delegation_route_middleware(request, handler):
+        error = _atlas_delegation_route_error(request)
+        return error if error is not None else await handler(request)
+
+    @web.middleware
     async def security_headers_middleware(request, handler):
         """Add security headers to all responses (including errors)."""
         response = await handler(request)
@@ -859,6 +886,7 @@ if AIOHTTP_AVAILABLE:
             response.headers.setdefault(k, v)
         return response
 else:
+    atlas_delegation_route_middleware = None
     security_headers_middleware = None  # type: ignore[assignment]
 
 
@@ -2319,6 +2347,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
                 effective_session_id = result.get("session_id", session_id) if isinstance(result, dict) else session_id
                 turn_messages = self._turn_transcript_messages(history, user_message, result) if isinstance(result, dict) else []
+                if result.get("failed"):
+                    await queue.put(_event_payload("run.failed", {"session_id": effective_session_id, "message_id": message_id, "usage": usage, "error": result.get("error", "Delegated run failed")}))
+                    return
                 await queue.put(_event_payload("assistant.completed", {
                     "session_id": effective_session_id,
                     "message_id": message_id,
@@ -4447,9 +4478,14 @@ class APIServerAdapter(BasePlatformAdapter):
                     route=route,
                     **({"atlas_delegation_context": atlas_delegation_context} if atlas_delegation_context is not None else {}),
                 )
-                if provider_user_hash:
+                if atlas_delegation_context is not None:
+                    import hashlib
+                    provider_user_hash_override = "atlas-user-" + hashlib.sha256(atlas_delegation_context["actor_user_id"].encode()).hexdigest()
+                else:
+                    provider_user_hash_override = provider_user_hash
+                if provider_user_hash_override:
                     overrides = dict(getattr(agent, "request_overrides", {}) or {})
-                    overrides["user"] = provider_user_hash
+                    overrides["user"] = provider_user_hash_override
                     agent.request_overrides = overrides
                 if atlas_route_request_id:
                     agent._atlas_route_request_id = atlas_route_request_id
@@ -4458,11 +4494,16 @@ class APIServerAdapter(BasePlatformAdapter):
                 effective_task_id = session_id or str(uuid.uuid4())
                 from agent.atlas_delegation import dispatch_context
                 with dispatch_context(agent):
-                    result = agent.run_conversation(
-                        user_message=user_message,
-                        conversation_history=conversation_history,
-                        task_id=effective_task_id,
-                    )
+                    try:
+                        result = agent.run_conversation(
+                            user_message=user_message,
+                            conversation_history=conversation_history,
+                            task_id=effective_task_id,
+                        )
+                    except Exception as exc:
+                        if atlas_delegation_context is None:
+                            raise
+                        result = {"final_response": "", "failed": True, "error": _redact_api_error_text(exc)}
                 usage = {
                     "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
                     "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
@@ -4485,6 +4526,9 @@ class APIServerAdapter(BasePlatformAdapter):
                         "request_count": getattr(agent, "session_api_calls", 0) or 0,
                         "calls": list(getattr(agent, "session_usage_calls", []) or []),
                     })
+                if atlas_delegation_context is not None:
+                    from agent.atlas_delegation import terminal_usage_calls
+                    usage["calls"] = terminal_usage_calls(agent)
                 # Include the effective session ID in the result so callers
                 # (e.g. X-Hermes-Session-Id header) can track compression-
                 # triggered session rotations. (#16938)
@@ -5199,7 +5243,7 @@ class APIServerAdapter(BasePlatformAdapter):
             return False
 
         try:
-            mws = [mw for mw in (cors_middleware, body_limit_middleware, security_headers_middleware) if mw is not None]
+            mws = [mw for mw in (cors_middleware, body_limit_middleware, security_headers_middleware, atlas_delegation_route_middleware) if mw is not None]
             self._app = web.Application(middlewares=mws, client_max_size=MAX_REQUEST_BYTES)
             assert self._app is not None
             self._app.router.add_get("/health", self._handle_health)

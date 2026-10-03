@@ -258,3 +258,54 @@ def test_atlas_async_compression_meters_without_retrying_generation(monkeypatch)
     assert response.choices[0].message.content == "summary"
     assert len(creates) == 1
     assert len(receipts) == 1
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+def test_delegated_aux_usage_actor_bound_and_retained_after_revocation(monkeypatch, async_mode):
+    import hashlib
+    import threading
+    from agent import atlas_delegation as policy
+    monkeypatch.setenv("ATLAS_MODEL_ROUTING_ENABLED", "true")
+    agent = SimpleNamespace(_atlas_delegation_policy=policy.POLICY_VERSION,
+        _atlas_delegation_identities={"actor_user_id": "actor", "subject_user_id": "subject", "view_as_session_id": "session", "resource_type": "chat", "resource_id": "turn_fixture", "receipt_limit": "256"},
+        _atlas_route_request_id="route_fixture", _atlas_paid_dispatch_lock=threading.Lock(),
+        _atlas_paid_dispatch_count=0, _atlas_auxiliary_usage_calls=[])
+    authorized = [True]
+    sent = []
+    def check(agent):
+        if not authorized[0]:
+            raise policy.DelegationDenied("expired")
+    monkeypatch.setattr(policy, "validate_dispatch", check)
+    def create(**kwargs):
+        sent.append(kwargs)
+        authorized[0] = False
+        return _response()
+    async def async_create(**kwargs):
+        return create(**kwargs)
+    client = SimpleNamespace(base_url="https://api.openai.com/v1", chat=SimpleNamespace(completions=SimpleNamespace(create=async_create if async_mode else create)))
+    monkeypatch.setattr(auxiliary_client, "_get_cached_client", lambda *args, **kwargs: (client, accounting.LUNA))
+    monkeypatch.setattr(accounting, "record_completed_response", lambda *args, **kwargs: pytest.fail("delegated usage must use durable terminal settlement"))
+    monkeypatch.setattr(accounting, "record_completed_response_async", lambda *args, **kwargs: pytest.fail("delegated usage must use durable terminal settlement"))
+    with policy.dispatch_context(agent):
+        result = auxiliary_client.async_call_llm(task="compression", messages=[{"role": "user", "content": "history"}]) if async_mode else auxiliary_client.call_llm(task="compression", messages=[{"role": "user", "content": "history"}])
+        if async_mode:
+            result = asyncio.run(result)
+        with pytest.raises(policy.DelegationDenied):
+            policy.admit_paid_dispatch(agent)
+    assert result.id == "resp-test"
+    assert agent._atlas_paid_dispatch_count == 1
+    receipt, = policy.terminal_usage_calls(agent)
+    assert receipt["user_id"] == receipt["actor_user_id"] == "actor"
+    assert receipt["subject_user_id"] == "subject" and receipt["view_as_session_id"] == "session"
+    assert receipt["resource_id"] == "turn_fixture" and receipt["route_request_id"] == "route_fixture"
+    assert sent[0]["user"] == receipt["provider_user_hash"] == "atlas-user-" + hashlib.sha256(b"actor").hexdigest()
+    assert receipt["input_tokens"] == 85 and receipt["input_tokens_total"] == 100 and receipt["generation_id"] == "resp-test"
+
+
+def test_responses_adapter_keeps_actor_hash_on_actual_provider_request(monkeypatch):
+    final = SimpleNamespace(id="resp", model=accounting.LUNA, usage=SimpleNamespace(input_tokens=1, output_tokens=1), output=[])
+    monkeypatch.setattr("agent.codex_runtime._consume_codex_event_stream", lambda *args, **kwargs: final)
+    requests = []
+    client = SimpleNamespace(base_url="https://api.openai.com/v1", responses=SimpleNamespace(create=lambda **kwargs: requests.append(kwargs) or SimpleNamespace(close=lambda: None)))
+    auxiliary_client._CodexCompletionsAdapter(client, accounting.LUNA).create(messages=[{"role": "user", "content": "read"}], user="atlas-user-fixture")
+    assert requests[0]["user"] == "atlas-user-fixture"

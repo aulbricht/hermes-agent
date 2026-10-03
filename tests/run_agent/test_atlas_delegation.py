@@ -22,7 +22,12 @@ def scoped_agent(monkeypatch):
     agent._atlas_delegation_allowed_tools = policy.ALLOWED_TOOLS
     agent._atlas_delegation_entries = {"web_search": (handler, json.dumps(schema, sort_keys=True), False)}
     agent._atlas_delegation_fingerprints = {"reader": "protected"}
-    agent._atlas_delegation_identities = {"actor_user_id": "actor", "subject_user_id": "subject", "view_as_session_id": "session"}
+    agent._atlas_delegation_identities = {"actor_user_id": "actor", "subject_user_id": "subject", "view_as_session_id": "session", "resource_type": "chat", "resource_id": "turn_fixture", "receipt_limit": "256"}
+    import threading
+    agent._atlas_paid_dispatch_lock = threading.Lock()
+    agent._atlas_paid_dispatch_count = 0
+    agent._atlas_auxiliary_usage_calls = []
+    agent._atlas_primary_usage_calls = []
     monkeypatch.setattr(policy, "_live_reader_fingerprints", lambda: {"reader": "protected"})
     return agent, handler
 
@@ -243,3 +248,34 @@ def test_codex_connection_retry_rechecks_expiry_before_second_billable_request(m
         run_codex_stream(agent, {"model": "fixture"}, client=client)
     assert checks.call_count == 2
     client.responses.create.assert_called_once()
+
+
+def test_callback_resource_is_signed_and_matches_headers(monkeypatch):
+    agent, _ = scoped_agent(monkeypatch)
+    monkeypatch.setattr(policy, "_read_dispatch_key", lambda: b"fixture-key")
+    response = MagicMock()
+    response.__enter__.return_value = response
+    response.status = 200
+    response.read.return_value = b'{"allowed":true}'
+    with patch("urllib.request.build_opener") as opener:
+        opener.return_value.open.return_value = response
+        policy.validate_dispatch(agent)
+        request = opener.return_value.open.call_args.args[0]
+        envelope = json.loads(base64.urlsafe_b64decode(request.get_header("X-atlas-delegation")))
+        assert envelope["resource_type"] == request.get_header("X-atlas-resource-type") == "chat"
+        assert envelope["resource_id"] == request.get_header("X-atlas-resource-id") == "turn_fixture"
+        agent._atlas_delegation_identities["resource_id"] = ""
+        with pytest.raises(policy.DelegationDenied):
+            policy.validate_dispatch(agent)
+        assert opener.return_value.open.call_count == 1
+
+
+def test_paid_calls_share_finite_capacity_and_denial_never_reserves(monkeypatch):
+    agent, _ = scoped_agent(monkeypatch)
+    monkeypatch.setattr(policy, "validate_dispatch", lambda agent: None)
+    for _ in range(256):
+        policy.admit_paid_dispatch(agent)
+    with pytest.raises(policy.DelegationDenied, match="exhausted"):
+        policy.admit_paid_dispatch(agent)
+    assert agent._atlas_paid_dispatch_count == 256
+    policy.admit_paid_dispatch(SimpleNamespace())

@@ -935,6 +935,9 @@ class _CodexCompletionsAdapter:
             "store": False,
         }
 
+        if kwargs.get("user"):
+            resp_kwargs["user"] = kwargs["user"]
+
         # Preserve the chat.completions timeout contract. This adapter is used
         # by auxiliary calls such as context compression; if the timeout is not
         # forwarded and enforced, a Codex Responses stream can sit behind a
@@ -1131,6 +1134,8 @@ class _CodexCompletionsAdapter:
                 # cadence the old in-line ``_check_cancelled()`` used.
                 _check_cancelled()
 
+            from agent.atlas_delegation import validate_auxiliary_dispatch
+            validate_auxiliary_dispatch()
             event_stream = self._client.responses.create(**stream_kwargs)
             try:
                 final = _consume_codex_event_stream(
@@ -6467,12 +6472,23 @@ def _atlas_direct_auxiliary_call(
         extra_body=merged_extra, base_url=base_url,
     )
     kwargs.pop("temperature", None)
+    from agent.atlas_delegation import current_dispatch_agent, admit_paid_dispatch
+    delegated_agent = current_dispatch_agent()
+    if delegated_agent is not None:
+        import hashlib
+        actor = delegated_agent._atlas_delegation_identities["actor_user_id"]
+        kwargs["user"] = "atlas-user-" + hashlib.sha256(actor.encode()).hexdigest()
 
     if async_mode:
         async def _perform():
             from agent.atlas_delegation import validate_auxiliary_dispatch
             validate_auxiliary_dispatch()
+            admit_paid_dispatch(delegated_agent)
             raw_response = await client.chat.completions.create(**kwargs)
+            if delegated_agent is not None:
+                from agent.atlas_auxiliary_accounting import collect_delegated_response
+                collect_delegated_response(delegated_agent, raw_response, requested_model=LUNA)
+                return _validate_llm_response(raw_response, task)
             from agent.atlas_auxiliary_accounting import record_completed_response_async
             try:
                 await record_completed_response_async(raw_response, requested_model=LUNA)
@@ -6483,7 +6499,12 @@ def _atlas_direct_auxiliary_call(
 
     from agent.atlas_delegation import validate_auxiliary_dispatch
     validate_auxiliary_dispatch()
+    admit_paid_dispatch(delegated_agent)
     raw_response = client.chat.completions.create(**kwargs)
+    if delegated_agent is not None:
+        from agent.atlas_auxiliary_accounting import collect_delegated_response
+        collect_delegated_response(delegated_agent, raw_response, requested_model=LUNA)
+        return _validate_llm_response(raw_response, task)
     from agent.atlas_auxiliary_accounting import record_completed_response
     try:
         record_completed_response(raw_response, requested_model=LUNA)

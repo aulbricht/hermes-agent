@@ -886,8 +886,8 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
         stream_kwargs["stream"] = True
 
         try:
-            from agent.atlas_delegation import validate_dispatch
-            validate_dispatch(agent)
+            from agent.atlas_delegation import admit_paid_dispatch
+            admit_paid_dispatch(agent)
             event_stream = active_client.responses.create(**stream_kwargs)
         except (_httpx.RemoteProtocolError, _httpx.ReadTimeout, _httpx.ConnectError, ConnectionError) as exc:
             if attempt < max_stream_retries:
@@ -903,6 +903,8 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
             # Compatibility: some mocks/providers return a concrete response
             # instead of an iterable.  Pass it straight through.
             if hasattr(event_stream, "output") and not hasattr(event_stream, "__iter__"):
+                from agent.atlas_delegation import collect_primary_response
+                collect_primary_response(agent, event_stream, api_kwargs.get("model"))
                 return event_stream
 
             try:
@@ -935,6 +937,8 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                     agent._client_log_context(),
                 )
 
+            from agent.atlas_delegation import collect_primary_response
+            collect_primary_response(agent, final, api_kwargs.get("model"))
             return final
         finally:
             close_fn = getattr(event_stream, "close", None)

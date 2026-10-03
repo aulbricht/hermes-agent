@@ -189,3 +189,46 @@ async def record_completed_response_async(response: Any, *, requested_model: str
             "Atlas auxiliary receipt ingestion failed after completed response (error_type=%s)",
             type(exc).__name__,
         )
+
+
+def collect_delegated_response(agent, response, *, requested_model=LUNA):
+    """Keep completed usage for durable broker settlement, even after revocation."""
+    import hashlib
+    payload = receipt_payload(response, requested_model=requested_model)
+    context = agent._atlas_delegation_identities
+    actor = context["actor_user_id"]
+    usage = _get(response, "usage") or {}
+    details = _get(usage, "cost_details") or {}
+    def observed_cost(value):
+        try:
+            amount = Decimal(str(value))
+            return float(amount) if not isinstance(value, bool) and amount.is_finite() and amount >= 0 else None
+        except Exception:
+            return None
+    actual = observed_cost(_get(usage, "cost"))
+    upstream = observed_cost(_get(details, "upstream_inference_cost", _get(usage, "upstream_cost_usd")))
+    call = {
+        "auxiliary": True,
+        "user_id": actor, "actor_user_id": actor,
+        "subject_user_id": context["subject_user_id"],
+        "view_as_session_id": context["view_as_session_id"],
+        "resource_type": context["resource_type"], "resource_id": context["resource_id"],
+        "provider_user_hash": "atlas-user-" + hashlib.sha256(actor.encode()).hexdigest(),
+        "generation_id": payload["provider_generation_id"],
+        "model": payload["model"], "provider": payload["provider"],
+        "route_request_id": getattr(agent, "_atlas_route_request_id", None),
+        "reservation_id": None, "usage_available": _get(response, "usage") is not None,
+        "input_tokens": max(0, payload["input_tokens"] - payload["cache_read_tokens"] - payload["cache_write_tokens"]),
+        "input_tokens_total": payload["input_tokens"], "output_tokens": payload["output_tokens"],
+        "cache_read_tokens": payload["cache_read_tokens"], "cache_write_tokens": payload["cache_write_tokens"],
+        "reasoning_tokens": payload["reasoning_tokens"],
+        "estimated_cost_usd": float(payload["estimated_total_usd"]),
+        "actual_cost_usd": actual if payload["provider"] == "openrouter" else None,
+        "upstream_cost_usd": upstream if payload["provider"] == "openrouter" else 0.0,
+        "is_byok": payload["is_byok"], "cost_basis": payload["cost_basis"],
+        "actual_cost_estimated": payload["cost_basis"] == "byok_estimated",
+        "byok_total_cost_usd": float(payload["estimated_total_usd"]) if payload["cost_basis"] == "byok_estimated" else None,
+        "service_tier": _get(response, "service_tier"),
+    }
+    with agent._atlas_paid_dispatch_lock:
+        agent._atlas_auxiliary_usage_calls.append(call)

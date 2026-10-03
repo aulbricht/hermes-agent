@@ -289,8 +289,8 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
         # OpenAI client from the virtual runtime metadata.
         return agent.client.chat.completions.create(**api_kwargs)
     request_client = make_client("chat_completion_request")
-    from agent.atlas_delegation import validate_dispatch
-    validate_dispatch(agent)
+    from agent.atlas_delegation import admit_paid_dispatch
+    admit_paid_dispatch(agent)
     return request_client.chat.completions.create(**api_kwargs)
 
 
@@ -2282,8 +2282,8 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         # ``request_client_holder["diag"]`` for closure access.
         _diag = agent._stream_diag_init()
         request_client_holder["diag"] = _diag
-        from agent.atlas_delegation import validate_dispatch
-        validate_dispatch(agent)
+        from agent.atlas_delegation import admit_paid_dispatch
+        admit_paid_dispatch(agent)
         stream = request_client.chat.completions.create(**stream_kwargs)
 
         # Some OpenAI-compatible adapters (for example copilot-acp, and the MoA

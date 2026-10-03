@@ -17,6 +17,7 @@ import re
 import secrets
 import stat
 import time
+import threading
 from types import MappingProxyType
 import urllib.request
 from urllib.parse import urlsplit
@@ -130,6 +131,8 @@ def capability():
 
 
 def bind_policy(agent, identities):
+    if getattr(agent, "api_mode", "codex_responses") != "codex_responses":
+        raise DelegationDenied("Atlas delegation requires the governed Responses lane")
     if getattr(agent, "provider", None) == "moa":
         raise DelegationDenied("Atlas delegation does not permit model delegation")
     schemas, entries, fingerprints = resolve_policy()
@@ -138,6 +141,10 @@ def bind_policy(agent, identities):
     agent._atlas_delegation_entries = MappingProxyType(entries)
     agent._atlas_delegation_fingerprints = MappingProxyType(fingerprints)
     agent._atlas_delegation_identities = MappingProxyType(dict(identities))
+    agent._atlas_paid_dispatch_lock = threading.Lock()
+    agent._atlas_paid_dispatch_count = 0
+    agent._atlas_auxiliary_usage_calls = []
+    agent._atlas_primary_usage_calls = []
     agent.tools = schemas
     agent.valid_tool_names = ALLOWED_TOOLS
     agent._skip_mcp_refresh = True
@@ -163,9 +170,11 @@ def validate_dispatch(agent):
     if not is_scoped(agent):
         return
     context = agent._atlas_delegation_identities
-    envelope = {**context, "method": "GET", "path": _VALIDATION_PATH,
+    if not valid_resource(context.get("resource_type"), context.get("resource_id")):
+        raise DelegationDenied("Atlas delegation requires a scoped resource")
+    envelope = {**{key: context[key] for key in ("actor_user_id", "subject_user_id", "view_as_session_id", "resource_type", "resource_id")}, "method": "GET", "path": _VALIDATION_PATH,
         "body_sha256": hashlib.sha256(b"").hexdigest(), "issued_at": int(time.time()),
-        "nonce": secrets.token_hex(16), "resource_type": "", "resource_id": ""}
+        "nonce": secrets.token_hex(16)}
     encoded = base64.urlsafe_b64encode(json.dumps(envelope, sort_keys=True, separators=(",", ":")).encode()).decode()
     signature = hmac.new(_read_dispatch_key(), encoded.encode(), hashlib.sha256).hexdigest()
     url = os.environ.get("ATLAS_VIEW_AS_AUTHORIZATION_URL", _VALIDATION_URL)
@@ -176,6 +185,8 @@ def validate_dispatch(agent):
     request = urllib.request.Request(url, method="GET", headers={
         "X-Atlas-Delegation": encoded, "X-Atlas-Delegation-Signature": signature,
         "X-Atlas-User-Key": context["subject_user_id"],
+        "X-Atlas-Resource-Type": context["resource_type"],
+        "X-Atlas-Resource-Id": context["resource_id"],
     })
     try:
         # Ignore ambient HTTP proxy settings and never follow redirects carrying
@@ -217,10 +228,11 @@ def dispatch_tool(agent, name, args, task_id):
         return json.dumps({"error": "Tool is unavailable in this Atlas View As session"})
     from tools.registry import registry
     handler, _, asynchronous = agent._atlas_delegation_entries[name]
-    result = handler(args, task_id=task_id)
-    if asynchronous:
-        from model_tools import _run_async
-        result = _run_async(result)
+    with dispatch_context(agent):
+        result = handler(args, task_id=task_id)
+        if asynchronous:
+            from model_tools import _run_async
+            result = _run_async(result)
     return registry._normalize_handler_result(name, result)
 
 
@@ -243,3 +255,79 @@ def validate_auxiliary_dispatch():
         if not atlas_auxiliary_enabled():
             raise DelegationDenied("Atlas delegation requires the governed auxiliary lane")
         validate_dispatch(agent)
+
+
+def valid_resource(kind, identifier):
+    prefixes = {"chat": "turn_", "query": "qry_", "query_plan": "qpl_"}
+    return (kind in prefixes and isinstance(identifier, str) and len(identifier) <= 180
+            and re.fullmatch(re.escape(prefixes[kind]) + r"[A-Za-z0-9_.:-]{1,180}", identifier) is not None)
+
+
+def current_dispatch_agent():
+    return _dispatch_agent.get()
+
+
+def admit_paid_dispatch(agent):
+    """Reserve one terminal-receipt slot immediately before a paid SDK call."""
+    if not is_scoped(agent):
+        return
+    validate_dispatch(agent)
+    limit = agent._atlas_delegation_identities.get("receipt_limit")
+    if limit != "256":
+        raise DelegationDenied("Atlas delegation receipt capacity is invalid")
+    with agent._atlas_paid_dispatch_lock:
+        if agent._atlas_paid_dispatch_count >= int(limit):
+            raise DelegationDenied("Atlas delegation receipt capacity is exhausted")
+        agent._atlas_paid_dispatch_count += 1
+
+
+def validate_mcp_send(agent, server_name, server):
+    """Check the actual transport after its RPC lock, including reconnect retries."""
+    if not is_scoped(agent):
+        return
+    from tools import mcp_tool
+    with mcp_tool._lock:
+        if mcp_tool._servers.get(server_name) is not server or server.session is None:
+            raise DelegationDenied("Atlas delegation MCP transport changed")
+    if _live_reader_fingerprints() != dict(agent._atlas_delegation_fingerprints):
+        raise DelegationDenied("Atlas delegation MCP transport changed")
+    validate_dispatch(agent)
+
+
+def collect_primary_response(agent, response, model):
+    if not is_scoped(agent):
+        return
+    from agent.atlas_sol_budget import _field, openai_usage_fields, _transport
+    call = {
+        **openai_usage_fields(response),
+        "generation_id": str(_field(response, "id", "") or ""),
+        "model": str(_field(response, "model", model) or model),
+        "provider": "openrouter" if _transport() == "openrouter" else "openai",
+        "usage_available": _field(response, "usage") is not None,
+        "route_request_id": getattr(agent, "_atlas_route_request_id", None),
+        "service_tier": _field(response, "service_tier"),
+    }
+    with agent._atlas_paid_dispatch_lock:
+        agent._atlas_primary_usage_calls.append(call)
+
+
+def terminal_usage_calls(agent):
+    """Merge loop settlement into every completed dispatch, without reauthorizing."""
+    recorded = list(getattr(agent, "session_usage_calls", []) or [])
+    completed = list(getattr(agent, "_atlas_primary_usage_calls", []) or [])
+    if not completed:
+        completed = recorded
+    else:
+        for call in completed:
+            match = next((row for row in recorded if call.get("generation_id") and row.get("generation_id") == call["generation_id"]), None)
+            if match:
+                call.update(match)
+    calls = completed + list(getattr(agent, "_atlas_auxiliary_usage_calls", []) or [])
+    context = agent._atlas_delegation_identities
+    actor = context["actor_user_id"]
+    for call in calls:
+        call.update({key: context[key] for key in ("actor_user_id", "subject_user_id", "view_as_session_id", "resource_type", "resource_id")})
+        call["user_id"] = actor
+        call["provider_user_hash"] = "atlas-user-" + hashlib.sha256(actor.encode()).hexdigest()
+        call["route_request_id"] = getattr(agent, "_atlas_route_request_id", None)
+    return calls
