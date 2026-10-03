@@ -679,12 +679,17 @@ def collect_primary_response(agent, response, model, attempt=None):
     if not is_scoped(agent):
         return
     from agent.atlas_sol_budget import _field, openai_usage_fields, _transport
+    usage = _field(response, "usage")
+    # The ordinary normalizer clamps/coerces values for compatibility. Scoped
+    # evidence must prove actual counts before that conversion can erase doubt.
+    raw_counts = (_field(usage, "input_tokens"), _field(usage, "output_tokens"))
+    known_counts = all(type(value) is int and value >= 0 for value in raw_counts)
+    fields = openai_usage_fields(response) if known_counts else {"usage_available": False}
     call = {
-        **openai_usage_fields(response),
+        **fields,
         "generation_id": str(_field(response, "id", "") or ""),
         "model": str(_field(response, "model", model) or model),
         "provider": "openrouter" if _transport() == "openrouter" else "openai",
-        "usage_available": openai_usage_fields(response)["usage_available"],
         "route_request_id": getattr(agent, "_atlas_route_request_id", None),
         "service_tier": _field(response, "service_tier"),
     }
@@ -693,6 +698,8 @@ def collect_primary_response(agent, response, model, attempt=None):
     else:
         with agent._atlas_paid_dispatch_lock:
             agent._atlas_primary_usage_calls.append(call)
+            if fields.get("usage_available") is not True:
+                agent._atlas_paid_uncertain = True
 
 
 def terminal_usage_calls(agent):

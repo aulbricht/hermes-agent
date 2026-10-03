@@ -592,3 +592,62 @@ def test_closed_model_client_never_constructs_sdk(monkeypatch):
         with pytest.raises(policy.DelegationDenied, match='closed'):
             policy.scoped_model_client('openrouter', agent=agent)
         sdk.assert_not_called()
+
+
+@pytest.mark.parametrize("field", ["input_tokens", "output_tokens"])
+@pytest.mark.parametrize("invalid", [-17, True, 1.5, "17"])
+def test_scoped_primary_stream_keeps_raw_invalid_counts_uncertain(monkeypatch, field, invalid):
+    from agent.codex_runtime import run_codex_stream
+    from agent.atlas_sol_budget import openai_usage_fields
+    agent, _ = scoped_agent(monkeypatch)
+    monkeypatch.setattr(policy, "validate_dispatch", lambda agent: None)
+    monkeypatch.delenv("ATLAS_SOL_ACCOUNTING_SOCKET", raising=False)
+    usage = {"input_tokens": 20, "output_tokens": 5, field: invalid}
+    response = SimpleNamespace(id="gen-invalid", model="fixture", service_tier="standard", usage=usage)
+    # Ordinary callers retain their existing normalization contract.
+    ordinary = openai_usage_fields(response)
+    assert ordinary["usage_available"] is True
+    assert ordinary[field] == max(0, int(invalid))
+    client = MagicMock()
+    client.responses.create.return_value = iter([
+        SimpleNamespace(type="response.created", response=response),
+        SimpleNamespace(type="response.completed", response=response),
+    ])
+    final = run_codex_stream(agent, {"model": "fixture"}, client=client)
+    assert final.usage[field] == invalid
+    client.responses.create.assert_called_once()
+    assert agent._atlas_paid_dispatch_count == 1
+    with pytest.raises(policy.DelegationDenied, match="unsettled"):
+        policy.admit_paid_dispatch(agent)
+    # Loop normalization must not overwrite an already-uncertain primary attempt.
+    agent.session_usage_calls = [{"generation_id": "gen-invalid", **ordinary}]
+    row, = policy.terminal_usage_calls(agent)
+    assert row["dispatch_status"] == "uncertain" and row["usage_available"] is False
+    assert row["generation_id"] == "gen-invalid" and row["model"] == "fixture"
+    assert row["service_tier"] == "standard" and row["actor_user_id"] == "actor"
+    assert row["attempt_id"].startswith("attempt_")
+    assert not any(name in row for name in ["input_tokens", "input_tokens_total", "output_tokens", "actual_cost_usd"])
+    with pytest.raises(policy.DelegationDenied, match="closed"):
+        policy.admit_paid_dispatch(agent)
+    assert agent._atlas_paid_dispatch_count == 1 and len(policy.terminal_usage_calls(agent)) == 1
+
+
+@pytest.mark.parametrize("inputs,outputs", [(0, 0), (0, 5), (20, 0)])
+def test_scoped_primary_stream_accepts_actual_zero_counts(monkeypatch, inputs, outputs):
+    from agent.codex_runtime import run_codex_stream
+    agent, _ = scoped_agent(monkeypatch)
+    monkeypatch.setattr(policy, "validate_dispatch", lambda agent: None)
+    monkeypatch.delenv("ATLAS_SOL_ACCOUNTING_SOCKET", raising=False)
+    response = SimpleNamespace(id="gen-zero", model="fixture", usage={"input_tokens": inputs, "output_tokens": outputs})
+    client = MagicMock()
+    client.responses.create.return_value = iter([SimpleNamespace(type="response.completed", response=response)])
+    run_codex_stream(agent, {"model": "fixture"}, client=client)
+    assert agent._atlas_paid_attempts[0]["dispatch_status"] == "completed"
+    assert agent._atlas_paid_attempts[0]["usage_available"] is True
+    # Real zero evidence does not activate the unknown hold.
+    second = policy.admit_paid_dispatch(agent, model="fixture")
+    policy.collect_primary_response(agent, SimpleNamespace(id="gen-next", usage={"input_tokens": 1, "output_tokens": 1}), "fixture", second)
+    first, later = policy.terminal_usage_calls(agent)
+    assert first["input_tokens_total"] == inputs and first["output_tokens"] == outputs
+    assert first["dispatch_status"] == later["dispatch_status"] == "completed"
+    assert agent._atlas_paid_dispatch_count == 2
