@@ -20,7 +20,7 @@ import time
 import threading
 from types import MappingProxyType
 import urllib.request
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, quote
 
 POLICY_VERSION = "view-as-v1"
 ALLOWED_TOOLS = frozenset({
@@ -272,6 +272,12 @@ def validate_dispatch(agent):
     context = agent._atlas_delegation_identities
     if not valid_resource(context.get("resource_type"), context.get("resource_id")):
         raise DelegationDenied("Atlas delegation requires a scoped resource")
+    _request_authorization(context)
+    check_admission_open(agent)  # The callback can outlive terminal collection.
+
+
+def _request_authorization(context):
+    """Shared signed live callback; caller must validate its distinct resource lane."""
     envelope = {**{key: context[key] for key in ("actor_user_id", "subject_user_id", "view_as_session_id", "resource_type", "resource_id")}, "method": "GET", "path": _VALIDATION_PATH,
         "body_sha256": hashlib.sha256(b"").hexdigest(), "issued_at": int(time.time()),
         "nonce": secrets.token_hex(16)}
@@ -299,9 +305,65 @@ def validate_dispatch(agent):
             payload = json.loads(response.read(4097))
             if response.status != 200 or not isinstance(payload, dict) or payload.get("allowed") is not True:
                 raise DelegationDenied("Atlas delegation is no longer authorized")
-        check_admission_open(agent)  # The callback can outlive terminal collection.
     except Exception as error:
         raise DelegationDenied("Atlas delegation is no longer authorized") from error
+
+
+CONTROL_POLICY_VERSION = "view-as-control-v1"
+_control_nonce_lock = threading.Lock()
+_control_nonces = {}
+
+
+def verify_session_title_control(headers, *, method, path, raw_body, native_id, body):
+    """Authenticated nonpaid title-only lane; never admitted as an agent resource."""
+    fields = {"actor_user_id", "subject_user_id", "view_as_session_id", "method", "path",
+        "body_sha256", "issued_at", "nonce", "resource_type", "resource_id"}
+    if (headers.get("X-Atlas-Delegation-Policy") != CONTROL_POLICY_VERSION
+            or method != "PATCH" or path != "/api/sessions/" + quote(native_id, safe="")
+            or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,200}", native_id)
+            or len(raw_body) > 4096 or not isinstance(body, dict) or set(body) != {"title"}
+            or not isinstance(body["title"], str) or len(body["title"]) > 100):
+        raise DelegationDenied("Invalid Atlas session title control")
+    encoded, signature = headers.get("X-Atlas-Delegation", ""), headers.get("X-Atlas-Delegation-Signature", "")
+    if len(encoded) > 4096 or not re.fullmatch(r"[0-9a-f]{64}", signature):
+        raise DelegationDenied("Invalid Atlas control signature")
+    expected = hmac.new(_read_dispatch_key(), encoded.encode(), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(signature, expected):
+        raise DelegationDenied("Invalid Atlas control signature")
+    try:
+        context = json.loads(base64.b64decode(encoded, altchars=b"-_", validate=True))
+        canonical = base64.urlsafe_b64encode(json.dumps(context, sort_keys=True, separators=(",", ":")).encode()).decode()
+    except Exception as error:
+        raise DelegationDenied("Invalid Atlas control envelope") from error
+    if (not isinstance(context, dict) or set(context) != fields or encoded != canonical
+            or context["method"] != method or context["path"] != path
+            or context["body_sha256"] != hashlib.sha256(raw_body).hexdigest()
+            or context["resource_type"] != "chat_session" or context["resource_id"] != native_id
+            or headers.get("X-Atlas-Resource-Type") != "chat_session"
+            or headers.get("X-Atlas-Resource-Id") != native_id
+            or headers.get("X-Atlas-User-Key") != context["subject_user_id"]
+            or any(not isinstance(context[key], str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,200}", context[key])
+                   for key in ("actor_user_id", "subject_user_id", "view_as_session_id"))
+            or type(context["issued_at"]) is not int
+            or not isinstance(context["nonce"], str) or not re.fullmatch(r"[0-9a-f]{32}", context["nonce"])):
+        raise DelegationDenied("Invalid Atlas control envelope")
+    now = time.time()
+    if not -5 <= now - context["issued_at"] <= 60:
+        raise DelegationDenied("Expired Atlas control envelope")
+    with _control_nonce_lock:
+        for nonce, timestamp in list(_control_nonces.items()):
+            if now - timestamp > 65:
+                del _control_nonces[nonce]
+        if context["nonce"] in _control_nonces or len(_control_nonces) >= 4096:
+            raise DelegationDenied("Replayed or unavailable Atlas control envelope")
+        _control_nonces[context["nonce"]] = now
+    return context
+
+
+def validate_session_title_control(context):
+    if context.get("resource_type") != "chat_session":
+        raise DelegationDenied("Invalid Atlas control resource")
+    _request_authorization(context)
 
 
 def tool_allowed(agent, name):

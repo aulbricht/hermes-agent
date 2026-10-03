@@ -202,3 +202,175 @@ def test_gateway_keeps_credential_boundary_across_actual_constructor_entry(monke
         adapter._create_agent(atlas_delegation_context={'actor_user_id': 'actor'}, route={'provider': 'openrouter', 'model': 'openai/gpt-6-luna'} if routed else None)
         write.assert_not_called()
     assert not policy.credential_scope_active()
+
+
+def _title_control_headers(policy, native_id, raw, *, nonce=None, updates=None):
+    import base64, hashlib, hmac, json, secrets, time
+    from urllib.parse import quote
+    envelope = {'actor_user_id': 'actor', 'subject_user_id': 'subject', 'view_as_session_id': 'session',
+        'method': 'PATCH', 'path': '/api/sessions/' + quote(native_id, safe=''),
+        'body_sha256': hashlib.sha256(raw).hexdigest(), 'issued_at': int(time.time()),
+        'nonce': nonce or secrets.token_hex(16), 'resource_type': 'chat_session', 'resource_id': native_id}
+    envelope.update(updates or {})
+    encoded = base64.urlsafe_b64encode(json.dumps(envelope, sort_keys=True, separators=(',', ':')).encode()).decode()
+    return {'Authorization': 'Bearer fixture-only-key', 'X-Atlas-Delegation-Policy': policy.CONTROL_POLICY_VERSION,
+        'X-Atlas-User-Key': 'subject', 'X-Atlas-Resource-Type': 'chat_session', 'X-Atlas-Resource-Id': native_id,
+        'X-Atlas-Delegation': encoded, 'X-Atlas-Delegation-Signature': hmac.new(b'synthetic-control-key', encoded.encode(), hashlib.sha256).hexdigest()}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('revoked', [False, True])
+async def test_actual_title_patch_rechecks_after_body_read_before_write(monkeypatch, tmp_path, revoked):
+    import json
+    from agent import atlas_delegation as policy
+    from hermes_state import SessionDB
+    db = SessionDB(tmp_path / 'title-control.db')
+    native_id = 'native_title_fixture'
+    db.create_session(native_id, 'api_server')
+    db.set_session_title(native_id, 'before')
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={'key': 'fixture-only-key'}))
+    adapter._session_db = db
+    read_complete = [False]
+    original = adapter._read_json_body
+    async def read_body(request):
+        result = await original(request)
+        read_complete[0] = True
+        return result
+    monkeypatch.setattr(adapter, '_read_json_body', read_body)
+    monkeypatch.setattr(policy, '_read_dispatch_key', lambda: b'synthetic-control-key')
+    callbacks = []
+    def live(context):
+        assert read_complete[0]
+        assert context['resource_type'] == 'chat_session'
+        assert context['resource_id'] == native_id and context['subject_user_id'] == 'subject'
+        callbacks.append(context)
+        if revoked:
+            raise policy.DelegationDenied('revoked while body was parsed')
+    monkeypatch.setattr(policy, '_request_authorization', live)
+    raw = json.dumps({'title': 'Résumé'}, ensure_ascii=False, separators=(',', ':')).encode()
+    app = web.Application()
+    app.router.add_patch('/api/sessions/{session_id}', adapter._handle_patch_session)
+    try:
+        async with TestClient(TestServer(app)) as client:
+            response = await client.patch('/api/sessions/' + native_id, data=raw,
+                headers=_title_control_headers(policy, native_id, raw))
+            assert response.status == (403 if revoked else 200)
+        assert len(callbacks) == 1
+        assert db.get_session(native_id)['title'] == ('before' if revoked else 'Résumé')
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize('mismatch', ['body', 'path', 'subject', 'resource', 'expired', 'future', 'method'])
+def test_nonpaid_control_signature_binds_actual_write_and_identity(monkeypatch, mismatch):
+    import time
+    from agent import atlas_delegation as policy
+    monkeypatch.setattr(policy, '_read_dispatch_key', lambda: b'synthetic-control-key')
+    raw = b'{"title":"after"}'
+    updates = {'path': '/api/sessions/other'} if mismatch == 'path' else {'subject_user_id': 'other'} if mismatch == 'subject' else {'resource_id': 'other'} if mismatch == 'resource' else {'issued_at': int(time.time()) - 61} if mismatch == 'expired' else {'issued_at': int(time.time()) + 6} if mismatch == 'future' else {'method': 'DELETE'} if mismatch == 'method' else {}
+    headers = _title_control_headers(policy, 'native_fixture', raw, updates=updates)
+    with pytest.raises(policy.DelegationDenied):
+        policy.verify_session_title_control(headers, method='PATCH', path='/api/sessions/native_fixture',
+            raw_body=raw + b' ' if mismatch == 'body' else raw, native_id='native_fixture', body={'title': 'after'})
+
+
+def test_control_replay_is_rejected_and_paid_resource_validation_stays_separate(monkeypatch):
+    from agent import atlas_delegation as policy
+    monkeypatch.setattr(policy, '_read_dispatch_key', lambda: b'synthetic-control-key')
+    raw = b'{"title":"after"}'
+    headers = _title_control_headers(policy, 'native_fixture', raw)
+    kwargs = dict(method='PATCH', path='/api/sessions/native_fixture', raw_body=raw,
+                  native_id='native_fixture', body={'title': 'after'})
+    context = policy.verify_session_title_control(headers, **kwargs)
+    assert context['resource_type'] == 'chat_session'
+    assert not policy.valid_resource('chat_session', 'native_fixture')
+    with pytest.raises(policy.DelegationDenied, match='Replayed'):
+        policy.verify_session_title_control(headers, **kwargs)
+    agent = SimpleNamespace(_atlas_delegation_policy=policy.POLICY_VERSION,
+                            _atlas_delegation_identities=context)
+    import threading
+    agent._atlas_paid_dispatch_lock = threading.Lock()
+    with pytest.raises(policy.DelegationDenied, match='scoped resource'):
+        policy.validate_dispatch(agent)
+    for method, path in [('DELETE', '/api/sessions/native_fixture'), ('POST', '/api/sessions/native_fixture/chat'), ('POST', '/api/sessions/native_fixture/chat/stream')]:
+        from gateway.platforms.api_server import _atlas_delegation_route_error
+        assert _atlas_delegation_route_error(SimpleNamespace(method=method, path=path, headers=headers)).status == 400
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('body', [{'title': 'after', 'end_reason': 'user'}, {'end_reason': 'user'}, {'title': 'after', 'archived': True}, {'title': {'unsafe': True}}])
+async def test_actual_control_patch_rejects_other_session_mutations(monkeypatch, tmp_path, body):
+    import json
+    from agent import atlas_delegation as policy
+    from hermes_state import SessionDB
+    db = SessionDB(tmp_path / 'forbidden-title-control.db')
+    db.create_session('native_fixture', 'api_server')
+    db.set_session_title('native_fixture', 'before')
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={'key': 'fixture-only-key'}))
+    adapter._session_db = db
+    monkeypatch.setattr(policy, '_read_dispatch_key', lambda: b'synthetic-control-key')
+    raw = json.dumps(body).encode()
+    app = web.Application()
+    app.router.add_patch('/api/sessions/{session_id}', adapter._handle_patch_session)
+    try:
+        with patch.object(policy, '_request_authorization') as live:
+            async with TestClient(TestServer(app)) as client:
+                response = await client.patch('/api/sessions/native_fixture', data=raw,
+                    headers=_title_control_headers(policy, 'native_fixture', raw))
+                assert response.status in {400, 403}
+            live.assert_not_called()
+        assert db.get_session('native_fixture')['title'] == 'before'
+        assert not db.get_session('native_fixture')['end_reason']
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('configured_key,authorization', [('', None), ('fixture-only-key', 'Bearer wrong')])
+async def test_title_control_always_requires_native_api_auth(monkeypatch, tmp_path, configured_key, authorization):
+    from agent import atlas_delegation as policy
+    from hermes_state import SessionDB
+    db = SessionDB(tmp_path / 'auth-title-control.db')
+    db.create_session('native_fixture', 'api_server')
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={'key': configured_key}))
+    adapter._session_db = db
+    adapter._api_key = configured_key
+    raw = b'{"title":"after"}'
+    headers = _title_control_headers(policy, 'native_fixture', raw)
+    if authorization is None:
+        headers.pop('Authorization')
+    else:
+        headers['Authorization'] = authorization
+    app = web.Application()
+    app.router.add_patch('/api/sessions/{session_id}', adapter._handle_patch_session)
+    try:
+        with patch.object(policy, '_request_authorization') as live:
+            async with TestClient(TestServer(app)) as client:
+                response = await client.patch('/api/sessions/native_fixture', data=raw, headers=headers)
+                assert response.status == 401
+            live.assert_not_called()
+        assert not db.get_session('native_fixture')['title']
+    finally:
+        db.close()
+
+
+def test_nonpaid_live_callback_signs_exact_resource_and_subject(monkeypatch):
+    import base64, json
+    from agent import atlas_delegation as policy
+    from unittest.mock import MagicMock
+    context = {'actor_user_id': 'actor', 'subject_user_id': 'subject', 'view_as_session_id': 'session', 'resource_type': 'chat_session', 'resource_id': 'native_fixture'}
+    monkeypatch.setattr(policy, '_read_dispatch_key', lambda: b'synthetic-control-key')
+    response = MagicMock()
+    response.__enter__.return_value = response
+    response.status = 200
+    response.read.return_value = b'{"allowed":true}'
+    with patch('urllib.request.build_opener') as opener:
+        opener.return_value.open.return_value = response
+        policy.validate_session_title_control(context)
+        request = opener.return_value.open.call_args.args[0]
+        envelope = json.loads(base64.urlsafe_b64decode(request.get_header('X-atlas-delegation')))
+        assert envelope['method'] == 'GET'
+        assert envelope['resource_type'] == request.get_header('X-atlas-resource-type') == 'chat_session'
+        assert envelope['resource_id'] == request.get_header('X-atlas-resource-id') == 'native_fixture'
+        assert envelope['subject_user_id'] == request.get_header('X-atlas-user-key') == 'subject'
+        assert opener.return_value.open.call_args.kwargs['timeout'] == 3

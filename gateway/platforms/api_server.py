@@ -426,9 +426,12 @@ def _has_atlas_delegation_headers(request):
 
 
 def _atlas_delegation_route_error(request):
-    if (_has_atlas_delegation_headers(request)
-            and not (request.method == "POST" and re.fullmatch(r"/api/sessions/[^/]+/chat(?:/stream)?", request.path))):
-        return web.json_response(_openai_error("Atlas delegation is unsupported on this route", code="unsupported_atlas_delegation_route"), status=400)
+    if _has_atlas_delegation_headers(request):
+        from agent.atlas_delegation import CONTROL_POLICY_VERSION
+        control = request.headers.get("X-Atlas-Delegation-Policy") == CONTROL_POLICY_VERSION
+        allowed = (request.method == "PATCH" and re.fullmatch(r"/api/sessions/[^/]+", request.path)) if control else (request.method == "POST" and re.fullmatch(r"/api/sessions/[^/]+/chat(?:/stream)?", request.path))
+        if not allowed:
+            return web.json_response(_openai_error("Atlas delegation is unsupported on this route", code="unsupported_atlas_delegation_route"), status=400)
     return None
 
 
@@ -1327,6 +1330,9 @@ class APIServerAdapter(BasePlatformAdapter):
         connect() refuses to start the API server without API_SERVER_KEY, so
         the no-key branch only exists for tests or unsupported manual wiring.
         """
+        route_error = _atlas_delegation_route_error(request)
+        if route_error is not None:
+            return route_error
         if not self._api_key:
             return None
 
@@ -2121,6 +2127,24 @@ class APIServerAdapter(BasePlatformAdapter):
             return web.json_response(_openai_error(f"Unsupported session fields: {', '.join(unknown)}", code="unsupported_session_field"), status=400)
 
         db = self._ensure_session_db()
+        if _has_atlas_delegation_headers(request):
+            from agent.atlas_delegation import verify_session_title_control, validate_session_title_control, DelegationDenied
+            if not self._api_key:
+                return web.json_response(_openai_error("Atlas control requires API authentication"), status=401)
+            raw_body = await request.read()  # Cached exact bytes; all awaits precede live authority.
+            try:
+                control = verify_session_title_control(request.headers, method=request.method,
+                    path=request.raw_path, raw_body=raw_body, native_id=session_id, body=body)
+                validate_session_title_control(control)
+            except DelegationDenied:
+                return web.json_response(_openai_error("Atlas session title control is no longer authorized", code="atlas_control_denied"), status=403)
+            # No await or additional resource acquisition after the live callback.
+            try:
+                db.set_session_title(session_id, body["title"])
+            except ValueError as exc:
+                return web.json_response(_openai_error(str(exc), code="invalid_title"), status=400)
+            session = db.get_session(session_id) or session
+            return web.json_response({"object": "hermes.session", "session": self._session_response(session)})
         if "title" in body:
             try:
                 db.set_session_title(session_id, "" if body["title"] is None else str(body["title"]))
