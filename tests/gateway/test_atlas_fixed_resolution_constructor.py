@@ -122,6 +122,28 @@ def real_harness(tmp_path, monkeypatch, request):
     return adapter, state, registry
 
 
+def test_tool_free_phase2_bootstrap_and_constructor_skip_generic_discovery(real_harness, monkeypatch):
+    adapter, _, _ = real_harness
+    from gateway.atlas_resolution import PHASE2_WORKER_SESSION_KEY
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("generic tool or credential discovery in tool-free Phase 2")
+
+    monkeypatch.setattr("hermes_cli.tools_config._get_platform_tools", forbidden)
+    monkeypatch.setattr("hermes_cli.plugins.discover_plugins", forbidden)
+    monkeypatch.setattr("hermes_cli.auth._read_xai_oauth_tokens", forbidden)
+    adapter._bootstrap_atlas_phase2_resolution()
+    scope = adapter._atlas_scope(PHASE2_WORKER_SESSION_KEY, "default")
+    generation = adapter._atlas_store()._records[scope]["generation_id"]
+    agent = adapter._create_agent(
+        gateway_session_key=PHASE2_WORKER_SESSION_KEY,
+        atlas_resolution_expected=generation,
+        atlas_resolution_alias="default",
+    )
+    assert agent.enabled_toolsets == []
+    assert agent.tools == []
+
+
 @pytest.mark.parametrize("alias,expected_model,expected_effort", [
     ("default", "openai/gpt-6-luna", "xhigh"),
     ("atlas-luna", "openai/gpt-6-luna", "xhigh"),
@@ -392,13 +414,21 @@ def test_phase2_dispatch_rejects_reintroduced_tool_availability(real_harness, ch
 def test_ordinary_main_retains_tool_schemas_and_actual_invocation(real_harness, monkeypatch):
     adapter, state, registry = real_harness
     import run_agent
+    import hermes_cli.tools_config as tools_config
     seen = []
     def invoke_fixture(name, args, task_id, **kwargs):
         seen.append((name, args, task_id, kwargs))
         return '{"fixture":"completed"}'
     monkeypatch.setattr(run_agent, "handle_function_call", invoke_fixture)
     phase2_agent(adapter)  # Reserving the fixed worker does not alter the profile.
+    generic_tools = tools_config._get_platform_tools
+    discovery_calls = []
+    def observed_tools(config, platform):
+        discovery_calls.append(platform)
+        return generic_tools(config, platform)
+    monkeypatch.setattr(tools_config, "_get_platform_tools", observed_tools)
     ordinary = adapter._create_agent(gateway_session_key="ordinary_main_worker")
+    assert discovery_calls == ["api_server"]
     assert ordinary.enabled_toolsets == ["acre-filemaker", "atlas_vault", "web"]
     assert ordinary.valid_tool_names == {"atlas_fixture_tool"}
     assert ordinary.tools == [SCHEMA]

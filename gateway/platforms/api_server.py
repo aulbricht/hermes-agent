@@ -431,6 +431,11 @@ def _has_atlas_delegation_headers(request):
 
 
 def _atlas_delegation_route_error(request):
+    if (_has_atlas_delegation_headers(request)
+            and "X-Atlas-Resolution-Generation" in request.headers):
+        return web.json_response(_openai_error(
+            "Atlas delegation and guarded resolution policies cannot be combined",
+            code="mixed_atlas_policies"), status=400)
     if _has_atlas_delegation_headers(request):
         from agent.atlas_delegation import CONTROL_POLICY_VERSION
         control = request.headers.get("X-Atlas-Delegation-Policy") == CONTROL_POLICY_VERSION
@@ -1559,7 +1564,6 @@ class APIServerAdapter(BasePlatformAdapter):
             _load_gateway_config,
             GatewayRunner,
         )
-        from hermes_cli.tools_config import _get_platform_tools
 
         if atlas_delegation_context is not None:
             from agent.atlas_delegation import scoped_runtime_kwargs
@@ -1635,15 +1639,20 @@ class APIServerAdapter(BasePlatformAdapter):
                 gateway_session_key or session_id,
             )
 
-        user_config = _load_gateway_config()
-        enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
         if atlas_delegation_context is not None:
             from agent.atlas_delegation import TOOLSETS
             enabled_toolsets = list(TOOLSETS)
-        elif strict_atlas and self._atlas_evidence_enabled and self._atlas_resolution_role == "main":
-            from gateway.atlas_resolution import PHASE2_WORKER_SESSION_KEY
-            if gateway_session_key == PHASE2_WORKER_SESSION_KEY:
+        else:
+            tool_free_worker = False
+            if (strict_atlas and self._atlas_evidence_enabled
+                    and self._atlas_resolution_role == "main"):
+                from gateway.atlas_resolution import PHASE2_WORKER_SESSION_KEY
+                tool_free_worker = gateway_session_key == PHASE2_WORKER_SESSION_KEY
+            if tool_free_worker:
                 enabled_toolsets = []
+            else:
+                from hermes_cli.tools_config import _get_platform_tools
+                enabled_toolsets = sorted(_get_platform_tools(_load_gateway_config(), "api_server"))
 
         max_iterations = _current_max_iterations()
         if route and not session_override and route.get("max_iterations"):

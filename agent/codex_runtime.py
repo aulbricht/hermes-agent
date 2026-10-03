@@ -856,10 +856,12 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
 
     active_client = client or agent._ensure_primary_openai_client(reason="codex_stream_direct")
     max_stream_retries = 1
-    if os.environ.get("ATLAS_SOL_ACCOUNTING_SOCKET") and api_kwargs.get("model") == "gpt-6.1-sol":
-        # The outer conversation retry obtains a fresh atomic reservation.
-        # Do not hide a second billable request inside one Sol reservation.
-        max_stream_retries = 0
+    if os.environ.get("ATLAS_SOL_ACCOUNTING_SOCKET"):
+        from agent.atlas_sol_budget import SOL, _canonical_model
+        if _canonical_model(api_kwargs.get("model")) == SOL:
+            # The outer conversation retry obtains a fresh atomic reservation.
+            # Do not hide a second billable request inside one Sol reservation.
+            max_stream_retries = 0
     # Accumulate streamed text so callers / compat shims can read it.
     agent._codex_streamed_text_parts: list = []
 

@@ -96,6 +96,29 @@ async def test_every_alternate_route_rejects_any_delegation_header(path, headers
     called.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/api/sessions/session-fixture/chat", "/api/sessions/session-fixture/chat/stream",
+                                  "/v1/atlas/guarded/chat/completions"])
+async def test_mixed_view_as_and_guarded_wire_headers_fail_before_any_handler(path):
+    from gateway.platforms.api_server import atlas_delegation_route_middleware
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={"key": "fixture-only-key"}))
+    app = web.Application(middlewares=[atlas_delegation_route_middleware])
+    handler = (adapter._handle_atlas_guarded_chat if path.startswith("/v1/") else
+               adapter._handle_session_chat_stream if path.endswith("/stream") else
+               adapter._handle_session_chat)
+    app.router.add_post(path, handler)
+    with patch.object(adapter, "_check_auth", side_effect=AssertionError("auth entered")) as auth, patch.object(adapter, "_atlas_fixed_auth", side_effect=AssertionError("guarded auth entered")) as fixed_auth, patch("hermes_cli.tools_config._get_platform_tools", side_effect=AssertionError("tool discovery")) as tools, patch("gateway.run._resolve_runtime_agent_kwargs", side_effect=AssertionError("credential discovery")) as credentials, patch("run_agent.AIAgent", side_effect=AssertionError("construction")) as constructor:
+        async with TestClient(TestServer(app)) as client:
+            response = await client.post(path, headers={**HEADERS, "X-Atlas-Resolution-Generation": "a" * 64})
+            assert response.status == 400
+            assert (await response.json())["error"]["code"] == "mixed_atlas_policies"
+    auth.assert_not_called()
+    fixed_auth.assert_not_called()
+    tools.assert_not_called()
+    credentials.assert_not_called()
+    constructor.assert_not_called()
+
+
 @pytest.mark.parametrize("kind,identifier", [("chat", ""), ("chat", "qry_wrong"), ("query", "turn_wrong"), ("query_plan", "qry_wrong"), ("unknown", "turn_test")])
 def test_native_resource_is_required_before_runner(kind, identifier):
     context, error = _atlas_delegation_context(SimpleNamespace(_api_key="configured"), SimpleNamespace(headers={**HEADERS, "X-Atlas-Delegated-Resource-Type": kind, "X-Atlas-Delegated-Resource-ID": identifier}))
@@ -154,8 +177,11 @@ def test_scoped_agent_runtime_never_enters_shared_auth_recovery(monkeypatch, rou
     adapter = APIServerAdapter(PlatformConfig(enabled=True))
     monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
     config = {"model": {"provider": "openrouter", "default": "gpt-6.1-sol"}}
-    with patch("gateway.run._load_gateway_config", return_value=config), patch("gateway.run._resolve_runtime_agent_kwargs") as ordinary, patch("gateway.run._resolve_runtime_agent_kwargs_for_provider") as routed_resolver, patch("agent.credential_pool._save_auth_store") as write, patch("run_agent.AIAgent", return_value=SimpleNamespace()) as constructor:
+    with patch("gateway.run._load_gateway_config", return_value=config), patch("gateway.run._resolve_runtime_agent_kwargs") as ordinary, patch("gateway.run._resolve_runtime_agent_kwargs_for_provider") as routed_resolver, patch("agent.credential_pool._save_auth_store") as write, patch("run_agent.AIAgent", return_value=SimpleNamespace()) as constructor, patch("hermes_cli.tools_config._get_platform_tools", side_effect=AssertionError("generic discovery in scoped lane")) as generic_tools, patch("hermes_cli.plugins.discover_plugins", side_effect=AssertionError("plugin discovery in scoped lane")) as plugins, patch("hermes_cli.auth._read_xai_oauth_tokens", side_effect=AssertionError("xAI credential read in scoped lane")) as xai_read:
         adapter._create_agent(atlas_delegation_context={"actor_user_id": "actor"}, route={"provider": "openrouter", "model": "gpt-6.1-sol", "api_key": "config-key-must-not-override"} if routed else None)
+    generic_tools.assert_not_called()
+    plugins.assert_not_called()
+    xai_read.assert_not_called()
     ordinary.assert_not_called()
     routed_resolver.assert_not_called()
     write.assert_not_called()

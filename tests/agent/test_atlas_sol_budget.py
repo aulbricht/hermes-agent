@@ -1,5 +1,9 @@
+import threading
+
 from decimal import Decimal
 from types import SimpleNamespace
+
+import pytest
 
 from agent import atlas_sol_budget as budget
 
@@ -196,9 +200,9 @@ def test_codex_iteration_summary_and_retry_each_use_admission(monkeypatch):
     assert all(call["model"] == budget.SOL for call in admitted)
 
 
-def test_sol_stream_transport_failure_does_not_hide_billable_retry(monkeypatch):
+@pytest.mark.parametrize("model", ["gpt-6.1-sol", "openai/gpt-6.1-sol"])
+def test_sol_stream_transport_failure_does_not_hide_billable_retry(monkeypatch, model):
     import httpx
-    import pytest
     from agent.codex_runtime import run_codex_stream
 
     monkeypatch.setenv("ATLAS_SOL_ACCOUNTING_SOCKET", "/tmp/accounting.sock")
@@ -219,8 +223,86 @@ def test_sol_stream_transport_failure_does_not_hide_billable_retry(monkeypatch):
         _client_log_context=lambda: "test",
     )
     with pytest.raises(httpx.ConnectError):
-        run_codex_stream(agent, {"model": budget.SOL}, client=client)
+        run_codex_stream(agent, {"model": model}, client=client)
     assert len(calls) == 1
+
+
+@pytest.mark.parametrize("transport,model", [("openai", "gpt-6.1-sol"),
+                                            ("openrouter", "openai/gpt-6.1-sol")])
+@pytest.mark.parametrize("failure_stage", ["connect", "stream"])
+def test_sol_transport_failure_has_one_reservation_and_uncertain_paid_attempt(
+    monkeypatch, transport, model, failure_stage,
+):
+    import httpx
+    from agent import atlas_delegation as delegation
+    from agent.codex_runtime import run_codex_stream
+
+    monkeypatch.setenv("ATLAS_MODEL_ROUTING_ENABLED", "true")
+    monkeypatch.setenv("ATLAS_MODEL_ROUTING_TRANSPORT", transport)
+    monkeypatch.setenv("ATLAS_SOL_ACCOUNTING_SOCKET", "/synthetic/accounting.sock")
+    monkeypatch.setenv("ATLAS_SOL_ACCOUNTING_TOKEN_FILE", "/synthetic/accounting.token")
+    monkeypatch.setattr(budget, "_read_token", lambda _path: "fixture-token")
+    accounting = []
+    def post(_socket, _token, path, body):
+        accounting.append((path, body))
+        return {"status": "reserved"} if path.endswith("reservations") else {"status": "settled"}
+    monkeypatch.setattr(budget, "_post", post)
+    monkeypatch.setattr(delegation, "validate_dispatch", lambda _agent: None)
+    sends = []
+    class Responses:
+        def create(self, **kwargs):
+            sends.append(kwargs)
+            if failure_stage == "connect":
+                raise httpx.ConnectError("uncertain provider send")
+            def interrupted_stream():
+                yield SimpleNamespace(type="response.created", response=SimpleNamespace(id="observed"))
+                raise httpx.ReadTimeout("uncertain stream")
+            return interrupted_stream()
+    client = SimpleNamespace(responses=Responses())
+    agent = SimpleNamespace(
+        model=model, _atlas_delegation_policy=delegation.POLICY_VERSION,
+        _atlas_delegation_identities={"receipt_limit": "256"},
+        _atlas_paid_dispatch_lock=threading.Lock(), _atlas_paid_dispatch_count=0,
+        _atlas_paid_attempts=[], _atlas_paid_uncertain=False,
+        _atlas_paid_active=set(), _atlas_admission_closed=False,
+        _interrupt_requested=False, _fire_stream_delta=lambda _text: None,
+        _fire_reasoning_delta=lambda _text: None, _touch_activity=lambda _text: None,
+        _client_log_context=lambda: "fixture",
+    )
+    with pytest.raises((httpx.ConnectError, httpx.ReadTimeout)):
+        budget.admitted_call(agent, {"model": model, "input": "fixture", "max_output_tokens": 32},
+                             lambda outbound: run_codex_stream(agent, outbound, client=client))
+    assert len(sends) == 1 and sends[0]["model"] == model
+    assert [path.rsplit("/", 1)[-1] for path, _ in accounting] == ["reservations", "settlements"]
+    assert agent._atlas_paid_dispatch_count == 1
+    assert len(agent._atlas_paid_attempts) == 1
+    assert agent._atlas_paid_uncertain is True
+    assert agent._atlas_paid_attempts[0]["dispatch_status"] == "uncertain"
+    assert agent._atlas_paid_attempts[0]["usage_available"] is False
+    assert accounting[1][1]["estimated"] is True
+
+
+def test_ordinary_stream_connect_retry_remains_available(monkeypatch):
+    import httpx
+    from agent.codex_runtime import run_codex_stream
+
+    monkeypatch.delenv("ATLAS_SOL_ACCOUNTING_SOCKET", raising=False)
+    sends = []
+    response = SimpleNamespace(output=[], usage=None)
+    class Responses:
+        def create(self, **kwargs):
+            sends.append(kwargs)
+            if len(sends) == 1:
+                raise httpx.ConnectError("transient")
+            return response
+    client = SimpleNamespace(responses=Responses())
+    agent = SimpleNamespace(
+        _interrupt_requested=False, _fire_stream_delta=lambda _text: None,
+        _fire_reasoning_delta=lambda _text: None, _touch_activity=lambda _text: None,
+        _client_log_context=lambda: "fixture",
+    )
+    assert run_codex_stream(agent, {"model": "gpt-6-luna"}, client=client) is response
+    assert len(sends) == 2
 
 
 def test_accounting_token_rejects_group_writable_file(tmp_path):
