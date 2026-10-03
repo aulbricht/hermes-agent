@@ -4377,6 +4377,11 @@ def run_conversation(
                 _normalize_kwargs["strip_tool_prefix"] = agent._is_anthropic_oauth
             normalized = _transport.normalize_response(response, **_normalize_kwargs)
             assistant_message = normalized
+            # A dedicated tool-free Atlas turn must reject attempted tool use
+            # before hooks, invalid-name retries, or any execution callback.
+            _atlas_guard = vars(agent).get("_atlas_resolution_guard")
+            if _atlas_guard is not None and assistant_message.tool_calls:
+                _atlas_guard.check_tool_execution(agent)
             finish_reason = normalized.finish_reason
             
             # Normalize content to string — some OpenAI-compatible servers
@@ -5394,6 +5399,11 @@ def run_conversation(
                 break
             
         except Exception as e:
+            # A tool-free denial is terminal for this prepared generation.
+            # Keep the ordinary error/retry path unchanged for other turns.
+            _atlas_guard = vars(agent).get("_atlas_resolution_guard")
+            if _atlas_guard is not None:
+                _atlas_guard.check_completion()
             error_msg = f"Error during OpenAI-compatible API call #{api_call_count}: {str(e)}"
             try:
                 print(f"❌ {error_msg}")

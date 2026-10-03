@@ -487,6 +487,7 @@ class AIAgent:
         checkpoint_max_file_size_mb: int = 10,
         pass_session_id: bool = False,
         atlas_delegation_policy: str = None,
+        atlas_init_snapshot=None,
     ):
         """Forwarder — see ``agent.agent_init.init_agent``."""
         from agent.agent_init import init_agent
@@ -564,6 +565,7 @@ class AIAgent:
             checkpoint_max_file_size_mb=checkpoint_max_file_size_mb,
             pass_session_id=pass_session_id,
             atlas_delegation_policy=atlas_delegation_policy,
+            atlas_init_snapshot=atlas_init_snapshot,
         )
 
     def _get_session_db_for_recall(self):
@@ -1229,10 +1231,19 @@ class AIAgent:
         passed as a per-call ``timeout=`` kwarg, overriding the client-level
         timeout the AIAgent.__init__ path configured.
         """
-        cfg = get_provider_request_timeout(self.provider, self.model)
+        cfg = self._provider_request_timeout()
         if cfg is not None:
             return cfg
         return env_float("HERMES_API_TIMEOUT", 1800.0)
+
+    def _provider_request_timeout(self) -> float | None:
+        """Resolve timeout against this agent's guarded config when present."""
+        snapshot = getattr(self, "_atlas_init_snapshot", None)
+        if snapshot is None:
+            return get_provider_request_timeout(self.provider, self.model)
+        return get_provider_request_timeout(
+            self.provider, self.model, config=snapshot.config_copy()
+        )
 
     def _resolved_api_call_stale_timeout_base(self) -> tuple[float, bool]:
         """Resolve the base non-stream stale timeout and whether it is implicit.
@@ -1252,7 +1263,11 @@ class AIAgent:
         explicitly configured a stale timeout, such as auto-disabling the
         detector for local endpoints.
         """
-        cfg = get_provider_stale_timeout(self.provider, self.model)
+        snapshot = getattr(self, "_atlas_init_snapshot", None)
+        cfg = get_provider_stale_timeout(
+            self.provider, self.model,
+            config=snapshot.config_copy() if snapshot is not None else None,
+        )
         if cfg is not None:
             return cfg, False
 
@@ -4412,7 +4427,7 @@ class AIAgent:
             self._anthropic_client = build_anthropic_client(
                 new_token,
                 getattr(self, "_anthropic_base_url", None),
-                timeout=get_provider_request_timeout(self.provider, self.model),
+                timeout=self._provider_request_timeout(),
             )
         except Exception as exc:
             logger.warning("Failed to rebuild Anthropic client after credential refresh: %s", exc)
@@ -4488,7 +4503,7 @@ class AIAgent:
             except Exception:
                 logger.debug("custom-provider extra_headers skipped", exc_info=True)
 
-    def _apply_user_default_headers(self) -> None:
+    def _apply_user_default_headers(self, snapshot_config: dict | None = None) -> None:
         """Merge user-configured request headers onto the OpenAI client.
 
         Reads ``model.default_headers`` from config.yaml and merges it onto
@@ -4514,7 +4529,15 @@ class AIAgent:
         from agent.auxiliary_client import (
             _apply_user_default_headers as _merge_user_headers,
         )
-        merged = _merge_user_headers(self._client_kwargs.get("default_headers"))
+        if snapshot_config is None:
+            snapshot = getattr(self, "_atlas_init_snapshot", None)
+            snapshot_config = snapshot.config_copy() if snapshot is not None else None
+        if snapshot_config is None:
+            merged = _merge_user_headers(self._client_kwargs.get("default_headers"))
+        else:
+            merged = _merge_user_headers(
+                self._client_kwargs.get("default_headers"), config=snapshot_config
+            )
         if merged:
             self._client_kwargs["default_headers"] = merged
 
@@ -4534,7 +4557,7 @@ class AIAgent:
             self._anthropic_base_url = runtime_base
             self._anthropic_client = build_anthropic_client(
                 runtime_key, runtime_base,
-                timeout=get_provider_request_timeout(self.provider, self.model),
+                timeout=self._provider_request_timeout(),
             )
             self._is_anthropic_oauth = _is_oauth_token(runtime_key) if self.provider == "anthropic" else False
             self.api_key = runtime_key
@@ -4605,7 +4628,7 @@ class AIAgent:
             self._anthropic_client = build_anthropic_client(
                 self._anthropic_api_key,
                 getattr(self, "_anthropic_base_url", None),
-                timeout=get_provider_request_timeout(self.provider, self.model),
+                timeout=self._provider_request_timeout(),
                 drop_context_1m_beta=_drop_1m,
             )
 
@@ -5688,6 +5711,9 @@ class AIAgent:
         independent: read-only tools may always share the parallel path, while
         file reads/writes may do so only when their target paths do not overlap.
         """
+        atlas_guard = vars(self).get("_atlas_resolution_guard")
+        if atlas_guard is not None:
+            atlas_guard.check_tool_execution(self)
         tool_calls = assistant_message.tool_calls
 
         # Allow _vprint during tool execution even with stream consumers

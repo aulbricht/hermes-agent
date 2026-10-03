@@ -469,6 +469,20 @@ def scoped_construction(function):
         bound = signature.bind(*args, **kwargs)
         identities = bound.arguments.get("atlas_delegation_context")
         policy = bound.arguments.get("atlas_delegation_policy")
+        if (identities is not None and (bound.arguments.get("atlas_resolution_expected") is not None
+                                        or bound.arguments.get("atlas_resolution_alias") is not None)
+                or policy is not None and bound.arguments.get("atlas_init_snapshot") is not None):
+            raise DelegationDenied("Atlas policies cannot be combined")
+        if identities is not None:
+            from gateway.atlas_resolution import PHASE2_WORKER_SESSION_KEY
+            if (bound.arguments.get("gateway_session_key") or bound.arguments.get("session_id")) == PHASE2_WORKER_SESSION_KEY:
+                raise DelegationDenied("Fixed worker cannot use Atlas delegation")
+        expected = bound.arguments.get("atlas_resolution_expected")
+        if expected is not None:
+            adapter = bound.arguments["self"]
+            scope = adapter._atlas_scope(bound.arguments.get("gateway_session_key"),
+                                         bound.arguments.get("atlas_resolution_alias"))
+            adapter._atlas_store().verify_loaded(expected, scope, lambda: adapter._atlas_dependencies(scope))
         if identities is None and policy is None:
             return function(*args, **kwargs)
         if policy not in (None, POLICY_VERSION):

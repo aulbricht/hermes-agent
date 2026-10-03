@@ -548,7 +548,9 @@ _OR_HEADERS_BASE = {
 _TRUTHY_ENV_VALUES = frozenset({"1", "true", "yes", "on"})
 
 
-def _apply_user_default_headers(headers: dict | None) -> dict | None:
+def _apply_user_default_headers(
+    headers: dict | None, *, config: dict | None = None
+) -> dict | None:
     """Merge user-configured ``model.default_headers`` onto resolved headers.
 
     User values take precedence over provider/SDK defaults, mirroring the main
@@ -568,7 +570,7 @@ def _apply_user_default_headers(headers: dict | None) -> dict | None:
         return None
     try:
         from hermes_cli.config import cfg_get, load_config
-        _cfg = load_config()
+        _cfg = config if config is not None else load_config()
         user_headers = cfg_get(_cfg, "model", "default_headers")
         # ``model.extra_headers`` is an accepted alias (matches the
         # per-provider ``extra_headers`` key on providers/custom_providers

@@ -1,6 +1,7 @@
 """Exercise actual MCP coroutine send after lock acquisition and recovery."""
 import asyncio
 import json
+import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -15,7 +16,8 @@ def test_actual_rpc_revalidates_after_lock_and_reconnect(monkeypatch, change):
     authorized = [True]
     fingerprint = ["frozen"]
     agent = SimpleNamespace(_atlas_delegation_policy=policy.POLICY_VERSION,
-                            _atlas_delegation_fingerprints={"reader": "frozen"})
+                            _atlas_delegation_fingerprints={"reader": "frozen"},
+                            _atlas_paid_dispatch_lock=threading.Lock())
     calls = AsyncMock(return_value=SimpleNamespace(content=[SimpleNamespace(text="ok")], isError=False))
     server = mcp.MCPServerTask("fixture")
     server.session = SimpleNamespace(call_tool=calls)

@@ -80,7 +80,8 @@ async def test_session_routes_propagate_authenticated_scope_to_runner(tmp_path, 
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("path", ["/v1/chat/completions", "/v1/responses", "/v1/runs", "/future"])
+@pytest.mark.parametrize("path", ["/v1/chat/completions", "/v1/responses", "/v1/runs",
+                                 "/v1/atlas/guarded/chat/completions", "/future"])
 @pytest.mark.parametrize("headers", [HEADERS, {"X-Atlas-Delegated-Session": "expired"}, {"X-Atlas-Delegation": "signed"}])
 async def test_every_alternate_route_rejects_any_delegation_header(path, headers):
     from gateway.platforms.api_server import atlas_delegation_route_middleware
