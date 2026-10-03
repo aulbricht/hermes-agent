@@ -402,6 +402,8 @@ def init_agent(
         raise ValueError("Unknown Atlas delegation policy")
     agent._atlas_delegation_policy = atlas_delegation_policy
     if atlas_delegation_policy is not None:
+        from agent.atlas_delegation import resolve_web_readers
+        resolve_web_readers()  # Before client/auth setup or general tool inventory.
         skip_memory = skip_context_files = True
         load_soul_identity = False
     _install_safe_stdio()
@@ -1194,11 +1196,15 @@ def init_agent(
         agent._tool_snapshot_generation = _snapshot_registry._generation
     except Exception:
         agent._tool_snapshot_generation = 0
-    agent.tools = _ra().get_tool_definitions(
-        enabled_toolsets=enabled_toolsets,
-        disabled_toolsets=disabled_toolsets,
-        quiet_mode=agent.quiet_mode,
-    )
+    if atlas_delegation_policy is not None:
+        from agent.atlas_delegation import resolve_policy
+        agent.tools = resolve_policy()[0]
+    else:
+        agent.tools = _ra().get_tool_definitions(
+            enabled_toolsets=enabled_toolsets,
+            disabled_toolsets=disabled_toolsets,
+            quiet_mode=agent.quiet_mode,
+        )
     
     # Show tool configuration and store valid tool names for validation
     agent.valid_tool_names = set()
@@ -1227,7 +1233,7 @@ def init_agent(
     )
 
     # Check tool requirements
-    if agent.tools and not agent.quiet_mode:
+    if agent.tools and not agent.quiet_mode and atlas_delegation_policy is None:
         requirements = _ra().check_toolset_requirements()
         missing_reqs = [name for name, available in requirements.items() if not available]
         if missing_reqs:

@@ -46,6 +46,17 @@ def _get_exa_client() -> Any:
     ``ValueError`` when ``EXA_API_KEY`` is unset.
     """
     import tools.web_tools as _wt
+    from agent.atlas_delegation import current_dispatch_agent, check_admission_open, readonly_web_env
+    if current_dispatch_agent() is not None:
+        check_admission_open(current_dispatch_agent())
+        key = readonly_web_env("EXA_API_KEY")
+        if not key:
+            raise ValueError("Scoped Exa requires a direct process credential")
+        from exa_py import Exa
+        check_admission_open(current_dispatch_agent())
+        client = Exa(api_key=key)
+        client.headers["x-exa-integration"] = "hermes-agent"
+        return client
 
     cached = getattr(_wt, "_exa_client", None)
     if cached is not None:

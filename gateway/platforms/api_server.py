@@ -1545,6 +1545,9 @@ class APIServerAdapter(BasePlatformAdapter):
         this session — its model/provider/api_key/base_url override the
         global defaults for this agent instance only.
         """
+        if atlas_delegation_context is not None:
+            from agent.atlas_delegation import resolve_web_readers
+            resolve_web_readers()  # Reject before model credential resolution or constructor.
         from run_agent import AIAgent
         from gateway.run import (
             _current_max_iterations,

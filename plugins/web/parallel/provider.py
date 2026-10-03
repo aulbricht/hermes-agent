@@ -68,6 +68,15 @@ def _get_sync_client() -> Any:
     tests that reset that name between cases keep working.
     """
     import tools.web_tools as _wt
+    from agent.atlas_delegation import current_dispatch_agent, check_admission_open, readonly_web_env
+    if current_dispatch_agent() is not None:
+        check_admission_open(current_dispatch_agent())
+        key = readonly_web_env("PARALLEL_API_KEY")
+        if not key:
+            raise ValueError("Scoped Parallel requires a direct process credential")
+        from parallel import Parallel
+        check_admission_open(current_dispatch_agent())
+        return Parallel(api_key=key, max_retries=0)
 
     cached = getattr(_wt, "_parallel_client", None)
     if cached is not None:
@@ -96,6 +105,15 @@ def _get_async_client() -> Any:
     Cache lives on :mod:`tools.web_tools` (as ``_async_parallel_client``).
     """
     import tools.web_tools as _wt
+    from agent.atlas_delegation import current_dispatch_agent, check_admission_open, readonly_web_env
+    if current_dispatch_agent() is not None:
+        check_admission_open(current_dispatch_agent())
+        key = readonly_web_env("PARALLEL_API_KEY")
+        if not key:
+            raise ValueError("Scoped Parallel requires a direct process credential")
+        from parallel import AsyncParallel
+        check_admission_open(current_dispatch_agent())
+        return AsyncParallel(api_key=key, max_retries=0)
 
     cached = getattr(_wt, "_async_parallel_client", None)
     if cached is not None:

@@ -43,14 +43,17 @@ def _tavily_request(endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
 
     from agent.web_search_provider import get_provider_env
 
-    api_key = get_provider_env("TAVILY_API_KEY")
+    from agent.atlas_delegation import current_dispatch_agent, check_admission_open, readonly_web_env
+    check_admission_open(current_dispatch_agent())
+    lookup = readonly_web_env if current_dispatch_agent() is not None else get_provider_env
+    api_key = lookup("TAVILY_API_KEY")
     if not api_key:
         raise ValueError(
             "TAVILY_API_KEY environment variable not set. "
             "Get your API key at https://app.tavily.com/home"
         )
 
-    base_url = get_provider_env("TAVILY_BASE_URL") or "https://api.tavily.com"
+    base_url = lookup("TAVILY_BASE_URL") or "https://api.tavily.com"
     payload = dict(payload)  # don't mutate caller's dict
     payload["api_key"] = api_key
     url = f"{base_url}/{endpoint.lstrip('/')}"

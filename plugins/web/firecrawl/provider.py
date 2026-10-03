@@ -228,6 +228,20 @@ def _get_firecrawl_client() -> Any:
     :func:`_is_tool_gateway_ready`.
     """
     import tools.web_tools as _wt
+    from agent.atlas_delegation import current_dispatch_agent, check_admission_open, readonly_web_env
+    if current_dispatch_agent() is not None:
+        check_admission_open(current_dispatch_agent())
+        key = readonly_web_env("FIRECRAWL_API_KEY")
+        if not key:
+            raise ValueError("Scoped Firecrawl requires a direct process credential; managed OAuth is unavailable")
+        kwargs = {"api_key": key, "max_retries": 0}
+        url = readonly_web_env("FIRECRAWL_API_URL")
+        if url:
+            kwargs["api_url"] = url
+        # Import an already installed SDK directly: no lazy-deps installer/proxy.
+        from firecrawl import Firecrawl as ScopedFirecrawl
+        check_admission_open(current_dispatch_agent())
+        return ScopedFirecrawl(**kwargs)
 
     direct_config = _get_direct_firecrawl_config()
     if direct_config is not None and not _wt.prefers_gateway("web"):
@@ -252,11 +266,6 @@ def _get_firecrawl_client() -> Any:
             kwargs["api_url"],
             managed_gateway.nous_user_token,
         )
-
-    from agent.atlas_delegation import current_dispatch_agent
-    if current_dispatch_agent() is not None:
-        # A dedicated client keeps ordinary agents' retry configuration untouched.
-        return _wt.Firecrawl(**kwargs, max_retries=0)
 
     cached = getattr(_wt, "_firecrawl_client", None)
     cached_config = getattr(_wt, "_firecrawl_client_config", None)
@@ -494,8 +503,9 @@ class FirecrawlWebSearchProvider(WebSearchProvider):
                 logger.info("Firecrawl scraping: %s", url)
                 try:
                     def scrape_in_worker():
+                        from agent.atlas_delegation import check_admission_open, current_dispatch_agent, validate_web_send
+                        check_admission_open(current_dispatch_agent())
                         client = _get_firecrawl_client()
-                        from agent.atlas_delegation import validate_web_send
                         validate_web_send()  # Fresh for each URL and after worker queuing.
                         return client.scrape(url=url, formats=formats)
                     scrape_result = await asyncio.wait_for(

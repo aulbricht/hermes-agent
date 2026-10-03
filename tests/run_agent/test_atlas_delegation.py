@@ -214,8 +214,10 @@ def test_live_resolution_filters_unknown_tools_and_accepts_actual_async_web_read
         schemas.append({"type": "function", "function": schema})
     schemas.append({"function": {"name": "terminal"}})
     monkeypatch.setattr(policy, "_live_reader_fingerprints", lambda: {"reader": "protected"})
-    with patch("model_tools.get_tool_definitions", return_value=schemas):
+    with patch("model_tools.get_tool_definitions", return_value=schemas) as dynamic, patch("tools.registry.registry.get_definitions") as inventory:
         resolved, entries, fingerprints = policy.resolve_policy()
+    dynamic.assert_not_called()
+    inventory.assert_not_called()
     assert {s["function"]["name"] for s in resolved} == policy.ALLOWED_TOOLS
     assert entries["web_extract"][2] is True
     assert "terminal" not in entries
@@ -417,3 +419,27 @@ def test_callback_rechecks_closure_after_authorization(monkeypatch):
         opener.return_value.open.return_value = response
         with pytest.raises(policy.DelegationDenied):
             policy.validate_dispatch(agent)
+
+
+@pytest.mark.parametrize("entrypoint", ["capability", "resolve_policy", "bind_policy", "agent_constructor", "gateway_constructor"])
+def test_ungoverned_provider_rejected_before_real_inventory_and_initialization(monkeypatch, entrypoint):
+    from tools import web_tools
+    monkeypatch.setattr(web_tools, "_load_web_config", lambda: {"backend": "xai"})
+    with patch("tools.registry.registry.get_definitions") as inventory, patch("model_tools.get_tool_definitions") as dynamic, patch("run_agent.OpenAI") as sdk, patch("tools.xai_http.has_xai_credentials") as credentials, patch("gateway.run._resolve_runtime_agent_kwargs") as model_credentials:
+        with pytest.raises(policy.DelegationDenied, match="not governed"):
+            if entrypoint == "agent_constructor":
+                from run_agent import AIAgent
+                AIAgent(atlas_delegation_policy=policy.POLICY_VERSION, api_key="fixture", quiet_mode=True)
+            elif entrypoint == "gateway_constructor":
+                from gateway.platforms.api_server import APIServerAdapter
+                from gateway.config import PlatformConfig
+                APIServerAdapter(PlatformConfig(enabled=True))._create_agent(atlas_delegation_context={"actor_user_id": "actor"})
+            elif entrypoint == "bind_policy":
+                policy.bind_policy(SimpleNamespace(), {})
+            else:
+                getattr(policy, entrypoint)()
+    inventory.assert_not_called()
+    dynamic.assert_not_called()
+    sdk.assert_not_called()
+    credentials.assert_not_called()
+    model_credentials.assert_not_called()

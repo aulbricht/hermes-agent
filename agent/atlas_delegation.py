@@ -98,11 +98,13 @@ def _live_reader_fingerprints():
 
 
 def resolve_policy():
-    from model_tools import get_tool_definitions
+    # General inventory invokes dynamic provider availability/credential probes.
+    # The scoped inventory uses only these captured, provenance-checked entries.
+    resolve_web_readers()
     from tools.registry import registry
     from tools import mcp_tool
-    schemas = get_tool_definitions(enabled_toolsets=TOOLSETS, quiet_mode=True, skip_tool_search_assembly=True) or []
-    selected = {tool["function"]["name"]: tool for tool in schemas if tool.get("function", {}).get("name") in ALLOWED_TOOLS}
+    selected = {name: {"type": "function", "function": json.loads(json.dumps(registry._tools[name].schema))}
+        for name in ALLOWED_TOOLS if name in registry._tools}
     if set(selected) != ALLOWED_TOOLS:
         raise DelegationDenied("Atlas delegation reader schemas are unavailable")
     fingerprints = _live_reader_fingerprints()
@@ -125,8 +127,8 @@ def resolve_policy():
 
 
 def capability():
-    resolve_policy()
     resolve_web_readers()
+    resolve_policy()
     _read_dispatch_key()
     return {"policy_version": POLICY_VERSION, "executor_enforced": True, "allowed_tools": sorted(ALLOWED_TOOLS)}
 
@@ -136,6 +138,7 @@ def bind_policy(agent, identities):
         raise DelegationDenied("Atlas delegation requires the governed Responses lane")
     if getattr(agent, "provider", None) == "moa":
         raise DelegationDenied("Atlas delegation does not permit model delegation")
+    readers = resolve_web_readers()
     schemas, entries, fingerprints = resolve_policy()
     agent._atlas_delegation_policy = POLICY_VERSION
     agent._atlas_delegation_allowed_tools = ALLOWED_TOOLS
@@ -151,7 +154,7 @@ def bind_policy(agent, identities):
     agent._atlas_admission_closed = False
     agent._atlas_paid_active = set()
     agent._atlas_paid_condition = threading.Condition(agent._atlas_paid_dispatch_lock)
-    agent._atlas_web_readers = MappingProxyType(resolve_web_readers())
+    agent._atlas_web_readers = MappingProxyType(readers)
     agent.tools = schemas
     agent.valid_tool_names = ALLOWED_TOOLS
     agent._skip_mcp_refresh = True
@@ -183,6 +186,12 @@ def resolve_web_readers():
             raise DelegationDenied("Atlas delegation web provider implementation changed")
         readers["web_" + capability] = (instance, method.__get__(instance, implementation))
     return readers
+
+
+def readonly_web_env(name):
+    """Scoped credentials are process-only; never resolve OAuth or modify auth."""
+    check_admission_open(current_dispatch_agent())
+    return os.environ.get(name, "").strip()
 
 
 def scoped_web_reader(name):

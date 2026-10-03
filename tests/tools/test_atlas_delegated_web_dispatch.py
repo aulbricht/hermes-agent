@@ -73,14 +73,14 @@ def test_parallel_scoped_sdk_disables_hidden_retries_and_rechecks_after_loading(
 
 
 def test_scoped_firecrawl_client_has_no_hidden_sdk_retries_or_shared_cache(monkeypatch):
+    import sys
     from plugins.web.firecrawl import provider as firecrawl
     from tools import web_tools
-    monkeypatch.setattr(firecrawl, "_get_direct_firecrawl_config", lambda: ({"api_key": "fixture"}, ("fixture",)))
-    monkeypatch.setattr(web_tools, "prefers_gateway", lambda name: False)
+    monkeypatch.setenv("FIRECRAWL_API_KEY", "fixture")
     cached = object()
     monkeypatch.setattr(web_tools, "_firecrawl_client", cached)
     constructor = MagicMock()
-    monkeypatch.setattr(web_tools, "Firecrawl", constructor)
+    monkeypatch.setitem(sys.modules, "firecrawl", SimpleNamespace(Firecrawl=constructor))
     with policy.dispatch_context(SimpleNamespace(_atlas_delegation_policy=policy.POLICY_VERSION, _atlas_paid_dispatch_lock=threading.Lock())):
         firecrawl._get_firecrawl_client()
     constructor.assert_called_once_with(api_key="fixture", max_retries=0)
@@ -126,3 +126,100 @@ def test_queued_web_send_denied_after_terminal_closure(monkeypatch):
     policy.terminal_usage_calls(agent)
     with policy.dispatch_context(agent), pytest.raises(policy.DelegationDenied, match="closed"):
         policy.validate_web_send()
+
+
+@pytest.mark.parametrize("backend,method,key,module,constructor", [
+    ("firecrawl", "_get_firecrawl_client", "FIRECRAWL_API_KEY", "firecrawl", "Firecrawl"),
+    ("parallel", "_get_sync_client", "PARALLEL_API_KEY", "parallel", "Parallel"),
+    ("parallel", "_get_async_client", "PARALLEL_API_KEY", "parallel", "AsyncParallel"),
+    ("exa", "_get_exa_client", "EXA_API_KEY", "exa_py", "Exa"),
+])
+def test_scoped_sdk_setup_never_installs_or_resolves_managed_auth(monkeypatch, backend, method, key, module, constructor):
+    import importlib
+    import sys
+    provider = importlib.import_module("plugins.web." + backend + ".provider")
+    create = MagicMock(return_value=SimpleNamespace(headers={}))
+    monkeypatch.setitem(sys.modules, module, SimpleNamespace(**{constructor: create}))
+    monkeypatch.setenv(key, "fixture")
+    agent = SimpleNamespace(_atlas_delegation_policy=policy.POLICY_VERSION, _atlas_paid_dispatch_lock=threading.Lock())
+    with patch("tools.lazy_deps.ensure") as install, patch("tools.web_tools.resolve_managed_tool_gateway") as managed, patch("tools.web_tools._read_nous_access_token") as oauth:
+        with policy.dispatch_context(agent):
+            getattr(provider, method)()
+        create.assert_called_once()
+        agent._atlas_admission_closed = True
+        with policy.dispatch_context(agent), pytest.raises(policy.DelegationDenied, match="closed"):
+            getattr(provider, method)()
+        create.assert_called_once()
+    install.assert_not_called()
+    managed.assert_not_called()
+    oauth.assert_not_called()
+
+
+def test_scoped_firecrawl_without_direct_key_rejects_managed_oauth(monkeypatch):
+    from plugins.web.firecrawl import provider as firecrawl
+    monkeypatch.delenv("FIRECRAWL_API_KEY", raising=False)
+    with patch("tools.web_tools.resolve_managed_tool_gateway") as managed, patch("tools.lazy_deps.ensure") as install:
+        agent = SimpleNamespace(_atlas_delegation_policy=policy.POLICY_VERSION, _atlas_paid_dispatch_lock=threading.Lock())
+        with policy.dispatch_context(agent), pytest.raises(ValueError, match="direct process credential"):
+            firecrawl._get_firecrawl_client()
+    managed.assert_not_called()
+    install.assert_not_called()
+
+
+def test_queued_closed_firecrawl_worker_never_constructs_sdk_or_resolves_oauth(monkeypatch):
+    from plugins.web.firecrawl import provider as firecrawl
+    monkeypatch.setattr(firecrawl, "check_website_access", lambda url: None)
+    agent = SimpleNamespace(_atlas_delegation_policy=policy.POLICY_VERSION, _atlas_paid_dispatch_lock=threading.Lock())
+    async def worker(func, *args, **kwargs):
+        agent._atlas_admission_closed = True
+        return func(*args, **kwargs)
+    monkeypatch.setattr(asyncio, "to_thread", worker)
+    with patch.object(firecrawl, "_get_firecrawl_client") as setup, patch("tools.web_tools.resolve_managed_tool_gateway") as oauth, patch("tools.lazy_deps.ensure") as install:
+        with policy.dispatch_context(agent):
+            result = asyncio.run(firecrawl.FirecrawlWebSearchProvider().extract(["https://example.com/"]))
+    assert "closed" in result[0]["error"]
+    setup.assert_not_called()
+    oauth.assert_not_called()
+    install.assert_not_called()
+
+
+def test_live_firecrawl_setup_is_followed_by_fresh_send_guard(monkeypatch):
+    from plugins.web.firecrawl import provider as firecrawl
+    monkeypatch.setattr(firecrawl, "check_website_access", lambda url: None)
+    agent = SimpleNamespace(_atlas_delegation_policy=policy.POLICY_VERSION, _atlas_paid_dispatch_lock=threading.Lock())
+    client = SimpleNamespace(scrape=MagicMock())
+    def setup():
+        agent._atlas_admission_closed = True
+        return client
+    monkeypatch.setattr(firecrawl, "_get_firecrawl_client", setup)
+    with policy.dispatch_context(agent):
+        result = asyncio.run(firecrawl.FirecrawlWebSearchProvider().extract(["https://example.com/"]))
+    assert "closed" in result[0]["error"]
+    client.scrape.assert_not_called()
+
+
+@pytest.mark.parametrize("backend,method,key,module", [
+    ("firecrawl", "_get_firecrawl_client", "FIRECRAWL_API_KEY", "firecrawl"),
+    ("parallel", "_get_sync_client", "PARALLEL_API_KEY", "parallel"),
+    ("parallel", "_get_async_client", "PARALLEL_API_KEY", "parallel"),
+    ("exa", "_get_exa_client", "EXA_API_KEY", "exa_py"),
+])
+def test_scoped_missing_sdk_fails_without_lazy_install(monkeypatch, backend, method, key, module):
+    import importlib
+    import sys
+    provider = importlib.import_module("plugins.web." + backend + ".provider")
+    monkeypatch.setenv(key, "fixture")
+    monkeypatch.setitem(sys.modules, module, None)
+    agent = SimpleNamespace(_atlas_delegation_policy=policy.POLICY_VERSION, _atlas_paid_dispatch_lock=threading.Lock())
+    with patch("tools.lazy_deps.ensure") as install, policy.dispatch_context(agent), pytest.raises(ImportError):
+        getattr(provider, method)()
+    install.assert_not_called()
+
+
+def test_closed_tavily_never_reads_credentials_or_sends(monkeypatch):
+    from plugins.web.tavily import provider as tavily
+    agent = SimpleNamespace(_atlas_delegation_policy=policy.POLICY_VERSION, _atlas_paid_dispatch_lock=threading.Lock(), _atlas_admission_closed=True)
+    with patch("hermes_cli.config.get_env_value") as lookup, patch("httpx.post") as send, policy.dispatch_context(agent), pytest.raises(policy.DelegationDenied, match="closed"):
+        tavily._tavily_request("extract", {})
+    lookup.assert_not_called()
+    send.assert_not_called()
