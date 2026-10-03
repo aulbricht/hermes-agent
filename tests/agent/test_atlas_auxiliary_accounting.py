@@ -332,9 +332,13 @@ def test_failed_delegated_auxiliary_attempt_retains_observed_generation(monkeypa
             asyncio.run(auxiliary_client.async_call_llm(task="compression", messages=[]))
         else:
             auxiliary_client.call_llm(task="compression", messages=[])
+    with pytest.raises(policy.DelegationDenied, match="unsettled"):
+        policy.admit_paid_dispatch(agent)
+    assert agent._atlas_paid_dispatch_count == 1
     row, = policy.terminal_usage_calls(agent)
     assert row["generation_id"] == "aux-failed" and row["auxiliary"] is True
     assert row["dispatch_status"] == "uncertain" and row["usage_available"] is False
     assert "input_tokens" not in row and "cost_usd" not in row
-    with pytest.raises(policy.DelegationDenied, match="unsettled"):
+    with pytest.raises(policy.DelegationDenied, match="closed"):
         policy.admit_paid_dispatch(agent)
+    assert agent._atlas_paid_dispatch_count == 1

@@ -302,14 +302,18 @@ def test_failed_paid_attempt_is_retained_and_blocks_another_send(monkeypatch, ob
     with pytest.raises(policy.DelegationDenied, match="unsettled"):
         run_codex_stream(agent, {"model": "fixture"}, client=client)
     client.responses.create.assert_called_once()
+    with pytest.raises(policy.DelegationDenied, match="unsettled"):
+        policy.admit_paid_dispatch(agent)
+    assert agent._atlas_paid_dispatch_count == 1
     row, = policy.terminal_usage_calls(agent)
     assert row["generation_id"] == ("gen-failed" if observed else "")
     assert row["dispatch_status"] == "uncertain" and row["usage_available"] is False
     assert row["attempt_id"].startswith("attempt_") and row["actor_user_id"] == "actor"
     assert "cost_usd" not in row and "input_tokens" not in row and "output_tokens" not in row
     assert agent._atlas_paid_dispatch_count == 1
-    with pytest.raises(policy.DelegationDenied, match="unsettled"):
+    with pytest.raises(policy.DelegationDenied, match="closed"):
         policy.admit_paid_dispatch(agent)
+    assert agent._atlas_paid_dispatch_count == 1
     assert len(policy.terminal_usage_calls(agent)) == 1
 
 
