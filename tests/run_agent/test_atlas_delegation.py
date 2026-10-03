@@ -278,4 +278,58 @@ def test_paid_calls_share_finite_capacity_and_denial_never_reserves(monkeypatch)
     with pytest.raises(policy.DelegationDenied, match="exhausted"):
         policy.admit_paid_dispatch(agent)
     assert agent._atlas_paid_dispatch_count == 256
+    assert len(agent._atlas_paid_attempts) == 256
+    assert len({row["attempt_id"] for row in agent._atlas_paid_attempts}) == 256
     policy.admit_paid_dispatch(SimpleNamespace())
+
+
+@pytest.mark.parametrize("observed", [False, True])
+def test_failed_paid_attempt_is_retained_and_blocks_another_send(monkeypatch, observed):
+    import httpx
+    from agent.codex_runtime import run_codex_stream
+    agent, _ = scoped_agent(monkeypatch)
+    monkeypatch.setattr(policy, "validate_dispatch", lambda agent: None)
+    monkeypatch.delenv("ATLAS_SOL_ACCOUNTING_SOCKET", raising=False)
+    def events():
+        yield SimpleNamespace(type="response.created", response=SimpleNamespace(id="gen-failed", model="fixture"))
+        yield SimpleNamespace(type="response.output_text.delta", delta="unsettled answer")
+        raise httpx.ReadTimeout("fixture failed after provider admission")
+    client = MagicMock()
+    if observed:
+        client.responses.create.return_value = events()
+    else:
+        client.responses.create.side_effect = httpx.ConnectError("uncertain provider admission")
+    with pytest.raises(policy.DelegationDenied, match="unsettled"):
+        run_codex_stream(agent, {"model": "fixture"}, client=client)
+    client.responses.create.assert_called_once()
+    row, = policy.terminal_usage_calls(agent)
+    assert row["generation_id"] == ("gen-failed" if observed else "")
+    assert row["dispatch_status"] == "uncertain" and row["usage_available"] is False
+    assert row["attempt_id"].startswith("attempt_") and row["actor_user_id"] == "actor"
+    assert "cost_usd" not in row and "input_tokens" not in row and "output_tokens" not in row
+    assert agent._atlas_paid_dispatch_count == 1
+    with pytest.raises(policy.DelegationDenied, match="unsettled"):
+        policy.admit_paid_dispatch(agent)
+    assert len(policy.terminal_usage_calls(agent)) == 1
+
+
+def test_completed_attempts_keep_unique_slots_and_unknown_usage_never_becomes_zero(monkeypatch):
+    agent, _ = scoped_agent(monkeypatch)
+    monkeypatch.setattr(policy, "validate_dispatch", lambda agent: None)
+    first = policy.admit_paid_dispatch(agent, model="fixture")
+    policy.collect_primary_response(agent, SimpleNamespace(id="known", usage=SimpleNamespace(input_tokens=2, output_tokens=1)), "fixture", first)
+    second = policy.admit_paid_dispatch(agent, model="fixture", auxiliary=True)
+    policy.finish_paid_attempt(agent, second, {"generation_id": "unknown", "usage_available": False, "input_tokens": 0, "cost_usd": 0})
+    rows = policy.terminal_usage_calls(agent)
+    assert len(rows) == 2 and len({r["attempt_id"] for r in rows}) == 2
+    assert rows[0]["dispatch_status"] == "completed" and rows[0]["input_tokens"] == 2
+    assert rows[1]["dispatch_status"] == "uncertain" and rows[1]["generation_id"] == "unknown"
+    assert "input_tokens" not in rows[1] and "cost_usd" not in rows[1]
+
+
+def test_delegated_error_hook_never_even_looks_up_plugins(monkeypatch):
+    agent, _ = scoped_agent(monkeypatch)
+    with patch("hermes_cli.plugins.has_hook") as lookup, patch("hermes_cli.plugins.invoke_hook") as invoke:
+        agent._invoke_api_request_error_hook(task_id="task", turn_id="turn", api_request_id="api", api_call_count=1, api_start_time=0, api_kwargs={}, error_type="Timeout", error_message="failed")
+    lookup.assert_not_called()
+    invoke.assert_not_called()

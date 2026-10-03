@@ -934,14 +934,17 @@ async def web_extract_tool(
             # Async-or-sync dispatch: parallel + firecrawl have async
             # extract(); exa + tavily are sync.
             import inspect
+            from agent.atlas_delegation import validate_web_send
             if inspect.iscoroutinefunction(provider.extract):
+                validate_web_send()
                 results = await provider.extract(safe_urls, format=format)
             else:
                 # Run sync extract() in a thread so we don't block the
                 # event loop on network I/O.
-                results = await asyncio.to_thread(
-                    provider.extract, safe_urls, format=format
-                )
+                def extract_in_worker():
+                    validate_web_send()  # After waiting for the thread pool, not before enqueue.
+                    return provider.extract(safe_urls, format=format)
+                results = await asyncio.to_thread(extract_in_worker)
 
         # Reconstruct the original input order across invalid, blocked, and
         # provider-processed entries. Providers are expected to preserve the

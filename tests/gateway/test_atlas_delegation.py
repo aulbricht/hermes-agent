@@ -121,3 +121,22 @@ async def test_failed_native_runner_retains_completed_usage_and_actor_hash(monke
     assert [call["generation_id"] for call in usage["calls"]] == ["primary", "auxiliary"]
     assert agent.request_overrides["user"] == "atlas-user-" + hashlib.sha256(b"actor").hexdigest()
     assert all(call["actor_user_id"] == "actor" and call["resource_id"] == "turn_fixture" and call["route_request_id"] == "route_fixture" for call in usage["calls"])
+
+
+@pytest.mark.asyncio
+async def test_uncertain_paid_attempt_withholds_answer_but_returns_durable_identity(monkeypatch):
+    import threading
+    from agent import atlas_delegation as policy
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={"key": "fixture-only-key"}))
+    context, _ = _atlas_delegation_context(adapter, SimpleNamespace(headers=HEADERS))
+    agent = SimpleNamespace(_atlas_delegation_policy=policy.POLICY_VERSION,
+        _atlas_delegation_identities=context, _atlas_paid_dispatch_lock=threading.Lock(),
+        _atlas_paid_attempts=[{"attempt_id": "attempt_fixture", "generation_id": "observed_failure", "dispatch_status": "uncertain", "usage_available": False}],
+        session_usage_calls=[], run_conversation=lambda **kwargs: {"final_response": "must be withheld"})
+    monkeypatch.setattr(adapter, "_create_agent", lambda **kwargs: agent)
+    result, usage = await adapter._run_agent(user_message="read", conversation_history=[], session_id="fixture", atlas_delegation_context=context, atlas_route_request_id="route_fixture", provider_user_hash="caller-supplied")
+    assert result["failed"] is True and result["final_response"] == ""
+    row, = usage["calls"]
+    assert row["attempt_id"] == "attempt_fixture" and row["generation_id"] == "observed_failure"
+    assert row["actor_user_id"] == "actor" and row["resource_id"] == "turn_fixture"
+    assert row["usage_available"] is False and "input_tokens" not in row and "cost_usd" not in row

@@ -309,3 +309,32 @@ def test_responses_adapter_keeps_actor_hash_on_actual_provider_request(monkeypat
     client = SimpleNamespace(base_url="https://api.openai.com/v1", responses=SimpleNamespace(create=lambda **kwargs: requests.append(kwargs) or SimpleNamespace(close=lambda: None)))
     auxiliary_client._CodexCompletionsAdapter(client, accounting.LUNA).create(messages=[{"role": "user", "content": "read"}], user="atlas-user-fixture")
     assert requests[0]["user"] == "atlas-user-fixture"
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+def test_failed_delegated_auxiliary_attempt_retains_observed_generation(monkeypatch, async_mode):
+    import threading
+    from agent import atlas_delegation as policy
+    monkeypatch.setenv("ATLAS_MODEL_ROUTING_ENABLED", "true")
+    agent = SimpleNamespace(_atlas_delegation_policy=policy.POLICY_VERSION,
+        _atlas_delegation_identities={"actor_user_id": "actor", "subject_user_id": "subject", "view_as_session_id": "session", "resource_type": "chat", "resource_id": "turn_fixture", "receipt_limit": "256"},
+        _atlas_paid_dispatch_lock=threading.Lock(), _atlas_paid_dispatch_count=0)
+    monkeypatch.setattr(policy, "validate_dispatch", lambda agent: None)
+    def create(**kwargs):
+        policy.observe_paid_event(SimpleNamespace(response=SimpleNamespace(id="aux-failed", model=accounting.LUNA)))
+        raise TimeoutError("provider may have charged")
+    async def async_create(**kwargs):
+        return create(**kwargs)
+    client = SimpleNamespace(base_url="https://api.openai.com/v1", chat=SimpleNamespace(completions=SimpleNamespace(create=async_create if async_mode else create)))
+    monkeypatch.setattr(auxiliary_client, "_get_cached_client", lambda *args, **kwargs: (client, accounting.LUNA))
+    with policy.dispatch_context(agent), pytest.raises(TimeoutError):
+        if async_mode:
+            asyncio.run(auxiliary_client.async_call_llm(task="compression", messages=[]))
+        else:
+            auxiliary_client.call_llm(task="compression", messages=[])
+    row, = policy.terminal_usage_calls(agent)
+    assert row["generation_id"] == "aux-failed" and row["auxiliary"] is True
+    assert row["dispatch_status"] == "uncertain" and row["usage_available"] is False
+    assert "input_tokens" not in row and "cost_usd" not in row
+    with pytest.raises(policy.DelegationDenied, match="unsettled"):
+        policy.admit_paid_dispatch(agent)

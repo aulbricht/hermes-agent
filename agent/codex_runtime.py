@@ -872,6 +872,8 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
 
     def _on_event(event: Any) -> None:
         # TTFB watchdog and activity touch — runs once per SSE event.
+        from agent.atlas_delegation import observe_paid_event
+        observe_paid_event(event, paid_attempt, agent)
         agent._codex_stream_last_event_ts = time.time()
         agent._touch_activity("receiving stream response")
 
@@ -885,11 +887,16 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
         stream_kwargs = dict(api_kwargs)
         stream_kwargs["stream"] = True
 
+        paid_attempt = None
         try:
             from agent.atlas_delegation import admit_paid_dispatch
-            admit_paid_dispatch(agent)
+            paid_attempt = admit_paid_dispatch(agent, model=api_kwargs.get("model"))
             event_stream = active_client.responses.create(**stream_kwargs)
-        except (_httpx.RemoteProtocolError, _httpx.ReadTimeout, _httpx.ConnectError, ConnectionError) as exc:
+        except BaseException as exc:
+            from agent.atlas_delegation import finish_paid_attempt
+            finish_paid_attempt(agent, locals().get("paid_attempt"))
+            if not isinstance(exc, (_httpx.RemoteProtocolError, _httpx.ReadTimeout, _httpx.ConnectError, ConnectionError)):
+                raise
             if attempt < max_stream_retries:
                 logger.debug(
                     "Codex Responses stream connect failed (attempt %s/%s); retrying. %s error=%s",
@@ -904,7 +911,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
             # instead of an iterable.  Pass it straight through.
             if hasattr(event_stream, "output") and not hasattr(event_stream, "__iter__"):
                 from agent.atlas_delegation import collect_primary_response
-                collect_primary_response(agent, event_stream, api_kwargs.get("model"))
+                collect_primary_response(agent, event_stream, api_kwargs.get("model"), paid_attempt)
                 return event_stream
 
             try:
@@ -938,9 +945,12 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                 )
 
             from agent.atlas_delegation import collect_primary_response
-            collect_primary_response(agent, final, api_kwargs.get("model"))
+            collect_primary_response(agent, final, api_kwargs.get("model"), paid_attempt)
             return final
         finally:
+            from agent.atlas_delegation import finish_paid_attempt
+            if paid_attempt is not None and paid_attempt.get("dispatch_status") != "completed":
+                finish_paid_attempt(agent, paid_attempt)
             close_fn = getattr(event_stream, "close", None)
             if callable(close_fn):
                 try:

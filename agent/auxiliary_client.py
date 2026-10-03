@@ -1130,6 +1130,8 @@ class _CodexCompletionsAdapter:
             stream_kwargs["stream"] = True
 
             def _on_each_event(_event: Any) -> None:
+                from agent.atlas_delegation import observe_paid_event
+                observe_paid_event(_event)
                 # Re-check timeout/cancellation per event, matching the
                 # cadence the old in-line ``_check_cancelled()`` used.
                 _check_cancelled()
@@ -6472,7 +6474,7 @@ def _atlas_direct_auxiliary_call(
         extra_body=merged_extra, base_url=base_url,
     )
     kwargs.pop("temperature", None)
-    from agent.atlas_delegation import current_dispatch_agent, admit_paid_dispatch
+    from agent.atlas_delegation import current_dispatch_agent, admit_paid_dispatch, paid_attempt_context, finish_paid_attempt, observe_paid_event
     delegated_agent = current_dispatch_agent()
     if delegated_agent is not None:
         import hashlib
@@ -6483,12 +6485,18 @@ def _atlas_direct_auxiliary_call(
         async def _perform():
             from agent.atlas_delegation import validate_auxiliary_dispatch
             validate_auxiliary_dispatch()
-            admit_paid_dispatch(delegated_agent)
-            raw_response = await client.chat.completions.create(**kwargs)
-            if delegated_agent is not None:
-                from agent.atlas_auxiliary_accounting import collect_delegated_response
-                collect_delegated_response(delegated_agent, raw_response, requested_model=LUNA)
-                return _validate_llm_response(raw_response, task)
+            attempt = admit_paid_dispatch(delegated_agent, model=requested_model, auxiliary=True)
+            try:
+                with paid_attempt_context(attempt):
+                    raw_response = await client.chat.completions.create(**kwargs)
+                if delegated_agent is not None:
+                    observe_paid_event({"response": raw_response}, attempt)
+                    from agent.atlas_auxiliary_accounting import collect_delegated_response
+                    collect_delegated_response(delegated_agent, raw_response, requested_model=LUNA, attempt=attempt)
+                    return _validate_llm_response(raw_response, task)
+            finally:
+                if attempt is not None and attempt.get("dispatch_status") != "completed":
+                    finish_paid_attempt(delegated_agent, attempt)
             from agent.atlas_auxiliary_accounting import record_completed_response_async
             try:
                 await record_completed_response_async(raw_response, requested_model=LUNA)
@@ -6499,12 +6507,18 @@ def _atlas_direct_auxiliary_call(
 
     from agent.atlas_delegation import validate_auxiliary_dispatch
     validate_auxiliary_dispatch()
-    admit_paid_dispatch(delegated_agent)
-    raw_response = client.chat.completions.create(**kwargs)
-    if delegated_agent is not None:
-        from agent.atlas_auxiliary_accounting import collect_delegated_response
-        collect_delegated_response(delegated_agent, raw_response, requested_model=LUNA)
-        return _validate_llm_response(raw_response, task)
+    attempt = admit_paid_dispatch(delegated_agent, model=requested_model, auxiliary=True)
+    try:
+        with paid_attempt_context(attempt):
+            raw_response = client.chat.completions.create(**kwargs)
+        if delegated_agent is not None:
+            observe_paid_event({"response": raw_response}, attempt)
+            from agent.atlas_auxiliary_accounting import collect_delegated_response
+            collect_delegated_response(delegated_agent, raw_response, requested_model=LUNA, attempt=attempt)
+            return _validate_llm_response(raw_response, task)
+    finally:
+        if attempt is not None and attempt.get("dispatch_status") != "completed":
+            finish_paid_attempt(delegated_agent, attempt)
     from agent.atlas_auxiliary_accounting import record_completed_response
     try:
         record_completed_response(raw_response, requested_model=LUNA)

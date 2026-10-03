@@ -56,6 +56,8 @@ def _tavily_request(endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     url = f"{base_url}/{endpoint.lstrip('/')}"
     logger.info("Tavily %s request to %s", endpoint, url)
 
+    from agent.atlas_delegation import validate_web_send
+    validate_web_send("web_extract" if endpoint.lstrip("/") == "extract" else "web_search")
     response = httpx.post(url, json=payload, timeout=60)
     response.raise_for_status()
     return response.json()

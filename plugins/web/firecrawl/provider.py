@@ -253,6 +253,11 @@ def _get_firecrawl_client() -> Any:
             managed_gateway.nous_user_token,
         )
 
+    from agent.atlas_delegation import current_dispatch_agent
+    if current_dispatch_agent() is not None:
+        # A dedicated client keeps ordinary agents' retry configuration untouched.
+        return _wt.Firecrawl(**kwargs, max_retries=0)
+
     cached = getattr(_wt, "_firecrawl_client", None)
     cached_config = getattr(_wt, "_firecrawl_client_config", None)
     if cached is not None and cached_config == client_config:
@@ -412,6 +417,8 @@ class FirecrawlWebSearchProvider(WebSearchProvider):
         # let it propagate so the dispatcher emits the legacy envelope shape.
         client = _get_firecrawl_client()
         try:
+            from agent.atlas_delegation import validate_web_send
+            validate_web_send("web_search")
             response = client.search(query=query, limit=limit)
             web_results = _extract_web_search_results(response)
             logger.info("Firecrawl: found %d search results", len(web_results))
@@ -486,12 +493,13 @@ class FirecrawlWebSearchProvider(WebSearchProvider):
             try:
                 logger.info("Firecrawl scraping: %s", url)
                 try:
+                    def scrape_in_worker():
+                        client = _get_firecrawl_client()
+                        from agent.atlas_delegation import validate_web_send
+                        validate_web_send()  # Fresh for each URL and after worker queuing.
+                        return client.scrape(url=url, formats=formats)
                     scrape_result = await asyncio.wait_for(
-                        asyncio.to_thread(
-                            _get_firecrawl_client().scrape,
-                            url=url,
-                            formats=formats,
-                        ),
+                        asyncio.to_thread(scrape_in_worker),
                         timeout=60,
                     )
                 except asyncio.TimeoutError:

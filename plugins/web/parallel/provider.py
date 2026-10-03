@@ -184,7 +184,12 @@ class ParallelWebSearchProvider(WebSearchProvider):
             logger.info(
                 "Parallel search: '%s' (mode=%s, limit=%d)", query, mode, limit
             )
-            response = _get_sync_client().beta.search(
+            client = _get_sync_client()
+            from agent.atlas_delegation import current_dispatch_agent, validate_web_send
+            if current_dispatch_agent() is not None:
+                client = client.with_options(max_retries=0)
+            validate_web_send("web_search")
+            response = client.beta.search(
                 search_queries=[query],
                 objective=query,
                 mode=mode,
@@ -234,7 +239,12 @@ class ParallelWebSearchProvider(WebSearchProvider):
                 ]
 
             logger.info("Parallel extract: %d URL(s)", len(urls))
-            response = await _get_async_client().beta.extract(
+            client = _get_async_client()
+            from agent.atlas_delegation import current_dispatch_agent, validate_web_send
+            if current_dispatch_agent() is not None:
+                client = client.with_options(max_retries=0)
+            validate_web_send()
+            response = await client.beta.extract(
                 urls=urls,
                 full_content=True,
             )

@@ -126,7 +126,10 @@ class ExaWebSearchProvider(WebSearchProvider):
                 return {"success": False, "error": "Interrupted"}
 
             logger.info("Exa search: '%s' (limit=%d)", query, limit)
-            response = _get_exa_client().search(
+            client = _get_exa_client()
+            from agent.atlas_delegation import validate_web_send
+            validate_web_send("web_search")
+            response = client.search(
                 query,
                 num_results=limit,
                 contents={"highlights": True},
@@ -170,7 +173,10 @@ class ExaWebSearchProvider(WebSearchProvider):
                 ]
 
             logger.info("Exa extract: %d URL(s)", len(urls))
-            response = _get_exa_client().get_contents(urls, text=True)
+            client = _get_exa_client()
+            from agent.atlas_delegation import validate_web_send
+            validate_web_send()
+            response = client.get_contents(urls, text=True)
 
             results: List[Dict[str, Any]] = []
             for result in response.results or []:

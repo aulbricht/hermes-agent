@@ -191,7 +191,7 @@ async def record_completed_response_async(response: Any, *, requested_model: str
         )
 
 
-def collect_delegated_response(agent, response, *, requested_model=LUNA):
+def collect_delegated_response(agent, response, *, requested_model=LUNA, attempt=None):
     """Keep completed usage for durable broker settlement, even after revocation."""
     import hashlib
     payload = receipt_payload(response, requested_model=requested_model)
@@ -217,7 +217,7 @@ def collect_delegated_response(agent, response, *, requested_model=LUNA):
         "generation_id": payload["provider_generation_id"],
         "model": payload["model"], "provider": payload["provider"],
         "route_request_id": getattr(agent, "_atlas_route_request_id", None),
-        "reservation_id": None, "usage_available": _get(response, "usage") is not None,
+        "reservation_id": None, "usage_available": (_get(usage, "input_tokens", _get(usage, "prompt_tokens")) is not None and _get(usage, "output_tokens", _get(usage, "completion_tokens")) is not None),
         "input_tokens": max(0, payload["input_tokens"] - payload["cache_read_tokens"] - payload["cache_write_tokens"]),
         "input_tokens_total": payload["input_tokens"], "output_tokens": payload["output_tokens"],
         "cache_read_tokens": payload["cache_read_tokens"], "cache_write_tokens": payload["cache_write_tokens"],
@@ -230,5 +230,9 @@ def collect_delegated_response(agent, response, *, requested_model=LUNA):
         "byok_total_cost_usd": float(payload["estimated_total_usd"]) if payload["cost_basis"] == "byok_estimated" else None,
         "service_tier": _get(response, "service_tier"),
     }
-    with agent._atlas_paid_dispatch_lock:
-        agent._atlas_auxiliary_usage_calls.append(call)
+    if attempt is not None:
+        from agent.atlas_delegation import finish_paid_attempt
+        finish_paid_attempt(agent, attempt, call)
+    else:
+        with agent._atlas_paid_dispatch_lock:
+            agent._atlas_auxiliary_usage_calls.append(call)

@@ -4529,6 +4529,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 if atlas_delegation_context is not None:
                     from agent.atlas_delegation import terminal_usage_calls
                     usage["calls"] = terminal_usage_calls(agent)
+                    if any(call.get("dispatch_status") == "uncertain" for call in usage["calls"]):
+                        result = {**result, "final_response": "", "failed": True, "error": "Paid attempt is awaiting accounting reconciliation"}
                 # Include the effective session ID in the result so callers
                 # (e.g. X-Hermes-Session-Id header) can track compression-
                 # triggered session rotations. (#16938)

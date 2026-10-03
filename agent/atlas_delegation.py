@@ -145,6 +145,8 @@ def bind_policy(agent, identities):
     agent._atlas_paid_dispatch_count = 0
     agent._atlas_auxiliary_usage_calls = []
     agent._atlas_primary_usage_calls = []
+    agent._atlas_paid_attempts = []
+    agent._atlas_paid_uncertain = False
     agent.tools = schemas
     agent.valid_tool_names = ALLOWED_TOOLS
     agent._skip_mcp_refresh = True
@@ -267,7 +269,7 @@ def current_dispatch_agent():
     return _dispatch_agent.get()
 
 
-def admit_paid_dispatch(agent):
+def admit_paid_dispatch(agent, *, model=None, auxiliary=False):
     """Reserve one terminal-receipt slot immediately before a paid SDK call."""
     if not is_scoped(agent):
         return
@@ -278,7 +280,73 @@ def admit_paid_dispatch(agent):
     with agent._atlas_paid_dispatch_lock:
         if agent._atlas_paid_dispatch_count >= int(limit):
             raise DelegationDenied("Atlas delegation receipt capacity is exhausted")
+        if getattr(agent, "_atlas_paid_uncertain", False):
+            raise DelegationDenied("Atlas delegation has an unsettled paid attempt")
+        from agent.atlas_sol_budget import _transport
+        call = {"attempt_id": "attempt_" + secrets.token_hex(16),
+            "dispatch_status": "uncertain", "usage_available": False,
+            "generation_id": "", "model": model or getattr(agent, "model", ""),
+            "provider": "openrouter" if _transport() == "openrouter" else "openai",
+            "auxiliary": auxiliary}
+        if not hasattr(agent, "_atlas_paid_attempts"):
+            agent._atlas_paid_attempts = []
+        agent._atlas_paid_attempts.append(call)
         agent._atlas_paid_dispatch_count += 1
+        return call
+
+
+def validate_web_send(name="web_extract"):
+    agent = current_dispatch_agent()
+    if agent is not None and not tool_allowed(agent, name):
+        raise DelegationDenied("Atlas delegation web reader is no longer authorized")
+
+
+_paid_attempt = ContextVar("atlas_delegation_paid_attempt", default=None)
+
+
+@contextmanager
+def paid_attempt_context(attempt):
+    token = _paid_attempt.set(attempt)
+    try:
+        yield
+    finally:
+        _paid_attempt.reset(token)
+
+
+def observe_paid_event(event, attempt=None, agent=None):
+    attempt = attempt if attempt is not None else _paid_attempt.get()
+    if attempt is None:
+        return
+    from agent.atlas_sol_budget import _field
+    response = _field(event, "response")
+    if response is not None:
+        observed = {}
+        for name, field in (("generation_id", "id"), ("model", "model"), ("service_tier", "service_tier")):
+            value = _field(response, field)
+            if isinstance(value, str) and value:
+                observed[name] = value
+        owner = agent or current_dispatch_agent()
+        if owner is not None:
+            with owner._atlas_paid_dispatch_lock:
+                attempt.update(observed)
+        else:
+            attempt.update(observed)
+
+
+def finish_paid_attempt(agent, attempt, fields=None):
+    if attempt is None:
+        return
+    with agent._atlas_paid_dispatch_lock:
+        if fields:
+            # Unknown usage must never become fabricated zero-token/zero-cost evidence.
+            if fields.get("usage_available") is True:
+                attempt.update(fields)
+                attempt["dispatch_status"] = "completed"
+                return
+            for key in ("generation_id", "model", "provider", "service_tier"):
+                if fields.get(key):
+                    attempt[key] = fields[key]
+        agent._atlas_paid_uncertain = True
 
 
 def validate_mcp_send(agent, server_name, server):
@@ -294,7 +362,7 @@ def validate_mcp_send(agent, server_name, server):
     validate_dispatch(agent)
 
 
-def collect_primary_response(agent, response, model):
+def collect_primary_response(agent, response, model, attempt=None):
     if not is_scoped(agent):
         return
     from agent.atlas_sol_budget import _field, openai_usage_fields, _transport
@@ -303,26 +371,31 @@ def collect_primary_response(agent, response, model):
         "generation_id": str(_field(response, "id", "") or ""),
         "model": str(_field(response, "model", model) or model),
         "provider": "openrouter" if _transport() == "openrouter" else "openai",
-        "usage_available": _field(response, "usage") is not None,
+        "usage_available": openai_usage_fields(response)["usage_available"],
         "route_request_id": getattr(agent, "_atlas_route_request_id", None),
         "service_tier": _field(response, "service_tier"),
     }
-    with agent._atlas_paid_dispatch_lock:
-        agent._atlas_primary_usage_calls.append(call)
+    if attempt is not None:
+        finish_paid_attempt(agent, attempt, call)
+    else:
+        with agent._atlas_paid_dispatch_lock:
+            agent._atlas_primary_usage_calls.append(call)
 
 
 def terminal_usage_calls(agent):
     """Merge loop settlement into every completed dispatch, without reauthorizing."""
     recorded = list(getattr(agent, "session_usage_calls", []) or [])
-    completed = list(getattr(agent, "_atlas_primary_usage_calls", []) or [])
+    with agent._atlas_paid_dispatch_lock:
+        attempts = [dict(row) for row in getattr(agent, "_atlas_paid_attempts", []) or []]
+        completed = attempts if attempts else [dict(row) for row in getattr(agent, "_atlas_primary_usage_calls", []) or []]
     if not completed:
         completed = recorded
     else:
         for call in completed:
             match = next((row for row in recorded if call.get("generation_id") and row.get("generation_id") == call["generation_id"]), None)
-            if match:
+            if match and call.get("usage_available") is True:
                 call.update(match)
-    calls = completed + list(getattr(agent, "_atlas_auxiliary_usage_calls", []) or [])
+    calls = completed if attempts else completed + list(getattr(agent, "_atlas_auxiliary_usage_calls", []) or [])
     context = agent._atlas_delegation_identities
     actor = context["actor_user_id"]
     for call in calls:
