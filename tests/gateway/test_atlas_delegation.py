@@ -160,3 +160,45 @@ def test_scoped_agent_runtime_never_enters_shared_auth_recovery(monkeypatch, rou
     write.assert_not_called()
     assert constructor.call_args.kwargs["api_key"] == "process-only-fixture"
     assert constructor.call_args.kwargs["credential_pool"] is None
+
+
+@pytest.mark.parametrize('routed', [False, True])
+def test_denied_scoped_gateway_validates_before_any_constructor_or_config(monkeypatch, routed):
+    from agent import atlas_delegation as policy
+    monkeypatch.setattr(policy, 'resolve_web_readers', lambda: {})
+    def deny(agent):
+        assert policy.credential_scope_active()
+        raise policy.DelegationDenied('revoked')
+    monkeypatch.setattr(policy, 'validate_dispatch', deny)
+    adapter = APIServerAdapter(PlatformConfig(enabled=True))
+    with patch('run_agent.AIAgent') as constructor, patch('gateway.run._load_gateway_config') as config, patch('gateway.run._resolve_runtime_agent_kwargs') as credentials, patch('tools.env_probe.warm_environment_probe_async') as probe:
+        with pytest.raises(policy.DelegationDenied, match='revoked'):
+            adapter._create_agent(atlas_delegation_context={'actor_user_id': 'actor'}, route={'provider': 'openrouter', 'model': 'gpt-6-luna'} if routed else None)
+        constructor.assert_not_called()
+        config.assert_not_called()
+        credentials.assert_not_called()
+        probe.assert_not_called()
+    assert not policy.credential_scope_active()
+
+
+@pytest.mark.parametrize('routed', [False, True])
+def test_gateway_keeps_credential_boundary_across_actual_constructor_entry(monkeypatch, routed):
+    from agent import atlas_delegation as policy
+    from agent.credential_pool import load_pool
+    monkeypatch.setenv('OPENROUTER_API_KEY', 'synthetic-process-key')
+    monkeypatch.setattr(policy, 'resolve_web_readers', lambda: {})
+    monkeypatch.setattr(policy, 'validate_dispatch', lambda agent: None)
+    monkeypatch.setattr(policy, 'bind_policy', lambda *args: None)
+    adapter = APIServerAdapter(PlatformConfig(enabled=True))
+    monkeypatch.setattr(adapter, '_ensure_session_db', lambda: None)
+    config = {'model': {'provider': 'openrouter', 'default': 'openai/gpt-6-luna'}}
+    def construct(**kwargs):
+        assert policy.credential_scope_active()
+        with pytest.raises(policy.DelegationDenied, match='shared credential'):
+            load_pool('openrouter')
+        assert kwargs['api_key'] == 'synthetic-process-key'
+        return SimpleNamespace()
+    with patch('gateway.run._load_gateway_config', return_value=config), patch('run_agent.AIAgent', side_effect=construct), patch('hermes_cli.auth._save_auth_store') as write:
+        adapter._create_agent(atlas_delegation_context={'actor_user_id': 'actor'}, route={'provider': 'openrouter', 'model': 'openai/gpt-6-luna'} if routed else None)
+        write.assert_not_called()
+    assert not policy.credential_scope_active()

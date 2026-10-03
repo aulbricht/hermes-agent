@@ -572,7 +572,10 @@ def interruptible_api_call(agent, api_kwargs: dict):
     _call_start = time.time()
     agent._touch_activity("waiting for non-streaming API response")
 
-    t = threading.Thread(target=_call, daemon=True)
+    from contextvars import copy_context
+    context = copy_context()
+    from agent.atlas_delegation import run_dispatch_worker
+    t = threading.Thread(target=lambda: context.run(run_dispatch_worker, agent, _call), daemon=True)
     t.start()
     _poll_count = 0
     while t.is_alive():
@@ -3069,7 +3072,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         if _reasoning_floor is not None:
             _stream_stale_timeout = max(_stream_stale_timeout, _reasoning_floor)
 
-    t = threading.Thread(target=_call, daemon=True)
+    from contextvars import copy_context
+    context = copy_context()
+    from agent.atlas_delegation import run_dispatch_worker
+    t = threading.Thread(target=lambda: context.run(run_dispatch_worker, agent, _call), daemon=True)
     t.start()
     _last_heartbeat = time.time()
     _HEARTBEAT_INTERVAL = 30.0  # seconds between gateway activity touches

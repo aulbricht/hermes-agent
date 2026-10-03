@@ -1121,6 +1121,8 @@ def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
 
 
 def _save_auth_store(auth_store: Dict[str, Any], target_path: Optional[Path] = None) -> Path:
+    from agent.atlas_delegation import deny_shared_credentials
+    deny_shared_credentials()
     # target_path=None preserves the existing contract (write the active
     # store at _auth_file_path()). An explicit path lets callers persist a
     # specific store — e.g. the global-root write-through for rotating xAI

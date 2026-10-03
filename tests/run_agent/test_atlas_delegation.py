@@ -443,3 +443,149 @@ def test_ungoverned_provider_rejected_before_real_inventory_and_initialization(m
     sdk.assert_not_called()
     credentials.assert_not_called()
     model_credentials.assert_not_called()
+
+
+@pytest.mark.parametrize('key', ['Authorization', 'aUtHoRiZaTiOn', 'X-API-Key', 'api-key', 'OpenAI-Organization', 'openai-project', 'Proxy-Authorization'])
+@pytest.mark.parametrize('location', ['default_headers', 'extra_headers', 'provider'])
+def test_scoped_runtime_rejects_configured_auth_headers(monkeypatch, key, location):
+    monkeypatch.setenv('OPENROUTER_API_KEY', 'synthetic-process-key')
+    config = {'model': {'provider': 'openrouter'}}
+    if location == 'provider':
+        config['providers'] = {'openrouter': {'extra_headers': {key: 'synthetic-config-key'}}}
+    else:
+        config['model'][location] = {key: 'synthetic-config-key'}
+    with pytest.raises(policy.DelegationDenied, match='authentication headers'):
+        policy.scoped_runtime_kwargs(config)
+
+
+@pytest.mark.parametrize('closed', [False, True])
+def test_scoped_metadata_and_shared_auth_are_inert_even_on_cold_cache(monkeypatch, tmp_path, closed):
+    import threading
+    from agent import model_metadata, credential_pool
+    from hermes_cli import auth
+    agent = SimpleNamespace(_atlas_delegation_policy=policy.POLICY_VERSION,
+                            _atlas_admission_closed=closed,
+                            _atlas_paid_dispatch_lock=threading.Lock())
+    target = tmp_path / 'auth.json'
+    with patch('requests.get') as network, patch.object(model_metadata, 'atomic_json_write') as cache, patch.object(credential_pool, 'read_credential_pool') as read:
+        with policy.dispatch_context(agent):
+            assert model_metadata.fetch_model_metadata(force_refresh=True) == {}
+            assert model_metadata.fetch_endpoint_model_metadata('https://openrouter.ai/api/v1', force_refresh=True) == {}
+            assert model_metadata.get_model_context_length('unknown', config_context_length=100000) == 32768
+            with pytest.raises(policy.DelegationDenied):
+                model_metadata.save_context_length('unknown', '', 99999)
+            with pytest.raises(policy.DelegationDenied):
+                credential_pool.load_pool('openrouter')
+            before = {'sentinel': True}
+            with pytest.raises(policy.DelegationDenied):
+                auth._save_auth_store(before, target_path=target)
+            assert before == {'sentinel': True}
+        network.assert_not_called()
+        cache.assert_not_called()
+        read.assert_not_called()
+    assert not target.exists()
+    assert not policy.credential_scope_active()
+
+
+def test_cached_pool_cannot_recover_expired_cooldown_inside_scope(monkeypatch):
+    from agent import credential_pool
+    from dataclasses import asdict
+    entry = credential_pool.PooledCredential.from_dict('openrouter', {'id': 'fixture', 'api_key': 'synthetic', 'last_status': 'exhausted', 'last_error_at': 1, 'last_error_reset_at': 1})
+    pool = credential_pool.CredentialPool('openrouter', [entry])
+    before = asdict(entry)
+    with patch.object(credential_pool, 'write_credential_pool') as write:
+        with policy.credential_scope():
+            for operation in (pool.select, pool.peek, pool.reset_statuses, pool.try_refresh_current):
+                with pytest.raises(policy.DelegationDenied):
+                    operation()
+        write.assert_not_called()
+    assert asdict(pool.entries()[0]) == before
+
+
+def test_scoped_actual_sdk_uses_process_key_and_rejects_request_auth_override(monkeypatch):
+    import httpx
+    import threading
+    from agent.agent_runtime_helpers import create_openai_client
+    real_client = httpx.Client
+    sent = []
+    checks = []
+    def provider(request):
+        sent.append(request)
+        return httpx.Response(200, json={'id': 'fixture', 'object': 'chat.completion', 'created': 1, 'model': 'gpt-6-luna', 'choices': [{'index': 0, 'message': {'role': 'assistant', 'content': 'ok'}, 'finish_reason': 'stop'}]})
+    monkeypatch.setattr(httpx, 'Client', lambda **kwargs: real_client(transport=httpx.MockTransport(provider), **kwargs))
+    monkeypatch.setenv('OPENROUTER_API_KEY', 'synthetic-process-key')
+    monkeypatch.setenv('OPENAI_ORG_ID', 'synthetic-env-org')
+    monkeypatch.setenv('OPENAI_PROJECT_ID', 'synthetic-env-project')
+    monkeypatch.setattr(policy, 'validate_dispatch', lambda agent: checks.append('live'))
+    agent = SimpleNamespace(provider='openrouter', _atlas_delegation_policy=policy.POLICY_VERSION,
+        _atlas_delegation_identities={'actor_user_id': 'actor'}, _atlas_paid_dispatch_lock=threading.Lock())
+    client = create_openai_client(agent, {'api_key': 'synthetic-config-key', 'base_url': 'https://wrong.invalid'}, reason='test', shared=True)
+    try:
+        client.chat.completions.create(model='openai/gpt-6-luna', messages=[])
+        assert sent[0].headers['authorization'] == 'Bearer synthetic-process-key'
+        assert sent[0].url.host == 'openrouter.ai'
+        assert not sent[0].headers.get('openai-organization')
+        assert not sent[0].headers.get('openai-project')
+        for header in ('aUtHoRiZaTiOn', 'X-API-Key', 'OpenAI-Organization', 'openai-project'):
+            with pytest.raises(Exception):
+                client.chat.completions.create(model='openai/gpt-6-luna', messages=[], extra_headers={header: 'synthetic-config-key'})
+        assert len(sent) == 1
+        assert len(checks) == 6
+    finally:
+        client.close()
+
+
+def test_actual_scoped_constructor_starts_no_metadata_or_terminal_background_work(monkeypatch):
+    from run_agent import AIAgent
+    monkeypatch.setenv('OPENROUTER_API_KEY', 'synthetic-process-key')
+    monkeypatch.setattr(policy, 'resolve_web_readers', lambda: {})
+    monkeypatch.setattr(policy, 'resolve_policy', lambda: ([], {}, {}))
+    with patch('hermes_cli.config.load_config', return_value={'agent': {'environment_probe': True}}), patch('agent.agent_init.fetch_model_metadata') as prewarm, patch('tools.env_probe.warm_environment_probe_async') as probe, patch('requests.get') as network, patch('agent.model_metadata.atomic_json_write') as cache, patch('openai.OpenAI') as sdk, patch('agent.credential_pool.load_pool') as pool:
+        agent = AIAgent(atlas_delegation_policy=policy.POLICY_VERSION, provider='openrouter', api_key='ignored-config-key', model='openai/gpt-6-luna', quiet_mode=True)
+        assert agent._environment_probe is False
+        assert agent.context_compressor.context_length <= 32768
+        assert sdk.call_args.kwargs['api_key'] == 'synthetic-process-key'
+        prewarm.assert_not_called()
+        probe.assert_not_called()
+        network.assert_not_called()
+        cache.assert_not_called()
+        pool.assert_not_called()
+        sdk.call_args.kwargs['http_client'].close()
+    assert not policy.credential_scope_active()
+
+
+def test_ordinary_header_merge_remains_compatible():
+    from agent.auxiliary_client import _apply_user_default_headers
+    with patch('hermes_cli.config.load_config', return_value={'model': {'default_headers': {'Authorization': 'synthetic-config'}}}):
+        assert _apply_user_default_headers({}) == {'Authorization': 'synthetic-config'}
+
+
+def test_primary_worker_establishes_credential_boundary_without_ambient_context(monkeypatch):
+    import threading
+    from agent.credential_pool import load_pool
+    agent = SimpleNamespace(_atlas_delegation_policy=policy.POLICY_VERSION)
+    failures = []
+    def worker():
+        try:
+            assert policy.credential_scope_active()
+            assert policy.current_dispatch_agent() is agent
+            with pytest.raises(policy.DelegationDenied):
+                load_pool('openrouter')
+        except BaseException as exc:
+            failures.append(exc)
+    thread = threading.Thread(target=lambda: policy.run_dispatch_worker(agent, worker))
+    thread.start()
+    thread.join(timeout=3)
+    assert not thread.is_alive() and not failures
+    assert not policy.credential_scope_active()
+
+
+def test_closed_model_client_never_constructs_sdk(monkeypatch):
+    import threading
+    agent = SimpleNamespace(_atlas_delegation_policy=policy.POLICY_VERSION,
+        _atlas_delegation_identities={}, _atlas_paid_dispatch_lock=threading.Lock(),
+        _atlas_admission_closed=True)
+    with patch('openai.OpenAI') as sdk:
+        with pytest.raises(policy.DelegationDenied, match='closed'):
+            policy.scoped_model_client('openrouter', agent=agent)
+        sdk.assert_not_called()

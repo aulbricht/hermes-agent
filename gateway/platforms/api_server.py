@@ -31,6 +31,8 @@ Requires:
 - aiohttp (already available in the gateway)
 """
 
+from agent.atlas_delegation import scoped_construction
+
 import asyncio
 import hashlib
 import hmac
@@ -1513,6 +1515,7 @@ class APIServerAdapter(BasePlatformAdapter):
         except Exception:
             return None
 
+    @scoped_construction
     def _create_agent(
         self,
         ephemeral_system_prompt: Optional[str] = None,

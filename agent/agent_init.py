@@ -273,6 +273,10 @@ def _merge_custom_provider_extra_body(agent, custom_providers: List[Dict[str, An
     agent.request_overrides = overrides
 
 
+from agent.atlas_delegation import scoped_construction
+
+
+@scoped_construction
 def init_agent(
     agent,
     base_url: str = None,
@@ -550,7 +554,7 @@ def init_agent(
     # AIAgent is created for every gateway request, so without the guard
     # each message leaks one OS thread and the process eventually exhausts
     # the system thread limit (RuntimeError: can't start new thread).
-    if (agent.provider == "openrouter" or agent._is_openrouter_url()) and \
+    if atlas_delegation_policy is None and (agent.provider == "openrouter" or agent._is_openrouter_url()) and \
             not _ra()._openrouter_prewarm_done.is_set():
         _ra()._openrouter_prewarm_done.set()
         threading.Thread(
@@ -1106,42 +1110,44 @@ def init_agent(
         # OpenAI SDK's identifying headers swap in a plain User-Agent. (#40033)
         # client_kwargs is the same dict object as agent._client_kwargs, so
         # this mutation is reflected in the client built just below.
-        agent._apply_user_default_headers()
+        if atlas_delegation_policy is None:
+            agent._apply_user_default_headers()
 
-        try:
-            from hermes_cli.config import (
-                apply_custom_provider_extra_headers_to_client_kwargs,
-                apply_custom_provider_tls_to_client_kwargs,
-                get_compatible_custom_providers,
-                load_config,
-            )
+            try:
+                from hermes_cli.config import (
+                    apply_custom_provider_extra_headers_to_client_kwargs,
+                    apply_custom_provider_tls_to_client_kwargs,
+                    get_compatible_custom_providers,
+                    load_config,
+                )
 
-            _cp_config = load_config()
-            _cp_entries = get_compatible_custom_providers(_cp_config)
-            _cp_base_url = str(client_kwargs.get("base_url") or agent.base_url or "")
-            apply_custom_provider_tls_to_client_kwargs(
-                client_kwargs,
-                _cp_base_url,
-                _cp_entries,
-            )
-            # Per-provider extra HTTP headers (providers.<name>.extra_headers /
-            # custom_providers[].extra_headers) — proxies, gateways, custom
-            # auth. Applied last so the most specific config level wins.
-            # SECURITY: values may carry credentials — never log them.
-            apply_custom_provider_extra_headers_to_client_kwargs(
-                client_kwargs,
-                _cp_base_url,
-                _cp_entries,
-            )
-        except Exception:
-            logger.debug("custom-provider TLS resolution skipped", exc_info=True)
+                _cp_config = load_config()
+                _cp_entries = get_compatible_custom_providers(_cp_config)
+                _cp_base_url = str(client_kwargs.get("base_url") or agent.base_url or "")
+                apply_custom_provider_tls_to_client_kwargs(
+                    client_kwargs,
+                    _cp_base_url,
+                    _cp_entries,
+                )
+                # Per-provider extra HTTP headers (providers.<name>.extra_headers /
+                # custom_providers[].extra_headers) — proxies, gateways, custom
+                # auth. Applied last so the most specific config level wins.
+                # SECURITY: values may carry credentials — never log them.
+                apply_custom_provider_extra_headers_to_client_kwargs(
+                    client_kwargs,
+                    _cp_base_url,
+                    _cp_entries,
+                )
+            except Exception:
+                logger.debug("custom-provider TLS resolution skipped", exc_info=True)
 
         agent.api_key = client_kwargs.get("api_key", "")
         agent.base_url = client_kwargs.get("base_url", agent.base_url)
         try:
             from agent.ssl_guard import verify_ca_bundle_with_fallback
 
-            verify_ca_bundle_with_fallback()
+            if atlas_delegation_policy is None:
+                verify_ca_bundle_with_fallback()
             agent.client = agent._create_openai_client(client_kwargs, reason="agent_init", shared=True)
             if not agent.quiet_mode:
                 print(f"🤖 AI Agent initialized with model: {agent.model}")
@@ -1500,7 +1506,7 @@ def init_agent(
     # the probe is skipped entirely (no subprocess calls, no system-prompt
     # line).  Useful for users on exotic setups where the probe heuristics
     # are noisy.
-    agent._environment_probe = bool(_agent_section.get("environment_probe", True))
+    agent._environment_probe = atlas_delegation_policy is None and bool(_agent_section.get("environment_probe", True))
     # Warm the probe off-thread: it shells out to python3/pip (~0.5s of
     # subprocess round-trips) and its result lands in the FIRST system
     # prompt build, which sits on the time-to-first-token critical path.

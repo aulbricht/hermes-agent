@@ -200,6 +200,17 @@ def scoped_requests_post(url, name, **kwargs):
 
 def scoped_runtime_kwargs(config, requested=None):
     """Process credentials plus read-only config; no auth pools/recovery/OAuth."""
+    def check_headers(value):
+        if isinstance(value, dict):
+            for name, child in value.items():
+                if name in ("default_headers", "extra_headers"):
+                    reject_auth_headers(child)
+                elif isinstance(child, (dict, list)):
+                    check_headers(child)
+        elif isinstance(value, list):
+            for child in value:
+                check_headers(child)
+    check_headers(config)
     model = config.get("model", {})
     model = model if isinstance(model, dict) else {}
     provider = requested or model.get("provider") or "openai-api"
@@ -327,6 +338,99 @@ def dispatch_tool(agent, name, args, task_id):
     return registry._normalize_handler_result(name, result)
 
 
+_credential_scope = ContextVar("atlas_delegation_credential_scope", default=False)
+
+
+def credential_scope_active():
+    return _credential_scope.get() or current_dispatch_agent() is not None
+
+
+def deny_shared_credentials():
+    if credential_scope_active():
+        raise DelegationDenied("Atlas delegation forbids shared credential recovery or writes")
+
+
+@contextmanager
+def credential_scope():
+    token = _credential_scope.set(True)
+    try:
+        yield
+    finally:
+        _credential_scope.reset(token)
+
+
+def scoped_construction(function):
+    """Trusted constructor boundary, before resolver/constructor side effects."""
+    import inspect
+    from functools import wraps
+    signature = inspect.signature(function)
+    @wraps(function)
+    def wrapped(*args, **kwargs):
+        bound = signature.bind(*args, **kwargs)
+        identities = bound.arguments.get("atlas_delegation_context")
+        policy = bound.arguments.get("atlas_delegation_policy")
+        if identities is None and policy is None:
+            return function(*args, **kwargs)
+        if policy not in (None, POLICY_VERSION):
+            raise DelegationDenied("Unknown Atlas delegation policy")
+        with credential_scope():
+            resolve_web_readers()  # Fixed implementation inventory, never ordinary probes.
+            if policy is not None:
+                runtime = scoped_runtime_kwargs({}, bound.arguments.get("provider") or "openai-api")
+                for key in ("provider", "api_key", "base_url", "api_mode", "credential_pool"):
+                    if key in signature.parameters:
+                        bound.arguments[key] = runtime[key]
+                if "quiet_mode" in signature.parameters:
+                    bound.arguments["quiet_mode"] = True
+                if "fallback_model" in signature.parameters:
+                    bound.arguments["fallback_model"] = None
+                args, kwargs = bound.args, bound.kwargs
+            if identities is not None:
+                from types import SimpleNamespace
+                bootstrap = SimpleNamespace(_atlas_delegation_policy=POLICY_VERSION,
+                    _atlas_delegation_identities=identities,
+                    _atlas_paid_dispatch_lock=threading.Lock())
+                # Live authority precedes config, SDK construction, and background work.
+                with dispatch_context(bootstrap):
+                    validate_dispatch(bootstrap)
+                    return function(*args, **kwargs)
+            return function(*args, **kwargs)
+    return wrapped
+
+
+_AUTH_HEADERS = frozenset({"authorization", "proxy-authorization", "api-key", "x-api-key",
+    "openai-organization", "openai-project", "x-openai-api-key", "x-goog-api-key"})
+
+
+def reject_auth_headers(headers):
+    if any(str(key).lower() in _AUTH_HEADERS for key in (headers or {})):
+        raise DelegationDenied("Atlas delegation forbids configured authentication headers")
+
+
+def scoped_model_client(provider, *, agent=None, headers=None, timeout=60):
+    """Isolated process-key SDK client; never user headers, pools, caches or proxies."""
+    setup_agent = agent if agent is not None and hasattr(agent, "_atlas_delegation_identities") else current_dispatch_agent()
+    if setup_agent is not None:
+        validate_dispatch(setup_agent)
+    import httpx
+    from openai import OpenAI
+    reject_auth_headers(headers)
+    runtime = scoped_runtime_kwargs({}, provider)
+    key, base_url = runtime["api_key"], runtime["base_url"]
+    def before_send(request):
+        if agent is not None and hasattr(agent, "_atlas_delegation_identities"):
+            validate_dispatch(agent)
+        if (str(request.url).split("?")[0].startswith(base_url + "/") is not True
+                or request.headers.get("authorization") != "Bearer " + key):
+            raise DelegationDenied("Atlas delegation model authentication changed")
+        if any(request.headers.get(name) for name in _AUTH_HEADERS - {"authorization"}):
+            raise DelegationDenied("Atlas delegation model authentication changed")
+    return OpenAI(api_key=key, base_url=base_url, max_retries=0,
+        organization="", project="", default_headers={}, timeout=timeout,
+        http_client=httpx.Client(trust_env=False, follow_redirects=False,
+            event_hooks={"request": [before_send]}))
+
+
 _dispatch_agent = ContextVar("atlas_delegation_dispatch_agent", default=None)
 
 
@@ -334,9 +438,18 @@ _dispatch_agent = ContextVar("atlas_delegation_dispatch_agent", default=None)
 def dispatch_context(agent):
     token = _dispatch_agent.set(agent if is_scoped(agent) else None)
     try:
-        yield
+        if is_scoped(agent):
+            with credential_scope():
+                yield
+        else:
+            yield
     finally:
         _dispatch_agent.reset(token)
+
+
+def run_dispatch_worker(agent, function):
+    with dispatch_context(agent):
+        return function()
 
 
 def validate_auxiliary_dispatch():

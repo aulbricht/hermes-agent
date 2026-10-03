@@ -283,7 +283,7 @@ def test_delegated_aux_usage_actor_bound_and_retained_after_revocation(monkeypat
     async def async_create(**kwargs):
         return create(**kwargs)
     client = SimpleNamespace(base_url="https://api.openai.com/v1", chat=SimpleNamespace(completions=SimpleNamespace(create=async_create if async_mode else create)))
-    monkeypatch.setattr(auxiliary_client, "_get_cached_client", lambda *args, **kwargs: (client, accounting.LUNA))
+    monkeypatch.setattr(auxiliary_client, "_get_scoped_atlas_auxiliary_client", lambda *args, **kwargs: (client, accounting.LUNA))
     monkeypatch.setattr(accounting, "record_completed_response", lambda *args, **kwargs: pytest.fail("delegated usage must use durable terminal settlement"))
     monkeypatch.setattr(accounting, "record_completed_response_async", lambda *args, **kwargs: pytest.fail("delegated usage must use durable terminal settlement"))
     with policy.dispatch_context(agent):
@@ -326,7 +326,7 @@ def test_failed_delegated_auxiliary_attempt_retains_observed_generation(monkeypa
     async def async_create(**kwargs):
         return create(**kwargs)
     client = SimpleNamespace(base_url="https://api.openai.com/v1", chat=SimpleNamespace(completions=SimpleNamespace(create=async_create if async_mode else create)))
-    monkeypatch.setattr(auxiliary_client, "_get_cached_client", lambda *args, **kwargs: (client, accounting.LUNA))
+    monkeypatch.setattr(auxiliary_client, "_get_scoped_atlas_auxiliary_client", lambda *args, **kwargs: (client, accounting.LUNA))
     with policy.dispatch_context(agent), pytest.raises(TimeoutError):
         if async_mode:
             asyncio.run(auxiliary_client.async_call_llm(task="compression", messages=[]))
@@ -342,3 +342,71 @@ def test_failed_delegated_auxiliary_attempt_retains_observed_generation(monkeypa
     with pytest.raises(policy.DelegationDenied, match="closed"):
         policy.admit_paid_dispatch(agent)
     assert agent._atlas_paid_dispatch_count == 1
+
+
+@pytest.mark.parametrize('async_mode', [False, True])
+@pytest.mark.parametrize('has_key', [False, True])
+def test_scoped_auxiliary_uses_isolated_process_client_no_pool_or_cache(monkeypatch, async_mode, has_key):
+    import threading
+    from unittest.mock import patch
+    from agent import atlas_delegation as policy
+    monkeypatch.setenv('ATLAS_MODEL_ROUTING_ENABLED', 'true')
+    monkeypatch.setenv('ATLAS_MODEL_ROUTING_TRANSPORT', 'openai')
+    monkeypatch.delenv('OPENAI_API_KEY', raising=False)
+    if has_key:
+        monkeypatch.setenv('OPENAI_API_KEY', 'synthetic-process-key')
+    agent = SimpleNamespace(_atlas_delegation_policy=policy.POLICY_VERSION,
+        _atlas_delegation_identities={'actor_user_id': 'actor', 'subject_user_id': 'subject', 'view_as_session_id': 'session', 'resource_type': 'chat', 'resource_id': 'turn_fixture', 'receipt_limit': '256'},
+        _atlas_paid_dispatch_lock=threading.Lock(), _atlas_paid_dispatch_count=0)
+    monkeypatch.setattr(policy, 'validate_dispatch', lambda agent: policy.check_admission_open(agent))
+    final = SimpleNamespace(id='response-process', model=accounting.LUNA, service_tier='standard',
+        usage=SimpleNamespace(input_tokens=100, output_tokens=20),
+        output=[SimpleNamespace(type='message', content=[SimpleNamespace(type='output_text', text='summary')])])
+    monkeypatch.setattr('agent.codex_runtime._consume_codex_event_stream', lambda *args, **kwargs: final)
+    sends = []
+    real = SimpleNamespace(api_key='synthetic-process-key', base_url='https://api.openai.com/v1', close=lambda: None,
+        responses=SimpleNamespace(create=lambda **kwargs: sends.append(kwargs) or SimpleNamespace(close=lambda: None)))
+    with patch('openai.OpenAI', return_value=real) as sdk, patch.object(auxiliary_client, '_get_cached_client') as cache, patch('agent.credential_pool.load_pool') as pool, patch('hermes_cli.auth._save_auth_store') as write:
+        with policy.dispatch_context(agent):
+            if not has_key:
+                with pytest.raises(policy.DelegationDenied, match='process model credential'):
+                    result = auxiliary_client.async_call_llm(task='compression', messages=[]) if async_mode else auxiliary_client.call_llm(task='compression', messages=[])
+                    if async_mode:
+                        asyncio.run(result)
+                sdk.assert_not_called()
+                assert not sends and agent._atlas_paid_dispatch_count == 0
+            else:
+                result = auxiliary_client.async_call_llm(task='compression', messages=[]) if async_mode else auxiliary_client.call_llm(task='compression', messages=[])
+                if async_mode:
+                    result = asyncio.run(result)
+                assert result.id == 'response-process'
+                assert sdk.call_args.kwargs['api_key'] == 'synthetic-process-key'
+                assert sdk.call_args.kwargs['default_headers'] == {}
+                assert len(sends) == 1 and agent._atlas_paid_dispatch_count == 1
+                assert sends[0]['user'].startswith('atlas-user-')
+                row, = policy.terminal_usage_calls(agent)
+                assert row['dispatch_status'] == 'completed' and row['generation_id'] == 'response-process'
+                sdk.call_args.kwargs['http_client'].close()
+        cache.assert_not_called()
+        pool.assert_not_called()
+        write.assert_not_called()
+
+
+@pytest.mark.parametrize('closed', [False, True])
+def test_denied_or_closed_auxiliary_starts_no_sdk_or_credential_work(monkeypatch, closed):
+    import threading
+    from unittest.mock import patch
+    from agent import atlas_delegation as policy
+    monkeypatch.setenv('ATLAS_MODEL_ROUTING_ENABLED', 'true')
+    agent = SimpleNamespace(_atlas_delegation_policy=policy.POLICY_VERSION,
+        _atlas_admission_closed=closed, _atlas_paid_dispatch_lock=threading.Lock())
+    def validate(agent):
+        policy.check_admission_open(agent)
+        raise policy.DelegationDenied('revoked')
+    monkeypatch.setattr(policy, 'validate_dispatch', validate)
+    with policy.dispatch_context(agent), patch('openai.OpenAI') as sdk, patch.object(auxiliary_client, '_get_cached_client') as cache, patch('agent.credential_pool.load_pool') as pool:
+        with pytest.raises(policy.DelegationDenied):
+            auxiliary_client.call_llm(task='compression', messages=[])
+        sdk.assert_not_called()
+        cache.assert_not_called()
+        pool.assert_not_called()
