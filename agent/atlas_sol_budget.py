@@ -6,9 +6,11 @@ not import Atlas credentials or contact Atlas accounting.
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import stat
 import uuid
+from dataclasses import asdict, dataclass, field
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Callable
@@ -20,6 +22,117 @@ OPENROUTER = "openrouter"
 OPENROUTER_RESPONSES_BASE_URL = "https://openrouter.ai/api/v1"
 
 
+@dataclass(frozen=True)
+class AdmissionPolicy:
+    """One immutable snapshot of Atlas's nonsecret per-call admission rules."""
+
+    enabled: bool
+    accounting_socket_configured: bool
+    accounting_token_file_configured: bool
+    accounting_socket_path: str = field(repr=False)
+    accounting_token_file_path: str = field(repr=False)
+    accounting_socket_ref_sha256: str
+    accounting_token_file_ref_sha256: str
+    transport: str
+    sol_model: str
+    luna_model: str
+    openrouter_provider: str
+    openrouter_base_url: str
+    openrouter_model_prefix: str
+    provider_order: tuple[str, ...]
+    provider_only: tuple[str, ...]
+    allow_fallbacks: bool
+    require_parameters: bool
+    budget_enforcement: str
+    request_service_tier: str
+    pricing_tier: str
+    default_output_tokens: int
+    max_output_tokens: int
+    long_context_threshold_bytes: int
+    standard_sol_input_usd_per_million: Decimal
+    standard_sol_output_usd_per_million: Decimal
+    long_context_sol_input_usd_per_million: Decimal
+    long_context_sol_output_usd_per_million: Decimal
+    estimated_sol_input_usd_per_million: Decimal
+    estimated_sol_cached_input_usd_per_million: Decimal
+    estimated_sol_cache_write_usd_per_million: Decimal
+    estimated_sol_output_usd_per_million: Decimal
+    luna_input_usd_per_million: Decimal
+    luna_cached_input_usd_per_million: Decimal
+    luna_cache_write_usd_per_million: Decimal
+    luna_output_usd_per_million: Decimal
+    long_context_input_multiplier: Decimal
+    long_context_output_multiplier: Decimal
+    high_price_tiers: tuple[str, ...]
+    discount_price_tiers: tuple[str, ...]
+    known_price_tiers: tuple[str, ...]
+    openrouter_margin: Decimal
+    fallback_effort: str
+
+    def public_projection(self) -> dict[str, Any]:
+        """Return only canonical, nonsecret policy values for evidence hashing."""
+        result = asdict(self)
+        result.pop("accounting_socket_path")
+        result.pop("accounting_token_file_path")
+        for key, value in tuple(result.items()):
+            if isinstance(value, Decimal):
+                result[key] = str(value)
+            elif isinstance(value, tuple):
+                result[key] = list(value)
+        return result
+
+
+def capture_admission_policy() -> AdmissionPolicy:
+    """Capture current nonsecret inputs once; performs no I/O or provider calls."""
+    socket_path = os.environ.get("ATLAS_SOL_ACCOUNTING_SOCKET", "")
+    token_file_path = os.environ.get("ATLAS_SOL_ACCOUNTING_TOKEN_FILE", "")
+    socket_configured = bool(socket_path)
+    token_file_configured = bool(token_file_path)
+    enabled = (os.environ.get("ATLAS_MODEL_ROUTING_ENABLED") == "true"
+               or socket_configured or token_file_configured)
+    return AdmissionPolicy(
+        enabled=enabled,
+        accounting_socket_configured=socket_configured,
+        accounting_token_file_configured=token_file_configured,
+        accounting_socket_path=socket_path, accounting_token_file_path=token_file_path,
+        accounting_socket_ref_sha256=hashlib.sha256(socket_path.encode()).hexdigest() if socket_path else "",
+        accounting_token_file_ref_sha256=hashlib.sha256(token_file_path.encode()).hexdigest() if token_file_path else "",
+        transport=_transport(), sol_model=SOL, luna_model=LUNA,
+        openrouter_provider=OPENROUTER,
+        openrouter_base_url=OPENROUTER_RESPONSES_BASE_URL,
+        openrouter_model_prefix="openai/",
+        provider_order=("openai",), provider_only=("openai",),
+        allow_fallbacks=False, require_parameters=True,
+        budget_enforcement="external_accounting_reservation_service",
+        request_service_tier="auto", pricing_tier="standard",
+        default_output_tokens=128_000, max_output_tokens=128_000,
+        long_context_threshold_bytes=272_000,
+        standard_sol_input_usd_per_million=Decimal("2.50"),
+        standard_sol_output_usd_per_million=Decimal("10"),
+        long_context_sol_input_usd_per_million=Decimal("5"),
+        long_context_sol_output_usd_per_million=Decimal("15"),
+        estimated_sol_input_usd_per_million=Decimal("2"),
+        estimated_sol_cached_input_usd_per_million=Decimal("0.10"),
+        estimated_sol_cache_write_usd_per_million=Decimal("2.50"),
+        estimated_sol_output_usd_per_million=Decimal("10"),
+        luna_input_usd_per_million=Decimal("0.10"),
+        luna_cached_input_usd_per_million=Decimal("0.01"),
+        luna_cache_write_usd_per_million=Decimal("0.125"),
+        luna_output_usd_per_million=Decimal("0.50"),
+        long_context_input_multiplier=Decimal("2"),
+        long_context_output_multiplier=Decimal("1.5"),
+        high_price_tiers=("fast", "priority"),
+        discount_price_tiers=("flex", "batch"),
+        known_price_tiers=("standard", "default", "auto", "flex", "batch", "fast", "priority"),
+        openrouter_margin=Decimal("1.05"), fallback_effort="xhigh",
+    )
+
+
+def canonical_admission_policy_projection(policy: AdmissionPolicy | None = None) -> dict[str, Any]:
+    """Canonical nonsecret projection for the owner generation publisher."""
+    return (policy or capture_admission_policy()).public_projection()
+
+
 def _transport() -> str:
     value = os.environ.get("ATLAS_MODEL_ROUTING_TRANSPORT", "openai").strip().lower()
     if value not in {"openai", OPENROUTER}:
@@ -27,32 +140,36 @@ def _transport() -> str:
     return value
 
 
-def _canonical_model(model: Any) -> str:
+def _canonical_model(model: Any, policy: AdmissionPolicy | None = None) -> str:
     value = str(model or "").strip()
-    if value.startswith("openai/"):
-        value = value[len("openai/"):]
+    prefix = policy.openrouter_model_prefix if policy else "openai/"
+    if value.startswith(prefix):
+        value = value[len(prefix):]
     return value
 
 
-def _routed_model(model: str, transport: str) -> str:
-    return f"openai/{model}" if transport == OPENROUTER else model
+def _routed_model(model: str, transport: str, policy: AdmissionPolicy | None = None) -> str:
+    prefix = policy.openrouter_model_prefix if policy else "openai/"
+    is_openrouter = transport == (policy.openrouter_provider if policy else OPENROUTER)
+    return f"{prefix}{model}" if is_openrouter else model
 
 
-def _pin_openrouter_provider(payload: dict[str, Any]) -> dict[str, Any]:
+def _pin_openrouter_provider(payload: dict[str, Any], policy: AdmissionPolicy | None = None) -> dict[str, Any]:
     """Pin OpenRouter Responses requests to OpenAI, with no provider fallback."""
     routed = dict(payload)
+    policy = policy or capture_admission_policy()
     extra = routed.get("extra_body")
     extra = dict(extra) if isinstance(extra, dict) else {}
     extra["provider"] = {
-        "order": ["openai"], "only": ["openai"],
-        "allow_fallbacks": False, "require_parameters": True,
+        "order": list(policy.provider_order), "only": list(policy.provider_only),
+        "allow_fallbacks": policy.allow_fallbacks, "require_parameters": policy.require_parameters,
     }
     routed["extra_body"] = extra
     # OpenRouter's default Responses tier is the standard tier. Strip any
     # mutable caller override so neither flex nor priority can be requested.
     # OpenRouter's Responses request enum uses `auto` for the default
     # provider tier; `default` is its normalized response label.
-    routed["service_tier"] = "auto"
+    routed["service_tier"] = policy.request_service_tier
     return routed
 
 
@@ -92,25 +209,26 @@ def _read_token(path: Path) -> str:
     return value
 
 
-def _maximum_usd(payload: dict[str, Any]) -> Decimal:
+def _maximum_usd(payload: dict[str, Any], policy: AdmissionPolicy | None = None) -> Decimal:
+    policy = policy or capture_admission_policy()
     _validate_bounded_text_request(payload)
     # Full serialized text bytes bound token counts, including function schemas. Above 272K
     # input tokens OpenAI applies its long-context price to the whole request.
     input_bound = len(json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
-    output_bound = int(payload.get("max_output_tokens") or payload.get("max_tokens") or 128_000)
-    if output_bound < 1 or output_bound > 128_000:
+    output_bound = int(payload.get("max_output_tokens") or payload.get("max_tokens") or policy.default_output_tokens)
+    if output_bound < 1 or output_bound > policy.max_output_tokens:
         raise ValueError("invalid_atlas_sol_output_limit")
-    long_context = input_bound > 272_000
-    input_rate = Decimal("5") if long_context else Decimal("2.50")
-    output_rate = Decimal("15") if long_context else Decimal("10")
+    long_context = input_bound > policy.long_context_threshold_bytes
+    input_rate = policy.long_context_sol_input_usd_per_million if long_context else policy.standard_sol_input_usd_per_million
+    output_rate = policy.long_context_sol_output_usd_per_million if long_context else policy.standard_sol_output_usd_per_million
     tier = str(payload.get("service_tier") or "standard").lower()
-    if tier not in {"standard", "default", "auto", "flex", "batch", "fast", "priority"}:
+    if tier not in policy.known_price_tiers:
         raise ValueError("unknown_atlas_sol_price_tier")
     # Reserve at least Standard even for Flex/Batch because the provider may
     # process a retried request at a different tier.
-    tier_factor = Decimal(2) if tier in {"fast", "priority"} else Decimal(1)
+    tier_factor = Decimal(2) if tier in policy.high_price_tiers else Decimal(1)
     reserve = tier_factor * (Decimal(input_bound) * input_rate + Decimal(output_bound) * output_rate) / Decimal(1_000_000)
-    return reserve * (Decimal("1.05") if _transport() == OPENROUTER else Decimal(1))
+    return reserve * (policy.openrouter_margin if policy.transport == policy.openrouter_provider else Decimal(1))
 
 
 def _field(value: Any, key: str, default=None):
@@ -148,7 +266,8 @@ def openai_usage_fields(response: Any) -> dict[str, Any]:
     return fields
 
 
-def _estimated_usd(response: Any, reserved: Decimal) -> Decimal:
+def _estimated_usd(response: Any, reserved: Decimal, policy: AdmissionPolicy | None = None) -> Decimal:
+    policy = policy or capture_admission_policy()
     usage = _field(response, "usage")
     if usage is None:
         return reserved
@@ -162,27 +281,33 @@ def _estimated_usd(response: Any, reserved: Decimal) -> Decimal:
     cached = max(0, int(_field(detail, "cached_tokens", 0) or 0)) if detail else 0
     cached = min(cached, input_count)
     writes = min(input_count - cached, max(0, int(_field(detail, "cache_write_tokens", 0) or 0))) if detail else 0
-    long_context = input_count > 272_000
-    multiplier = Decimal(2) if long_context else Decimal(1)
-    output_multiplier = Decimal("1.5") if long_context else Decimal(1)
-    model = _canonical_model(_field(response, "model", SOL))
-    if model == LUNA:
+    long_context = input_count > policy.long_context_threshold_bytes
+    multiplier = policy.long_context_input_multiplier if long_context else Decimal(1)
+    output_multiplier = policy.long_context_output_multiplier if long_context else Decimal(1)
+    model = _canonical_model(_field(response, "model", policy.sol_model), policy)
+    if model == policy.luna_model:
         input_rate, cached_rate, write_rate, output_rate = (
-            Decimal("0.10"), Decimal("0.01"), Decimal("0.125"), Decimal("0.50"),
+            policy.luna_input_usd_per_million, policy.luna_cached_input_usd_per_million,
+            policy.luna_cache_write_usd_per_million, policy.luna_output_usd_per_million,
         )
     else:
         input_rate, cached_rate, write_rate, output_rate = (
-            Decimal("2"), Decimal("0.10"), Decimal("2.50"), Decimal("10"),
+            policy.estimated_sol_input_usd_per_million,
+            policy.estimated_sol_cached_input_usd_per_million,
+            policy.estimated_sol_cache_write_usd_per_million,
+            policy.estimated_sol_output_usd_per_million,
         )
     result = ((Decimal(input_count - cached - writes) * input_rate + Decimal(cached) * cached_rate + Decimal(writes) * write_rate) * multiplier
               + Decimal(output_count) * output_rate * output_multiplier) / Decimal(1_000_000)
     tier = str(_field(response, "service_tier", "standard") or "standard").lower()
-    result *= Decimal(2) if tier in {"fast", "priority"} else Decimal("0.5") if tier in {"flex", "batch"} else Decimal(1)
-    return result * (Decimal("1.05") if _transport() == OPENROUTER else Decimal(1))
+    result *= (Decimal(2) if tier in policy.high_price_tiers
+               else Decimal("0.5") if tier in policy.discount_price_tiers else Decimal(1))
+    return result * (policy.openrouter_margin if policy.transport == policy.openrouter_provider else Decimal(1))
 
 
-def _cost_components(response: Any, reserved: Decimal) -> dict[str, Any]:
+def _cost_components(response: Any, reserved: Decimal, policy: AdmissionPolicy | None = None) -> dict[str, Any]:
     """Return content-free OpenRouter cost components and a safe Sol estimate."""
+    policy = policy or capture_admission_policy()
     usage = _field(response, "usage")
     details = _field(usage, "cost_details")
     raw_cost = _field(usage, "cost")
@@ -211,7 +336,7 @@ def _cost_components(response: Any, reserved: Decimal) -> dict[str, Any]:
         reported_total = charged
         estimated = False
     else:
-        reported_total = _estimated_usd(response, reserved)
+        reported_total = _estimated_usd(response, reserved, policy)
         estimated = True
     return {
         "actual_cost_usd": None if charged is None else str(charged),
@@ -234,26 +359,67 @@ def _post(socket_path: str, token: str, path: str, body: dict[str, Any]) -> dict
 
 
 def admitted_call(agent: Any, payload: dict[str, Any], perform: Callable[[dict[str, Any]], Any]) -> Any:
-    socket_path = os.environ.get("ATLAS_SOL_ACCOUNTING_SOCKET", "")
-    enabled = os.environ.get("ATLAS_MODEL_ROUTING_ENABLED") == "true" or bool(socket_path) or bool(os.environ.get("ATLAS_SOL_ACCOUNTING_TOKEN_FILE"))
+    try:
+        resolution_guard = vars(agent).get("_atlas_resolution_guard")
+    except TypeError:
+        resolution_guard = None
+    # Preserve legacy pass-through exactly when Atlas routing is disabled and
+    # this is not a generation-guarded turn.
+    if resolution_guard is None:
+        enabled = (os.environ.get("ATLAS_MODEL_ROUTING_ENABLED") == "true"
+                   or bool(os.environ.get("ATLAS_SOL_ACCOUNTING_SOCKET", ""))
+                   or bool(os.environ.get("ATLAS_SOL_ACCOUNTING_TOKEN_FILE", "")))
+        if not enabled:
+            return perform(payload)
+    if resolution_guard is not None:
+        # The accepted generation owns the frozen policy used for the entire
+        # request. Capture live globals once, compare them to that policy, then
+        # route/reserve/fallback only from the prepared snapshot.
+        from gateway.atlas_resolution import ResolutionDrift
+        policy = resolution_guard.prepared.policy
+        live_policy = capture_admission_policy()
+        resolution_guard.check_policy(live_policy)
+        if live_policy.public_projection() != policy.public_projection():
+            raise ResolutionDrift()
+    else:
+        policy = capture_admission_policy()
+    socket_path = policy.accounting_socket_path
+    enabled = policy.enabled
     if enabled:
         agent._atlas_sol_last_call = {}
+
+    def dispatch(outbound):
+        # Optional v1 observation is best effort and precedes the generation
+        # gate so that the gate check is the last operation before provider I/O.
+        try:
+            if enabled:
+                from gateway.atlas_runtime_evidence import record_dispatch
+                record_dispatch(agent, outbound)
+        except Exception:
+            pass  # Optional metadata must never interfere with admission.
+        # This observes the final payload after any Sol->Luna rewrite. A gate
+        # failure propagates and prevents the provider callable from running.
+        if resolution_guard is not None:
+            resolution_guard.check_dispatch(agent, outbound, policy)
+        return perform(outbound)
+
     if not enabled:
-        return perform(payload)
-    transport = _transport()
-    requested_model = _canonical_model(payload.get("model"))
+        return dispatch(payload)
+
+    transport = policy.transport
+    requested_model = _canonical_model(payload.get("model"), policy)
     routed_payload = dict(payload)
     if transport == OPENROUTER:
-        routed_payload["model"] = _routed_model(requested_model, transport)
-        routed_payload = _pin_openrouter_provider(routed_payload)
-    if requested_model != SOL:
-        return perform(routed_payload)
+        routed_payload["model"] = _routed_model(requested_model, policy.transport, policy)
+        routed_payload = _pin_openrouter_provider(routed_payload, policy)
+    if requested_model != policy.sol_model:
+        return dispatch(routed_payload)
     reservation_id = "sol-" + uuid.uuid4().hex
     try:
         if not socket_path:
             raise ValueError("atlas_accounting_socket_missing")
-        maximum = _maximum_usd(routed_payload)
-        token_path = Path(os.environ["ATLAS_SOL_ACCOUNTING_TOKEN_FILE"])
+        maximum = _maximum_usd(routed_payload, policy)
+        token_path = Path(policy.accounting_token_file_path)
         token = _read_token(token_path)
         reservation = _post(socket_path, token, "/v1/sol/reservations", {
             "reservation_id": reservation_id, "user_id": "atlas-hermes", "max_usd": str(maximum),
@@ -265,17 +431,22 @@ def admitted_call(agent: Any, payload: dict[str, Any], perform: Callable[[dict[s
         # A failed gate cannot authorize Sol. Switch the current agent too so
         # subsequent tool iterations stay on Luna for this turn.
         routed_payload = dict(routed_payload)
-        routed_payload["model"] = _routed_model(LUNA, transport)
-        routed_payload["reasoning"] = {"effort": "xhigh"}
+        routed_payload["model"] = _routed_model(policy.luna_model, transport, policy)
+        routed_payload["reasoning"] = {"effort": policy.fallback_effort}
         routed_payload.pop("reasoning_effort", None)
         if transport == OPENROUTER:
-            routed_payload = _pin_openrouter_provider(routed_payload)
-        agent.model = _routed_model(LUNA, transport)
-        agent.reasoning_config = {"enabled": True, "effort": "xhigh"}
+            routed_payload = _pin_openrouter_provider(routed_payload, policy)
+        if resolution_guard is not None:
+            agent._atlas_sol_budget_fallback = resolution_guard.authorize_budget_fallback(
+                policy, source_model=_routed_model(policy.sol_model, transport, policy),
+                target_model=routed_payload["model"], effort=policy.fallback_effort,
+            )
+        agent.model = _routed_model(policy.luna_model, transport, policy)
+        agent.reasoning_config = {"enabled": True, "effort": policy.fallback_effort}
         agent._atlas_sol_last_call = {"route_request_id": getattr(agent, "_atlas_route_request_id", None), "reservation_id": None, "actual_model": agent.model}
-        return perform(routed_payload)
+        return dispatch(routed_payload)
     try:
-        response = perform(routed_payload)
+        response = dispatch(routed_payload)
     except BaseException:
         # A streamed or interrupted call can still have incurred provider cost.
         # Hold the full estimate when usage is unavailable.
@@ -287,8 +458,8 @@ def admitted_call(agent: Any, payload: dict[str, Any], perform: Callable[[dict[s
             pass  # Keep the reservation and preserve the transport exception.
         raise
     try:
-        components = _cost_components(response, maximum) if transport == OPENROUTER else {}
-        estimated = Decimal(components["byok_total_cost_usd"]) if components else _estimated_usd(response, maximum)
+        components = _cost_components(response, maximum, policy) if transport == OPENROUTER else {}
+        estimated = Decimal(components["byok_total_cost_usd"]) if components else _estimated_usd(response, maximum, policy)
         generation_id = str(_field(response, "id", "") or "")
         actual_model = str(_field(response, "model", routed_payload["model"]) or routed_payload["model"])
         agent._atlas_sol_last_call = {

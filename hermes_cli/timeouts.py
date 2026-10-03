@@ -12,17 +12,18 @@ def _coerce_timeout(raw: object) -> float | None:
 
 
 def get_provider_request_timeout(
-    provider_id: str, model: str | None = None
+    provider_id: str, model: str | None = None, *, config: dict | None = None
 ) -> float | None:
-    """Return a configured provider request timeout in seconds, if any."""
+    """Return a configured provider timeout, using *config* when supplied."""
     if not provider_id:
         return None
 
-    try:
-        from hermes_cli.config import load_config_readonly
-        config = load_config_readonly()
-    except Exception:
-        return None
+    if config is None:
+        try:
+            from hermes_cli.config import load_config_readonly
+            config = load_config_readonly()
+        except Exception:
+            return None
 
     providers = config.get("providers", {}) if isinstance(config, dict) else {}
     provider_config = (

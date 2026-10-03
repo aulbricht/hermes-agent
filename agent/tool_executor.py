@@ -328,6 +328,9 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     Results are collected in the original tool-call order and appended to
     messages so the API sees them in the expected sequence.
     """
+    atlas_guard = vars(agent).get("_atlas_resolution_guard")
+    if atlas_guard is not None:
+        atlas_guard.check_tool_execution(agent)
     tool_calls = assistant_message.tool_calls
     num_tools = len(tool_calls)
 
@@ -1021,6 +1024,9 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
 
 def execute_tool_calls_sequential(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
     """Execute tool calls sequentially (original behavior). Used for single calls or interactive tools."""
+    atlas_guard = vars(agent).get("_atlas_resolution_guard")
+    if atlas_guard is not None:
+        atlas_guard.check_tool_execution(agent)
     # Resolve the context-scaled tool-output budget once per turn.
     _tool_budget = _budget_for_agent(agent)
     for i, tool_call in enumerate(assistant_message.tool_calls, 1):

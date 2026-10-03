@@ -244,3 +244,134 @@ def test_luna_summary_usage_is_included_in_turn_receipts(monkeypatch):
     assert call["provider"] == "openai" and call["route_request_id"] == "turn-fixture"
     assert call["input_tokens"] == 20 and call["input_tokens_total"] == 100 and call["output_tokens"] == 50
     assert call["cache_read_tokens"] == 80 and call["reasoning_tokens"] == 20
+
+
+def test_admission_policy_snapshot_is_frozen_and_projection_excludes_paths(monkeypatch):
+    monkeypatch.setenv("ATLAS_MODEL_ROUTING_ENABLED", "true")
+    monkeypatch.setenv("ATLAS_MODEL_ROUTING_TRANSPORT", "openrouter")
+    monkeypatch.setenv("ATLAS_SOL_ACCOUNTING_SOCKET", "/private/run/accounting.sock")
+    monkeypatch.setenv("ATLAS_SOL_ACCOUNTING_TOKEN_FILE", "/private/run/token")
+    policy = budget.capture_admission_policy()
+    projection = budget.canonical_admission_policy_projection(policy)
+    assert policy.enabled is True
+    assert policy.transport == "openrouter"
+    assert policy.sol_model == "gpt-6.1-sol"
+    assert policy.luna_model == "gpt-6-luna"
+    assert projection["provider_order"] == ["openai"]
+    assert projection["provider_only"] == ["openai"]
+    assert projection["allow_fallbacks"] is False
+    assert projection["require_parameters"] is True
+    assert projection["request_service_tier"] == "auto"
+    assert "/private/run" not in repr(projection)
+    assert policy.accounting_socket_ref_sha256
+    assert policy.accounting_token_file_ref_sha256
+    monkeypatch.setenv("ATLAS_MODEL_ROUTING_TRANSPORT", "openai")
+    monkeypatch.setattr(budget, "SOL", "changed-sol")
+    assert policy.transport == "openrouter"
+    assert policy.sol_model == "gpt-6.1-sol"
+    assert budget.canonical_admission_policy_projection() != projection
+
+
+def test_guarded_admission_uses_one_policy_snapshot_through_luna_fallback(monkeypatch):
+    monkeypatch.setenv("ATLAS_MODEL_ROUTING_ENABLED", "true")
+    monkeypatch.setenv("ATLAS_MODEL_ROUTING_TRANSPORT", "openrouter")
+    monkeypatch.setenv("ATLAS_SOL_ACCOUNTING_SOCKET", "/tmp/test-accounting.sock")
+    monkeypatch.setenv("ATLAS_SOL_ACCOUNTING_TOKEN_FILE", "/tmp/test-accounting-token")
+    monkeypatch.setattr(budget, "_read_token", lambda _path: "fixture-token")
+    events = []
+
+    def post(_socket, _token, path, body):
+        events.append((path, body))
+        return {"status": "denied"}
+
+    monkeypatch.setattr(budget, "_post", post)
+    checked = []
+    prepared_policy = budget.capture_admission_policy()
+
+    class Guard:
+        prepared = SimpleNamespace(policy=prepared_policy)
+
+        def check_policy(self, policy):
+            checked.append(("policy", policy))
+            # Prove routing/limit/pinning after this point use the frozen input.
+            monkeypatch.setenv("ATLAS_MODEL_ROUTING_TRANSPORT", "openai")
+            monkeypatch.setattr(budget, "SOL", "changed-sol")
+            monkeypatch.setattr(budget, "LUNA", "changed-luna")
+
+        def check_dispatch(self, agent, outbound, policy):
+            checked.append(("dispatch", policy, dict(outbound)))
+
+        def authorize_budget_fallback(self, policy, source_model, target_model, effort):
+            checked.append(("fallback-authorized", policy, source_model, target_model, effort))
+            return "authorized-marker"
+
+    agent = SimpleNamespace(model=budget.SOL, _atlas_resolution_guard=Guard())
+    seen = {}
+
+    def perform(payload):
+        seen.update(payload)
+        return "ok"
+
+    assert budget.admitted_call(
+        agent, {"model": "gpt-6.1-sol", "max_output_tokens": 500, "input": "hello"}, perform,
+    ) == "ok"
+    reserved_payload = budget._pin_openrouter_provider(
+        {"model": "openai/gpt-6.1-sol", "max_output_tokens": 500, "input": "hello"}, checked[0][1],
+    )
+    assert Decimal(events[0][1]["max_usd"]) == budget._maximum_usd(reserved_payload, checked[0][1])
+    assert seen["model"] == "openai/gpt-6-luna"
+    assert seen["extra_body"]["provider"] == {
+        "order": ["openai"], "only": ["openai"],
+        "allow_fallbacks": False, "require_parameters": True,
+    }
+    assert seen["service_tier"] == "auto"
+    assert seen["reasoning"]["effort"] == "xhigh"
+    assert [item[0] for item in checked] == ["policy", "fallback-authorized", "dispatch"]
+    assert checked[2][1] is prepared_policy
+    assert checked[2][2]["model"] == "openai/gpt-6-luna"
+    assert agent._atlas_sol_budget_fallback == "authorized-marker"
+
+
+def test_guard_rejections_propagate_before_reservation_or_provider_dispatch(monkeypatch):
+    import pytest
+
+    monkeypatch.setenv("ATLAS_MODEL_ROUTING_ENABLED", "true")
+    monkeypatch.setenv("ATLAS_SOL_ACCOUNTING_SOCKET", "/tmp/test-accounting.sock")
+    monkeypatch.setenv("ATLAS_SOL_ACCOUNTING_TOKEN_FILE", "/tmp/test-accounting-token")
+    monkeypatch.setattr(budget, "_read_token", lambda _path: "fixture-token")
+    events = []
+    monkeypatch.setattr(budget, "_post", lambda *_args: events.append("reserve") or {"status": "reserved"})
+
+    class PolicyGuard:
+        prepared = SimpleNamespace(policy=budget.capture_admission_policy())
+
+        def check_policy(self, _policy):
+            raise RuntimeError("policy drift")
+
+        def check_dispatch(self, _agent, _payload, _policy):
+            raise RuntimeError("dispatch drift")
+
+    with pytest.raises(RuntimeError, match="policy drift"):
+        budget.admitted_call(
+            SimpleNamespace(model=budget.SOL, _atlas_resolution_guard=PolicyGuard()),
+            {"model": budget.SOL, "max_output_tokens": 500}, lambda _payload: pytest.fail("dispatched"),
+        )
+    assert events == []
+
+    # When dispatch validation rejects after reservation, it still propagates
+    # and the provider callable remains untouched.
+    class DispatchGuard:
+        prepared = SimpleNamespace(policy=budget.capture_admission_policy())
+
+        def check_policy(self, _policy):
+            return None
+
+        def check_dispatch(self, _agent, _payload, _policy):
+            raise RuntimeError("dispatch drift")
+
+    with pytest.raises(RuntimeError, match="dispatch drift"):
+        budget.admitted_call(
+            SimpleNamespace(model=budget.SOL, _atlas_resolution_guard=DispatchGuard()),
+            {"model": budget.SOL, "max_output_tokens": 500}, lambda _payload: pytest.fail("dispatched"),
+        )
+    assert events == ["reserve", "reserve"]
