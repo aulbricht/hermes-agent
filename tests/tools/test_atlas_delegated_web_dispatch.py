@@ -234,22 +234,24 @@ def test_scoped_firecrawl_redirect_is_rejected_before_second_send(monkeypatch, s
     checks = []
     monkeypatch.setattr(policy, "tool_allowed", lambda agent, name: checks.append(name) or True)
     monkeypatch.setenv("FIRECRAWL_API_KEY", "fixture")
-    transport = SimpleNamespace(_build_url=lambda endpoint: "https://api.firecrawl.dev" + endpoint, _prepare_headers=lambda: {})
+    transport = SimpleNamespace(_build_url=lambda endpoint: "https://api.firecrawl.dev" + endpoint, _prepare_headers=lambda: {"Authorization": "Bearer fixture"})
     sdk = SimpleNamespace(_v2_client=SimpleNamespace(http_client=transport))
     sdk.search = lambda **kwargs: transport.post("/v2/search", kwargs)
     monkeypatch.setitem(sys.modules, "firecrawl", SimpleNamespace(Firecrawl=lambda **kwargs: sdk))
     response = requests.Response()
     response.status_code = status
     response.headers["Location"] = "https://api.firecrawl.dev/second"
-    def send(*args, **kwargs):
+    def send(self, prepared, **kwargs):
+        assert self.trust_env is False
+        assert prepared.headers["Authorization"] == "Bearer fixture"
         assert kwargs["allow_redirects"] is False
         agent._atlas_admission_closed = True
         return response
-    with patch("requests.post", side_effect=send) as actual, policy.dispatch_context(agent):
+    with patch("requests.Session.send", autospec=True, side_effect=send) as actual, policy.dispatch_context(agent):
         result = firecrawl.FirecrawlWebSearchProvider().search("read")
     assert result["success"] is False and "redirect" in result["error"]
     actual.assert_called_once()
-    assert checks == ["web_search", "web_search"]
+    assert checks == ["web_search", "web_search", "web_search"]
 
 
 @pytest.mark.parametrize("async_mode", [False, True])
@@ -262,6 +264,7 @@ def test_scoped_parallel_transport_does_not_follow_redirects(monkeypatch, async_
     checks, sends = [], []
     monkeypatch.setattr(policy, "tool_allowed", lambda agent, name: checks.append(name) or True)
     def sdk(**kwargs):
+        kwargs["http_client"].headers["x-api-key"] = kwargs["api_key"]
         return kwargs["http_client"]
     monkeypatch.setitem(sys.modules, "parallel", SimpleNamespace(Parallel=sdk, AsyncParallel=sdk))
     def send(request):
@@ -314,15 +317,110 @@ def test_scoped_exa_sdk_request_rejects_redirect_without_second_hop(monkeypatch)
     import sys
     from plugins.web.exa import provider as exa
     monkeypatch.setenv("EXA_API_KEY", "fixture")
-    client = SimpleNamespace(headers={}, base_url="https://api.exa.ai")
+    client = SimpleNamespace(headers={"x-api-key": "fixture"}, base_url="https://api.exa.ai")
     monkeypatch.setitem(sys.modules, "exa_py", SimpleNamespace(Exa=lambda **kwargs: client))
     monkeypatch.setitem(sys.modules, "exa_py.api", SimpleNamespace(ExaJSONEncoder=json.JSONEncoder))
     agent = SimpleNamespace(_atlas_delegation_policy=policy.POLICY_VERSION, _atlas_paid_dispatch_lock=threading.Lock())
     monkeypatch.setattr(policy, "tool_allowed", lambda *args: True)
     response = SimpleNamespace(status_code=307)
-    with policy.dispatch_context(agent), patch("requests.post", return_value=response) as send:
+    with policy.dispatch_context(agent), patch("requests.Session.send", return_value=response) as send:
         actual = exa._get_exa_client()
         with pytest.raises(policy.DelegationDenied, match="redirect"):
             actual.request("/search", {"query": "read"})
     send.assert_called_once()
     assert send.call_args.kwargs["allow_redirects"] is False
+
+
+@pytest.mark.parametrize('backend', ['firecrawl', 'exa'])
+def test_actual_scoped_sdk_requests_never_load_netrc_and_keep_process_auth(monkeypatch, backend):
+    import importlib
+    import requests
+    provider = importlib.import_module('plugins.web.' + backend + '.provider')
+    key_env = 'FIRECRAWL_API_KEY' if backend == 'firecrawl' else 'EXA_API_KEY'
+    monkeypatch.setenv(key_env, 'synthetic-process-key')
+    monkeypatch.setenv('HTTP_PROXY', 'http://synthetic-ambient-proxy.invalid')
+    monkeypatch.setenv('HTTPS_PROXY', 'http://synthetic-ambient-proxy.invalid')
+    agent = SimpleNamespace(_atlas_delegation_policy=policy.POLICY_VERSION, _atlas_paid_dispatch_lock=threading.Lock())
+    monkeypatch.setattr(policy, 'tool_allowed', lambda *args: True)
+    sends, preparation = [], []
+    original = requests.Session.prepare_request
+    def prepare(session, request):
+        assert session.trust_env is False and session.auth is None and not session.cookies
+        assert session.get_adapter(request.url).max_retries.total == 0
+        preparation.append(True)
+        return original(session, request)
+    def send(adapter, prepared, **kwargs):
+        assert kwargs['proxies'] == {} and kwargs['verify'] is True
+        assert kwargs['stream'] is False
+        expected = ('Authorization', 'Bearer synthetic-process-key') if backend == 'firecrawl' else ('x-api-key', 'synthetic-process-key')
+        assert prepared.headers[expected[0]] == expected[1]
+        assert not prepared.headers.get('Cookie')
+        if backend == 'exa':
+            assert not prepared.headers.get('Authorization')
+        sends.append(prepared)
+        response = requests.Response()
+        response.status_code = 200
+        response.request = prepared
+        response.url = prepared.url
+        response._content = json.dumps({'success': True, 'data': {'web': []}} if backend == 'firecrawl' else {'results': [], 'requestId': 'synthetic'}).encode()
+        return response
+    with policy.dispatch_context(agent), patch('requests.sessions.get_netrc_auth', side_effect=AssertionError('Forbidden netrc lookup')) as netrc, patch('requests.sessions.get_environ_proxies', side_effect=AssertionError('Forbidden ambient proxy lookup')) as proxies, patch.object(requests.Session, 'prepare_request', autospec=True, side_effect=prepare), patch.object(requests.adapters.HTTPAdapter, 'send', autospec=True, side_effect=send):
+        # Actual installed frozen SDK constructors and their real header preparation.
+        # Missing frozen extras are a test setup failure, never a silent skip.
+        client = getattr(provider, '_get_firecrawl_client' if backend == 'firecrawl' else '_get_exa_client')()
+        if backend == 'firecrawl':
+            client.search('read')
+        else:
+            client.request('/search', {'query': 'read'})
+        netrc.assert_not_called()
+        proxies.assert_not_called()
+    assert len(sends) == len(preparation) == 1
+
+
+@pytest.mark.parametrize('change', ['revoked', 'auth', 'cookie'])
+def test_requests_send_rechecks_prepared_auth_and_live_authority(monkeypatch, change):
+    import requests
+    monkeypatch.setenv('FIRECRAWL_API_KEY', 'synthetic-process-key')
+    live = [True]
+    agent = SimpleNamespace(_atlas_delegation_policy=policy.POLICY_VERSION, _atlas_paid_dispatch_lock=threading.Lock())
+    monkeypatch.setattr(policy, 'tool_allowed', lambda *args: live[0])
+    original = requests.Session.prepare_request
+    def prepare(session, request):
+        prepared = original(session, request)
+        if change == 'revoked':
+            live[0] = False
+        elif change == 'auth':
+            prepared.headers['Authorization'] = 'Basic synthetic-stored-auth'
+        else:
+            prepared.headers['Cookie'] = 'synthetic-stored-cookie'
+        return prepared
+    with policy.dispatch_context(agent), patch.object(requests.Session, 'prepare_request', autospec=True, side_effect=prepare), patch.object(requests.adapters.HTTPAdapter, 'send') as send:
+        with pytest.raises(policy.DelegationDenied):
+            policy.scoped_requests_post('https://api.firecrawl.dev/v2/search', 'web_search',
+                credential_env='FIRECRAWL_API_KEY', headers={'Authorization': 'Bearer synthetic-process-key'}, json={'query': 'read'})
+        send.assert_not_called()
+
+
+def test_scoped_tavily_has_isolated_prepared_transport(monkeypatch):
+    import httpx
+    from plugins.web.tavily import provider as tavily
+    monkeypatch.setenv('TAVILY_API_KEY', 'synthetic-process-key')
+    monkeypatch.setenv('HTTPS_PROXY', 'http://synthetic-ambient-proxy.invalid')
+    agent = SimpleNamespace(_atlas_delegation_policy=policy.POLICY_VERSION, _atlas_paid_dispatch_lock=threading.Lock())
+    checks, sends = [], []
+    monkeypatch.setattr(policy, 'tool_allowed', lambda agent, name: checks.append(name) or True)
+    def send(request):
+        assert json.loads(request.content)['api_key'] == 'synthetic-process-key'
+        assert not request.headers.get('authorization') and not request.headers.get('cookie')
+        sends.append(request)
+        return httpx.Response(200, json={'results': []})
+    original = httpx.Client
+    class IsolatedClient(original):
+        def __init__(self, **kwargs):
+            assert kwargs['trust_env'] is False and kwargs['follow_redirects'] is False
+            super().__init__(transport=httpx.MockTransport(send), **kwargs)
+    monkeypatch.setattr(httpx, 'Client', IsolatedClient)
+    with policy.dispatch_context(agent), patch('httpx.post') as ordinary:
+        assert tavily._tavily_request('search', {'api_key': 'synthetic-config-key'}) == {'results': []}
+        ordinary.assert_not_called()
+    assert len(sends) == 1 and checks == ['web_search', 'web_search']

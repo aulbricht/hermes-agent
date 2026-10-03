@@ -61,8 +61,16 @@ def _tavily_request(endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
 
     from agent.atlas_delegation import validate_web_send
     validate_web_send("web_extract" if endpoint.lstrip("/") == "extract" else "web_search")
-    scoped_options = {"follow_redirects": False} if current_dispatch_agent() is not None else {}
-    response = httpx.post(url, json=payload, timeout=60, **scoped_options)
+    if current_dispatch_agent() is not None:
+        from agent.atlas_delegation import validate_prepared_web_auth
+        def authorize(request):
+            validate_prepared_web_auth(request.headers, "TAVILY_API_KEY", body=request.content)
+            validate_web_send("web_extract" if endpoint.lstrip("/") == "extract" else "web_search")
+        with httpx.Client(trust_env=False, follow_redirects=False,
+                event_hooks={"request": [authorize]}) as client:
+            response = client.post(url, json=payload, timeout=60)
+    else:
+        response = httpx.post(url, json=payload, timeout=60)
     response.raise_for_status()
     return response.json()
 

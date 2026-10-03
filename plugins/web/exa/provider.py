@@ -64,7 +64,7 @@ def _get_exa_client() -> Any:
             if method != "POST" or name is None:
                 raise DelegationDenied("Atlas delegation Exa endpoint is unavailable")
             response = scoped_requests_post(client.base_url + endpoint, name,
-                data=json.dumps(data, cls=ExaJSONEncoder), headers={**client.headers, **(headers or {})}, timeout=60)
+                credential_env="EXA_API_KEY", data=json.dumps(data, cls=ExaJSONEncoder), headers={**client.headers, **(headers or {})}, timeout=60)
             response.raise_for_status()
             return response.json()
         client.request = request

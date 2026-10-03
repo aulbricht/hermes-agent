@@ -249,7 +249,7 @@ def _get_firecrawl_client() -> Any:
             if name is None:
                 raise DelegationDenied("Atlas delegation Firecrawl endpoint is unavailable")
             return scoped_requests_post(transport._build_url(endpoint), name,
-                json=data, headers=headers or transport._prepare_headers(), timeout=timeout or 60)
+                credential_env="FIRECRAWL_API_KEY", json=data, headers=headers or transport._prepare_headers(), timeout=timeout or 60)
         # Replace only this instance's v2 transport. SDK parsing stays intact.
         transport.post = post
         return client

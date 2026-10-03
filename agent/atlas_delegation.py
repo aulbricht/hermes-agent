@@ -188,11 +188,49 @@ def resolve_web_readers():
     return readers
 
 
-def scoped_requests_post(url, name, **kwargs):
-    """One authorized Requests send; never replay redirects or retry implicitly."""
+def validate_prepared_web_auth(headers, credential_env, *, body=None):
+    """Explicit process credential only, checked after HTTP preparation."""
+    bindings = {"FIRECRAWL_API_KEY": ("authorization", "Bearer "),
+        "EXA_API_KEY": ("x-api-key", ""), "PARALLEL_API_KEY": ("x-api-key", ""),
+        "TAVILY_API_KEY": (None, "")}
+    if credential_env not in bindings:
+        raise DelegationDenied("Atlas web credential binding is unavailable")
+    key = readonly_web_env(credential_env)
+    name, prefix = bindings[credential_env]
+    normalized = {str(k).lower(): v for k, v in headers.items()}
+    if not key or "cookie" in normalized:
+        raise DelegationDenied("Atlas web authentication changed")
+    forbidden = _AUTH_HEADERS - ({name} if name else set())
+    if any(header in normalized for header in forbidden):
+        raise DelegationDenied("Atlas web authentication changed")
+    if name:
+        if normalized.get(name) != prefix + key:
+            raise DelegationDenied("Atlas web authentication changed")
+    else:
+        try:
+            payload = json.loads(body)
+        except Exception as error:
+            raise DelegationDenied("Atlas web authentication changed") from error
+        if not isinstance(payload, dict) or payload.get("api_key") != key:
+            raise DelegationDenied("Atlas web authentication changed")
+
+
+def scoped_requests_post(url, name, *, credential_env, **kwargs):
+    """Fresh isolated Requests send; no netrc, proxy, auth, cookies or retries."""
     import requests
     validate_web_send(name)
-    response = requests.post(url, allow_redirects=False, **kwargs)
+    if set(kwargs) - {"headers", "json", "data", "timeout"}:
+        raise DelegationDenied("Atlas web transport options are unavailable")
+    with requests.Session() as session:
+        session.trust_env = False
+        session.mount("https://", requests.adapters.HTTPAdapter(max_retries=0))
+        session.mount("http://", requests.adapters.HTTPAdapter(max_retries=0))
+        prepared = session.prepare_request(requests.Request("POST", url,
+            headers=kwargs.get("headers"), json=kwargs.get("json"), data=kwargs.get("data")))
+        validate_prepared_web_auth(prepared.headers, credential_env)
+        validate_web_send(name)  # Preparation can outlive revocation/terminal close.
+        response = session.send(prepared, timeout=kwargs.get("timeout", 60),
+            allow_redirects=False, proxies={}, verify=True, stream=False)
     if 300 <= response.status_code < 400:
         raise DelegationDenied("Atlas delegation web redirects are unavailable")
     return response

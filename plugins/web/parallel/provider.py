@@ -77,8 +77,11 @@ def _get_sync_client() -> Any:
         from parallel import Parallel
         check_admission_open(current_dispatch_agent())
         import httpx
-        from agent.atlas_delegation import validate_web_send
-        transport = httpx.Client(follow_redirects=False, trust_env=False, event_hooks={"request": [lambda request: validate_web_send("web_search")]})
+        from agent.atlas_delegation import validate_web_send, validate_prepared_web_auth
+        def authorize(request):
+            validate_prepared_web_auth(request.headers, "PARALLEL_API_KEY")
+            validate_web_send("web_search")
+        transport = httpx.Client(follow_redirects=False, trust_env=False, event_hooks={"request": [authorize]})
         return Parallel(api_key=key, max_retries=0, http_client=transport)
 
     cached = getattr(_wt, "_parallel_client", None)
@@ -117,8 +120,9 @@ def _get_async_client() -> Any:
         from parallel import AsyncParallel
         check_admission_open(current_dispatch_agent())
         import httpx
-        from agent.atlas_delegation import validate_web_send
+        from agent.atlas_delegation import validate_web_send, validate_prepared_web_auth
         async def authorize(request):
+            validate_prepared_web_auth(request.headers, "PARALLEL_API_KEY")
             validate_web_send("web_extract")
         transport = httpx.AsyncClient(follow_redirects=False, trust_env=False, event_hooks={"request": [authorize]})
         return AsyncParallel(api_key=key, max_retries=0, http_client=transport)
