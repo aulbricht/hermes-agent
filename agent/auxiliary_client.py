@@ -548,7 +548,9 @@ _OR_HEADERS_BASE = {
 _TRUTHY_ENV_VALUES = frozenset({"1", "true", "yes", "on"})
 
 
-def _apply_user_default_headers(headers: dict | None) -> dict | None:
+def _apply_user_default_headers(
+    headers: dict | None, *, config: dict | None = None
+) -> dict | None:
     """Merge user-configured ``model.default_headers`` onto resolved headers.
 
     User values take precedence over provider/SDK defaults, mirroring the main
@@ -564,7 +566,7 @@ def _apply_user_default_headers(headers: dict | None) -> dict | None:
     """
     try:
         from hermes_cli.config import cfg_get, load_config
-        _cfg = load_config()
+        _cfg = config if config is not None else load_config()
         user_headers = cfg_get(_cfg, "model", "default_headers")
         # ``model.extra_headers`` is an accepted alias (matches the
         # per-provider ``extra_headers`` key on providers/custom_providers
@@ -953,6 +955,14 @@ class _CodexCompletionsAdapter:
         # same behavior as the main agent's Codex transport.
         extra_body = kwargs.get("extra_body") or {}
         if isinstance(extra_body, dict):
+            # OpenRouter Responses accepts provider selection as a top-level
+            # Responses field. Atlas supplies a hard OpenAI-only pin through
+            # extra_body; forward it here instead of dropping it in this
+            # chat-to-Responses adapter.
+            if isinstance(extra_body.get("provider"), dict):
+                resp_kwargs["provider"] = dict(extra_body["provider"])
+            if extra_body.get("service_tier"):
+                resp_kwargs["service_tier"] = extra_body["service_tier"]
             reasoning_cfg = extra_body.get("reasoning")
             if isinstance(reasoning_cfg, dict):
                 if reasoning_cfg.get("enabled") is False:
@@ -1169,13 +1179,27 @@ class _CodexCompletionsAdapter:
 
             resp_usage = getattr(final, "usage", None)
             if resp_usage:
+                def _usage_value(key: str, default: Any = 0) -> Any:
+                    value = getattr(resp_usage, key, None)
+                    if value is None and isinstance(resp_usage, dict):
+                        value = resp_usage.get(key)
+                    return default if value is None else value
+
                 usage = SimpleNamespace(
-                    prompt_tokens=getattr(resp_usage, "input_tokens", 0)
-                        or (resp_usage.get("input_tokens", 0) if isinstance(resp_usage, dict) else 0),
-                    completion_tokens=getattr(resp_usage, "output_tokens", 0)
-                        or (resp_usage.get("output_tokens", 0) if isinstance(resp_usage, dict) else 0),
-                    total_tokens=getattr(resp_usage, "total_tokens", 0)
-                        or (resp_usage.get("total_tokens", 0) if isinstance(resp_usage, dict) else 0),
+                    input_tokens=_usage_value("input_tokens"),
+                    output_tokens=_usage_value("output_tokens"),
+                    input_tokens_details=_usage_value("input_tokens_details", None),
+                    output_tokens_details=_usage_value("output_tokens_details", None),
+                    prompt_tokens=_usage_value("input_tokens"),
+                    completion_tokens=_usage_value("output_tokens"),
+                    total_tokens=_usage_value("total_tokens"),
+                    # OpenRouter Responses can include billing attribution
+                    # alongside usage. Preserve it through the adapter so
+                    # Atlas separates platform charges from BYOK upstream.
+                    cost=_usage_value("cost", None),
+                    cost_details=_usage_value("cost_details", None),
+                    is_byok=_usage_value("is_byok", None),
+                    upstream_cost_usd=_usage_value("upstream_cost_usd", None),
                 )
         except Exception as exc:
             if timed_out.is_set():
@@ -1201,7 +1225,9 @@ class _CodexCompletionsAdapter:
         )
         return SimpleNamespace(
             choices=[choice],
-            model=model,
+            id=getattr(final, "id", "") or (final.get("id", "") if isinstance(final, dict) else ""),
+            model=(getattr(final, "model", None) or (final.get("model") if isinstance(final, dict) else None) or model),
+            service_tier=(getattr(final, "service_tier", None) or (final.get("service_tier") if isinstance(final, dict) else None)),
             usage=usage,
         )
 
@@ -6391,6 +6417,79 @@ def _validate_llm_response(response: Any, task: str = None) -> Any:
     return response
 
 
+def _atlas_direct_auxiliary_call(
+    *, task: str, messages: list, temperature: Optional[float], max_tokens: int,
+    tools: list, timeout: float, extra_body: dict, stream: bool = False,
+    stream_options: dict = None, async_mode: bool = False,
+) -> Any:
+    """Run an Atlas auxiliary request on pinned Luna without provider fallback."""
+    from urllib.parse import urlsplit
+    from agent.atlas_auxiliary_accounting import LUNA
+    from agent.atlas_sol_budget import OPENROUTER, _pin_openrouter_provider, _transport
+
+    if stream:
+        raise RuntimeError("Atlas auxiliary accounting requires a completed non-streaming response")
+
+    transport = _transport()
+    provider = OPENROUTER if transport == OPENROUTER else "openai-api"
+    requested_model = f"openai/{LUNA}" if transport == OPENROUTER else LUNA
+    expected_host = "openrouter.ai" if transport == OPENROUTER else "api.openai.com"
+    base_url = "https://openrouter.ai/api/v1" if transport == OPENROUTER else "https://api.openai.com/v1"
+    client, resolved_model = _get_cached_client(
+        provider, requested_model, async_mode=async_mode,
+        base_url=base_url, api_mode="codex_responses",
+        # Deliberately omit main_runtime: Atlas auxiliary calls must never
+        # inherit the primary Sol route or credentials.
+        main_runtime=None, task=task,
+    )
+    base_url = str(getattr(client, "base_url", "") or "") if client is not None else ""
+    if (
+        client is None
+        or resolved_model != requested_model
+        or urlsplit(str(getattr(client, "base_url", "") or "")).hostname != expected_host
+    ):
+        credential_label = "OpenRouter API" if transport == OPENROUTER else "direct OpenAI API"
+        raise RuntimeError(f"Atlas auxiliary calls require {credential_label} credentials for {requested_model}")
+
+    effective_timeout = _effective_aux_timeout(task, timeout)
+    merged_extra = _get_task_extra_body(task)
+    merged_extra.update(extra_body or {})
+    for routed_field in ("temperature", "provider", "models", "plugins"):
+        merged_extra.pop(routed_field, None)
+    reasoning_effort = "low" if task == "title_generation" else "medium"
+    reasoning = dict(merged_extra.get("reasoning") or {})
+    reasoning.update({"enabled": True, "effort": str(reasoning_effort)})
+    merged_extra["reasoning"] = reasoning
+    if transport == OPENROUTER:
+        merged_extra["service_tier"] = "auto"
+        merged_extra = _pin_openrouter_provider({"extra_body": merged_extra})["extra_body"]
+    kwargs = _build_call_kwargs(
+        provider, requested_model, messages, temperature=None,
+        max_tokens=max_tokens, tools=tools, timeout=effective_timeout,
+        extra_body=merged_extra, base_url=base_url,
+    )
+    kwargs.pop("temperature", None)
+
+    if async_mode:
+        async def _perform():
+            raw_response = await client.chat.completions.create(**kwargs)
+            from agent.atlas_auxiliary_accounting import record_completed_response_async
+            try:
+                await record_completed_response_async(raw_response, requested_model=LUNA)
+            except Exception as exc:
+                logger.warning("Atlas auxiliary receipt failed after completed response (error_type=%s)", type(exc).__name__)
+            return _validate_llm_response(raw_response, task)
+        return _perform()
+
+    raw_response = client.chat.completions.create(**kwargs)
+    from agent.atlas_auxiliary_accounting import record_completed_response
+    try:
+        record_completed_response(raw_response, requested_model=LUNA)
+    except Exception as exc:
+        logger.warning("Atlas auxiliary receipt failed after completed response (error_type=%s)", type(exc).__name__)
+    return _validate_llm_response(raw_response, task)
+
+
 def _recover_aux_response_message(response: Any) -> Optional[Any]:
     """Synthesize chat-completions shape from Responses-style text fields.
 
@@ -6500,6 +6599,14 @@ def call_llm(
     Raises:
         RuntimeError: If no provider is configured.
     """
+    from agent.atlas_auxiliary_accounting import atlas_auxiliary_enabled
+    if atlas_auxiliary_enabled():
+        return _atlas_direct_auxiliary_call(
+            task=task or "system_other",
+            messages=messages, temperature=temperature, max_tokens=max_tokens,
+            tools=tools, timeout=timeout, extra_body=extra_body,
+            stream=stream, stream_options=stream_options,
+        )
     resolved_provider, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
         task, provider, model, base_url, api_key)
     if api_mode:
@@ -7119,6 +7226,14 @@ async def async_call_llm(
 
     Same as call_llm() but async. See call_llm() for full documentation.
     """
+    from agent.atlas_auxiliary_accounting import atlas_auxiliary_enabled
+    if atlas_auxiliary_enabled():
+        return await _atlas_direct_auxiliary_call(
+            task=task or "system_other",
+            messages=messages, temperature=temperature, max_tokens=max_tokens,
+            tools=tools, timeout=timeout, extra_body=extra_body,
+            async_mode=True,
+        )
     resolved_provider, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
         task, provider, model, base_url, api_key)
     effective_extra_body = _get_task_extra_body(task)

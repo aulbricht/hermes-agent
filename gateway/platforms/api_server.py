@@ -39,10 +39,12 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from functools import wraps
 import logging
+import math
 import os
 import socket as _socket
 import re
 import sqlite3
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -73,6 +75,10 @@ from agent.redact import redact_sensitive_text
 from gateway.readiness import collect_runtime_readiness
 
 logger = logging.getLogger(__name__)
+
+# Guard binding is request-local; explicitly copied across the executor boundary.
+_atlas_guard_context = ContextVar("atlas_fixed_resolution_binding", default=None)
+
 
 
 def _hermes_version() -> str:
@@ -105,6 +111,62 @@ MAX_REQUEST_BYTES = 10_000_000  # 10 MB — accommodates long agent conversation
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
+
+
+def _consistent_usage_byok(usage: dict) -> bool | None:
+    """Return a BYOK flag only when every recorded call agrees explicitly."""
+    direct = usage.get("is_byok")
+    calls = usage.get("calls")
+    if calls is None:
+        return direct if isinstance(direct, bool) else None
+    if not isinstance(calls, list) or not calls:
+        return None
+    values = [call.get("is_byok") for call in calls if isinstance(call, dict)]
+    if len(values) != len(calls) or not values or not all(isinstance(value, bool) for value in values):
+        return None
+    calls_value = values[0] if all(value is values[0] for value in values) else None
+    if calls_value is None or (isinstance(direct, bool) and direct is not calls_value):
+        return None
+    return calls_value
+
+
+def _complete_byok_cost_components(usage: dict) -> tuple[float, float] | None:
+    """Aggregate BYOK cost components only when every call reports both."""
+    calls = usage.get("calls")
+    if not isinstance(calls, list) or not calls:
+        return None
+    charged_total = 0.0
+    upstream_total = 0.0
+    for call in calls:
+        if not isinstance(call, dict) or call.get("provider") != "openrouter" or call.get("is_byok") is not True:
+            return None
+        charged = call.get("actual_cost_usd")
+        upstream = call.get("upstream_cost_usd")
+        if charged is None or upstream is None or isinstance(charged, bool) or isinstance(upstream, bool):
+            return None
+        try:
+            charged_value = float(charged)
+            upstream_value = float(upstream)
+        except (TypeError, ValueError):
+            return None
+        if (not math.isfinite(charged_value) or not math.isfinite(upstream_value)
+                or charged_value < 0 or upstream_value < 0):
+            return None
+        charged_total += charged_value
+        upstream_total += upstream_value
+        if not math.isfinite(charged_total) or not math.isfinite(upstream_total):
+            return None
+    return charged_total, upstream_total
+
+
+def _has_unresolved_openrouter_byok(usage: dict) -> bool:
+    """Detect OpenRouter call records whose BYOK status is missing or mixed."""
+    calls = usage.get("calls")
+    return (
+        isinstance(calls, list)
+        and any(isinstance(call, dict) and call.get("provider") == "openrouter" for call in calls)
+        and _consistent_usage_byok(usage) is None
+    )
 
 
 def _coerce_port(value: Any, default: int = DEFAULT_PORT) -> int:
@@ -374,6 +436,18 @@ def _session_chat_user_message(body: Dict[str, Any], *, param: str = "message") 
         return _normalize_multimodal_content(user_message), None
     except ValueError as exc:
         return None, _multimodal_validation_error(exc, param=param)
+
+
+def _atlas_route_request_id(request: "web.Request") -> tuple[str | None, Optional["web.Response"]]:
+    value = request.headers.get("X-Atlas-Route-Request-ID", "")
+    if not value:
+        return None, None
+    if len(value) > 180 or not re.fullmatch(r"[A-Za-z0-9_.:-]+", value):
+        return None, web.json_response(
+            _openai_error("Invalid Atlas route request ID", code="invalid_route_request_id"),
+            status=400,
+        )
+    return value, None
 
 
 def check_api_server_requirements() -> bool:
@@ -921,6 +995,15 @@ class APIServerAdapter(BasePlatformAdapter):
             raw_port = os.getenv("API_SERVER_PORT", str(DEFAULT_PORT))
         self._port: int = _coerce_port(raw_port, DEFAULT_PORT)
         self._api_key: str = extra.get("key", os.getenv("API_SERVER_KEY", ""))
+        # Owner metadata is Atlas-only and never exposed on a public bind.
+        self._atlas_evidence_enabled = (
+            os.getenv("ATLAS_MODEL_ROUTING_ENABLED") == "true"
+            and self._host in {"127.0.0.1", "::1"}
+        )
+        self._atlas_resolution_role = {8093: "main", 8092: "support"}.get(self._port)
+        self._atlas_resolution_store = None
+        self._atlas_resolution_lock = threading.RLock()
+        self._atlas_fixed_bindings = {}  # Private session keys; never exported.
         self._cors_origins: tuple[str, ...] = self._parse_cors_origins(
             extra.get("cors_origins", os.getenv("API_SERVER_CORS_ORIGINS", "")),
         )
@@ -1338,7 +1421,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 )
             return {}
 
-        allowed_keys = ("model", "provider", "api_key", "base_url")
+        allowed_keys = ("model", "provider", "api_key", "base_url", "reasoning_effort", "max_iterations")
         routes: Dict[str, Dict[str, Any]] = {}
         for alias, cfg in raw.items():
             alias_str = str(alias).strip()
@@ -1357,6 +1440,17 @@ class APIServerAdapter(BasePlatformAdapter):
                     "api_server model_routes: route %r has no 'model'; dropping", alias_str
                 )
                 continue
+            if route.get("reasoning_effort") and route["reasoning_effort"] not in {"none", "low", "medium", "high", "xhigh", "max"}:
+                logger.warning("api_server model_routes: dropping route %r with invalid reasoning effort", alias_str)
+                continue
+            if route.get("max_iterations"):
+                try:
+                    bound = int(route["max_iterations"])
+                except ValueError:
+                    bound = 0
+                if not 1 <= bound <= 90:
+                    logger.warning("api_server model_routes: dropping route %r with invalid iteration cap", alias_str)
+                    continue
             routes[alias_str] = route
         return routes
 
@@ -1375,50 +1469,31 @@ class APIServerAdapter(BasePlatformAdapter):
         override even when the request's ``model`` field matches a configured
         route — a user-issued ``/model`` always wins over static config.
         """
-        if not session_key:
-            return None
         try:
-            from gateway.run import _gateway_runner_ref
-            runner = _gateway_runner_ref()
-            if runner is None:
-                return None
-            override = runner._session_model_overrides.get(session_key)
-            return dict(override) if isinstance(override, dict) else None
+            return self._lookup_session_model_override(session_key)
         except Exception:
             return None
 
-    def _create_agent(
-        self,
-        ephemeral_system_prompt: Optional[str] = None,
-        session_id: Optional[str] = None,
-        stream_delta_callback=None,
-        tool_progress_callback=None,
-        tool_start_callback=None,
-        tool_complete_callback=None,
-        gateway_session_key: Optional[str] = None,
-        route: Optional[Dict[str, Any]] = None,
-    ) -> Any:
-        """
-        Create an AIAgent instance using the gateway's runtime config.
+    @staticmethod
+    def _lookup_session_model_override(session_key):
+        if not session_key:
+            return None
+        from gateway.run import _gateway_runner_ref
+        runner = _gateway_runner_ref()
+        if runner is None:
+            return None
+        override = runner._session_model_overrides.get(session_key)
+        return dict(override) if isinstance(override, dict) else None
 
-        Uses _resolve_runtime_agent_kwargs() to pick up model, api_key,
-        base_url, etc. from config.yaml / env vars.  Toolsets are resolved
-        from config.yaml platform_toolsets.api_server (same as all other
-        gateway platforms), falling back to the hermes-api-server default.
+    def _atlas_session_override_for(self, session_key):
+        try:
+            return self._lookup_session_model_override(session_key)
+        except Exception:
+            from gateway.atlas_resolution import ResolutionUnavailable
+            raise ResolutionUnavailable() from None
 
-        ``gateway_session_key`` is a stable per-channel identifier supplied
-        by the client (via ``X-Hermes-Session-Key``).  Unlike ``session_id``
-        which scopes the short-term transcript and rotates on /new, this
-        key is meant to persist across transcripts so long-term memory
-        providers (e.g. Honcho) can scope their per-chat state correctly
-        — matching the semantics of the native gateway's ``session_key``.
-
-        ``route`` is an optional ``model_routes`` entry (per-client model
-        routing).  When set — and no session ``/model`` override exists for
-        this session — its model/provider/api_key/base_url override the
-        global defaults for this agent instance only.
-        """
-        from run_agent import AIAgent
+    def _resolve_agent_constructor_inputs(self, gateway_session_key=None, session_id=None, route=None, *, strict_atlas=False):
+        """The existing API resolution order, shared by normal and guarded turns."""
         from gateway.run import (
             _current_max_iterations,
             _resolve_runtime_agent_kwargs,
@@ -1449,7 +1524,8 @@ class APIServerAdapter(BasePlatformAdapter):
         # Precedence (highest first): session ``/model`` override → model_routes
         # route → global config — an explicit user-issued ``/model`` on the
         # session always beats static per-client route config.
-        session_override = self._session_model_override_for(
+        lookup = self._atlas_session_override_for if strict_atlas else self._session_model_override_for
+        session_override = lookup(
             gateway_session_key or session_id
         )
         if route and not session_override:
@@ -1478,6 +1554,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 runtime_kwargs["api_key"] = route["api_key"]
             if route.get("base_url"):
                 runtime_kwargs["base_url"] = route["base_url"]
+            if route.get("reasoning_effort"):
+                reasoning_config = {
+                    "enabled": route["reasoning_effort"] != "none",
+                    "effort": route["reasoning_effort"],
+                }
             logger.debug(
                 "api_server model route applied: model=%s provider=%s",
                 model,
@@ -1491,32 +1572,221 @@ class APIServerAdapter(BasePlatformAdapter):
 
         user_config = _load_gateway_config()
         enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
+        if strict_atlas and self._atlas_evidence_enabled and self._atlas_resolution_role == "main":
+            from gateway.atlas_resolution import PHASE2_WORKER_SESSION_KEY
+            if gateway_session_key == PHASE2_WORKER_SESSION_KEY:
+                enabled_toolsets = []
 
         max_iterations = _current_max_iterations()
+        if route and not session_override and route.get("max_iterations"):
+            max_iterations = min(max_iterations, int(route["max_iterations"]))
 
         # Load fallback provider chain so the API server platform has the
         # same fallback behaviour as Telegram/Discord/Slack (fixes #4954).
         fallback_model = GatewayRunner._load_fallback_model()
 
+        return dict(model=model, **runtime_kwargs, max_iterations=max_iterations,
+                    enabled_toolsets=enabled_toolsets, fallback_model=fallback_model,
+                    reasoning_config=reasoning_config), session_override
+
+    def _atlas_store(self):
+        with self._atlas_resolution_lock:
+            if self._atlas_resolution_store is None:
+                from gateway.atlas_resolution import ResolutionStore
+                self._atlas_resolution_store = ResolutionStore()
+            return self._atlas_resolution_store
+
+    def _atlas_scope(self, session_key, alias):
+        from gateway.atlas_resolution import ALIASES, ResolutionUnavailable
+        from gateway.atlas_runtime_evidence import digest
+        if (not self._atlas_evidence_enabled or self._atlas_resolution_role is None
+                or alias not in ALIASES or type(session_key) is not str
+                or not session_key or len(session_key) > self._MAX_SESSION_HEADER_LEN
+                or re.search(r"[\x00-\x1f\x7f]", session_key)):
+            raise ResolutionUnavailable()
+        return (self._atlas_resolution_role, alias, digest([self._atlas_resolution_role, session_key]))
+
+    def _atlas_dependencies(self, scope):
+        """Loaded/cached dependencies only: no config, credentials, or discovery."""
+        import sys
+        from run_agent import AIAgent
+        from tools.registry import registry
+        from agent.atlas_sol_budget import capture_admission_policy
+        from gateway.atlas_resolution import constructor_defaults, ResolutionUnavailable, MODELS, _validate_policy
+        from gateway.atlas_runtime_evidence import digest, loaded_code
+        with self._atlas_resolution_lock:
+            key = self._atlas_fixed_bindings.get(scope)
+        if key is None or self._atlas_scope(key, scope[1]) != scope:
+            raise ResolutionUnavailable()
+        routes = {}
+        for alias, route in self._model_routes.items():
+            if alias not in {"atlas-luna", "atlas-sol"} or not isinstance(route, dict):
+                raise ResolutionUnavailable()
+            safe = {}
+            for name, value in route.items():
+                if name == "api_key":
+                    safe[name] = bool(value)
+                elif name == "model" and value in MODELS:
+                    safe[name] = value
+                elif name == "provider" and value == "openrouter":
+                    safe[name] = value
+                elif name == "base_url" and value == "https://openrouter.ai/api/v1":
+                    safe[name] = value
+                elif name == "reasoning_effort" and value in {"none", "low", "medium", "high", "xhigh", "max"}:
+                    safe[name] = value
+                elif name == "max_iterations" and str(value).isdigit() and 1 <= int(value) <= 90:
+                    safe[name] = int(value)
+                else:
+                    raise ResolutionUnavailable()
+            routes[alias] = safe
+        env = {}
+        for name in ("HERMES_MAX_TOKENS", "HERMES_MAX_ITERATIONS"):
+            raw = os.environ.get(name)
+            if raw is None or raw == "":
+                env[name] = None
+            elif raw.isdigit() and 1 <= int(raw) <= 1000000:
+                env[name] = int(raw)
+            else:
+                raise ResolutionUnavailable()
+        return {"role": scope[0], "binding_sha256": scope[2],
+                "routes_sha256": digest(routes), "session_override_present": bool(self._atlas_session_override_for(key)),
+                "tool_registry_generation": registry._generation, "selected_env": env,
+                "constructor_defaults": constructor_defaults(AIAgent),
+                "admission_policy": _validate_policy(capture_admission_policy()),
+                "loaded_python_code": {name: loaded_code(sys.modules.get(name)) for name in
+                    ("gateway.platforms.api_server", "gateway.run", "agent.agent_init", "run_agent",
+                     "hermes_cli.runtime_provider", "agent.atlas_sol_budget", "agent.atlas_init_snapshot",
+                     "gateway.atlas_resolution", "gateway.atlas_runtime_evidence", "hermes_cli.timeouts",
+                     "agent.auxiliary_client", "agent.transports.codex", "agent.codex_responses_adapter",
+                     "agent.codex_runtime", "agent.chat_completion_helpers", "agent.tool_executor",
+                     "agent.agent_runtime_helpers", "agent.conversation_loop")}}
+
+    def _capture_atlas_resolution(self, inputs, override, session_key, alias):
+        import importlib
+        from run_agent import AIAgent, get_tool_definitions
+        from hermes_cli.config import load_config
+        from tools.registry import registry
+        from agent.atlas_init_snapshot import capture_atlas_init_snapshot
+        from agent.atlas_sol_budget import capture_admission_policy
+        from gateway.atlas_resolution import PreparedTurn, constructor_defaults, ResolutionDrift, phase2_tool_free_binding
+        # Initialization lazily imports these main-path implementations. Load
+        # them at owner capture, so the probe never imports to fabricate proof
+        # and cold construction does not invalidate its own generation.
+        for module in ("agent.agent_init", "hermes_cli.timeouts", "agent.auxiliary_client",
+                       "agent.transports.codex", "agent.codex_responses_adapter", "agent.codex_runtime",
+                       "agent.chat_completion_helpers", "agent.tool_executor", "agent.agent_runtime_helpers",
+                       "agent.conversation_loop"):
+            importlib.import_module(module)
+        scope = self._atlas_scope(session_key, alias)
+        before = self._atlas_dependencies(scope)
+        config = load_config()
+        generation = registry._generation
+        if phase2_tool_free_binding(scope[0], scope[2]):
+            if inputs["enabled_toolsets"]:
+                raise ResolutionDrift()
+            tools = []
+        else:
+            tools = get_tool_definitions(enabled_toolsets=inputs["enabled_toolsets"],
+                                         disabled_toolsets=None, quiet_mode=True)
+        snapshot = capture_atlas_init_snapshot(config=config, tool_definitions=tools, tool_generation=generation)
+        after = self._atlas_dependencies(scope)
+        if before != after or generation != after["tool_registry_generation"]:
+            raise ResolutionDrift()
+        return PreparedTurn.capture(inputs, snapshot, capture_admission_policy(), constructor_defaults(AIAgent),
+                                    alias, scope[2], scope[0], override, after)
+
+    def _prepare_atlas_resolution(self, *, gateway_session_key, model_alias="default"):
+        """Owner initialization seam. Never called by a probe or normal chat.
+
+        Uses existing resolution/config/tool effects, without construction or
+        inference. The dedicated main/default worker is prepared during connect.
+        """
+        from gateway.atlas_resolution import ResolutionUnavailable
+        scope = self._atlas_scope(gateway_session_key, model_alias)
+        route = None if model_alias == "default" else self._resolve_route(model_alias)
+        if model_alias != "default" and route is None:
+            raise ResolutionUnavailable()
+        with self._atlas_resolution_lock:
+            self._atlas_fixed_bindings[scope] = gateway_session_key
+            if len(self._atlas_fixed_bindings) > 32:
+                del self._atlas_fixed_bindings[next(iter(self._atlas_fixed_bindings))]
+        inputs, override = self._resolve_agent_constructor_inputs(gateway_session_key, route=route, strict_atlas=True)
+        prepared = self._capture_atlas_resolution(inputs, override, gateway_session_key, model_alias)
+        return self._atlas_store().publish(prepared)
+
+    def _bootstrap_atlas_phase2_resolution(self):
+        """Prepare the reviewed main/default worker before serving HTTP.
+
+        Gateway startup has already completed MCP discovery. This owner step
+        captures existing resolution inputs without constructing an agent or
+        dispatching. Failure leaves ordinary callers available and the fixed
+        worker unavailable, with no fallback to an unguarded endpoint.
+        """
+        if not self._atlas_evidence_enabled or self._atlas_resolution_role != "main":
+            return
+        from gateway.atlas_resolution import PHASE2_WORKER_SESSION_KEY
+        scope = self._atlas_scope(PHASE2_WORKER_SESSION_KEY, "default")
+        # Reserve the binding even if credentials/config/tool capture fails.
+        # Reconnect must not retain a prior successful startup's publication.
+        with self._atlas_resolution_lock:
+            self._atlas_fixed_bindings[scope] = PHASE2_WORKER_SESSION_KEY
+            if len(self._atlas_fixed_bindings) > 32:
+                del self._atlas_fixed_bindings[next(iter(self._atlas_fixed_bindings))]
+        try:
+            store = self._atlas_store()
+            store.discard(scope)
+            if not self._api_key:
+                raise ValueError("fixed endpoint authentication unavailable")
+            self._prepare_atlas_resolution(
+                gateway_session_key=PHASE2_WORKER_SESSION_KEY,
+                model_alias="default",
+            )
+        except Exception:
+            # Resolver errors may contain private values; never echo them.
+            logger.warning("[%s] Atlas Phase 2 startup resolution unavailable", self.name)
+
+    def _create_agent(
+        self, ephemeral_system_prompt=None, session_id=None, stream_delta_callback=None,
+        tool_progress_callback=None, tool_start_callback=None, tool_complete_callback=None,
+        gateway_session_key=None, route=None, atlas_resolution_expected=None, atlas_resolution_alias=None,
+    ):
+        from run_agent import AIAgent
+        if atlas_resolution_expected is not None:
+            scope = self._atlas_scope(gateway_session_key, atlas_resolution_alias)
+            with self._atlas_resolution_lock:
+                known = self._atlas_fixed_bindings.get(scope) == gateway_session_key
+            if not known:
+                from gateway.atlas_resolution import ResolutionDrift
+                raise ResolutionDrift()
+        else:
+            # Explicitly registered fixed workers cannot fall back to a legacy
+            # unguarded surface. Other ordinary callers retain their behavior.
+            key = gateway_session_key or session_id
+            with self._atlas_resolution_lock:
+                fixed = key is not None and key in self._atlas_fixed_bindings.values()
+            if fixed:
+                from gateway.atlas_resolution import ResolutionDrift
+                raise ResolutionDrift()
+        inputs, override = self._resolve_agent_constructor_inputs(gateway_session_key, session_id, route,
+                                                               strict_atlas=atlas_resolution_expected is not None)
+        guard = None
+        if atlas_resolution_expected is not None:
+            # Re-resolve through the same actual path, then admit before the factory.
+            fresh = self._capture_atlas_resolution(inputs, override, gateway_session_key, atlas_resolution_alias)
+            guard = self._atlas_store().accept(atlas_resolution_expected, fresh, lambda: self._atlas_dependencies(scope))
+            inputs = guard.prepared.factory_kwargs()
+            inputs["atlas_init_snapshot"] = guard.prepared.initialization
         agent = AIAgent(
-            model=model,
-            **runtime_kwargs,
-            max_iterations=max_iterations,
-            quiet_mode=True,
-            verbose_logging=False,
-            ephemeral_system_prompt=ephemeral_system_prompt or None,
-            enabled_toolsets=enabled_toolsets,
-            session_id=session_id,
-            platform="api_server",
-            stream_delta_callback=stream_delta_callback,
-            tool_progress_callback=tool_progress_callback,
-            tool_start_callback=tool_start_callback,
-            tool_complete_callback=tool_complete_callback,
-            session_db=self._ensure_session_db(),
-            fallback_model=fallback_model,
-            reasoning_config=reasoning_config,
+            **inputs, quiet_mode=True, verbose_logging=False,
+            ephemeral_system_prompt=ephemeral_system_prompt or None, session_id=session_id,
+            platform="api_server", stream_delta_callback=stream_delta_callback,
+            tool_progress_callback=tool_progress_callback, tool_start_callback=tool_start_callback,
+            tool_complete_callback=tool_complete_callback, session_db=self._ensure_session_db(),
             gateway_session_key=gateway_session_key,
         )
+        if guard is not None:
+            guard.check_constructed(agent)
+            agent._atlas_resolution_guard = guard
         return agent
 
     # ------------------------------------------------------------------
@@ -1528,6 +1798,94 @@ class APIServerAdapter(BasePlatformAdapter):
         return web.json_response(
             {"status": "ok", "platform": "hermes-agent", "version": _hermes_version()}
         )
+
+    async def _handle_atlas_runtime_evidence(self, request: "web.Request") -> "web.Response":
+        """Authenticated metadata; never create an agent or query a provider."""
+        if not self._atlas_evidence_enabled or request.remote not in {"127.0.0.1", "::1"}:
+            return web.json_response({"error": "not_found"}, status=404)
+        # Unlike generic test wiring, this endpoint always requires a key.
+        if not self._api_key:
+            return web.json_response({"error": "authentication_required"}, status=401)
+        auth = self._check_auth(request)
+        if auth is not None:
+            return auth
+        nonce = request.headers.get("X-Atlas-Baseline-Nonce", "")
+        if request.query_string or not re.fullmatch(r"[A-Za-z0-9_-]{16,128}", nonce):
+            return web.json_response({"error": "invalid_nonce_or_query"}, status=400)
+        try:
+            from gateway.atlas_runtime_evidence import snapshot
+            result = snapshot(self, nonce)
+        except Exception:
+            return web.json_response({"error": "runtime_evidence_unavailable"}, status=503)
+        return web.json_response(result, headers={"Cache-Control": "no-store"})
+
+    def _atlas_fixed_auth(self, request):
+        if (not self._atlas_evidence_enabled or self._atlas_resolution_role is None
+                or request.remote not in {"127.0.0.1", "::1"}):
+            return web.json_response({"error": "not_found"}, status=404)
+        if not self._api_key:
+            return web.json_response({"error": "authentication_required"}, status=401)
+        return self._check_auth(request)
+
+    @staticmethod
+    def _atlas_guard_error(error):
+        from gateway.atlas_resolution import ResolutionDrift
+        status = 409 if isinstance(error, ResolutionDrift) else 503
+        return web.json_response({"error": "atlas_resolution_rejected"}, status=status,
+                                 headers={"Cache-Control": "no-store"})
+
+    async def _handle_atlas_resolution_generation(self, request):
+        denied = self._atlas_fixed_auth(request)
+        if denied is not None:
+            return denied
+        nonce = request.headers.get("X-Atlas-Baseline-Nonce", "")
+        if request.query_string or not re.fullmatch(r"[A-Za-z0-9_-]{16,128}", nonce):
+            return web.json_response({"error": "invalid_nonce_or_query"}, status=400)
+        try:
+            result = self._atlas_store().proof(nonce, self._atlas_dependencies)
+        except Exception as error:
+            return self._atlas_guard_error(error)
+        return web.json_response(result, headers={"Cache-Control": "no-store"})
+
+    async def _handle_atlas_guarded_chat(self, request):
+        """Fixed caller entry: no legacy fallback, streaming, or cached answer."""
+        denied = self._atlas_fixed_auth(request)
+        if denied is not None:
+            return denied
+        expected = request.headers.get("X-Atlas-Resolution-Generation", "")
+        if (request.query_string or not re.fullmatch(r"[0-9a-f]{64}", expected)
+                or "Idempotency-Key" in request.headers):
+            return web.json_response({"error": "invalid_resolution_binding"}, status=400)
+        key, error = self._parse_session_key_header(request)
+        if error is not None:
+            return error
+        if not key:
+            return web.json_response({"error": "fixed_session_key_required"}, status=400)
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "invalid_body"}, status=400)
+        if (type(body) is not dict or set(body) - {"model", "messages", "stream"}
+                or body.get("stream", False) is not False):
+            return web.json_response({"error": "unsupported_guarded_request"}, status=400)
+        model = body.get("model", self._model_name)
+        if type(model) is not str:
+            return web.json_response({"error": "unsupported_guarded_model"}, status=400)
+        if model in {"atlas-luna", "atlas-sol"} and self._resolve_route(model) is not None:
+            alias = model
+        elif model in {self._model_name, "openai/gpt-6-luna", "default"}:
+            alias = "default"
+        else:
+            return web.json_response({"error": "unsupported_guarded_model"}, status=400)
+        token = _atlas_guard_context.set((expected, alias, key))
+        try:
+            response = await self._handle_chat_completions(request)
+            response.headers["Cache-Control"] = "no-store"
+            return response
+        except Exception as error:
+            return self._atlas_guard_error(error)
+        finally:
+            _atlas_guard_context.reset(token)
 
     async def _handle_health_detailed(self, request: "web.Request") -> "web.Response":
         """GET /health/detailed — rich status for cross-container dashboard probing.
@@ -2059,6 +2417,17 @@ class APIServerAdapter(BasePlatformAdapter):
         system_prompt = body.get("system_message") or body.get("instructions")
         if system_prompt is not None and not isinstance(system_prompt, str):
             return web.json_response(_openai_error("system_message must be a string", code="invalid_system_message"), status=400)
+        provider_user_hash = request.headers.get("X-Atlas-Provider-User", "")
+        if provider_user_hash and not re.fullmatch(r"atlas-(?:system|[0-9a-f]{48})", provider_user_hash):
+            return web.json_response(_openai_error("Invalid provider user attribution", code="invalid_provider_user"), status=400)
+        atlas_route_request_id, route_id_err = _atlas_route_request_id(request)
+        if route_id_err is not None:
+            return route_id_err
+        # Session turns need the same per-request model routes as the
+        # OpenAI-compatible endpoints. A route is selected only from the
+        # server's configured alias map; callers cannot supply arbitrary
+        # provider URLs, keys, or reasoning settings.
+        route = self._resolve_route(body.get("model"))
         history = self._conversation_history_for_session(session_id)
         result, usage = await self._run_agent(
             user_message=user_message,
@@ -2066,6 +2435,9 @@ class APIServerAdapter(BasePlatformAdapter):
             ephemeral_system_prompt=system_prompt,
             session_id=session_id,
             gateway_session_key=gateway_session_key,
+            provider_user_hash=provider_user_hash or None,
+            atlas_route_request_id=atlas_route_request_id,
+            route=route,
         )
         effective_session_id = result.get("session_id") if isinstance(result, dict) else session_id
         final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
@@ -2101,6 +2473,13 @@ class APIServerAdapter(BasePlatformAdapter):
         system_prompt = body.get("system_message") or body.get("instructions")
         if system_prompt is not None and not isinstance(system_prompt, str):
             return web.json_response(_openai_error("system_message must be a string", code="invalid_system_message"), status=400)
+        provider_user_hash = request.headers.get("X-Atlas-Provider-User", "")
+        if provider_user_hash and not re.fullmatch(r"atlas-(?:system|[0-9a-f]{48})", provider_user_hash):
+            return web.json_response(_openai_error("Invalid provider user attribution", code="invalid_provider_user"), status=400)
+        atlas_route_request_id, route_id_err = _atlas_route_request_id(request)
+        if route_id_err is not None:
+            return route_id_err
+        route = self._resolve_route(body.get("model"))
 
         loop = asyncio.get_running_loop()
         queue: "asyncio.Queue[Optional[tuple[str, Dict[str, Any]]]]" = asyncio.Queue()
@@ -2155,6 +2534,9 @@ class APIServerAdapter(BasePlatformAdapter):
                     stream_delta_callback=_delta,
                     tool_progress_callback=_tool_progress,
                     gateway_session_key=gateway_session_key,
+                    provider_user_hash=provider_user_hash or None,
+                    atlas_route_request_id=atlas_route_request_id,
+                    route=route,
                 )
                 final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
                 effective_session_id = result.get("session_id", session_id) if isinstance(result, dict) else session_id
@@ -2467,6 +2849,8 @@ class APIServerAdapter(BasePlatformAdapter):
             try:
                 result, usage = await _idem_cache.get_or_set(idempotency_key, fp, _compute_completion)
             except Exception as e:
+                if _atlas_guard_context.get() is not None:
+                    return self._atlas_guard_error(e)
                 logger.error("Error running agent for chat completions: %s", e, exc_info=True)
                 return web.json_response(
                     _openai_error(f"Internal server error: {e}", err_type="server_error"),
@@ -2476,11 +2860,22 @@ class APIServerAdapter(BasePlatformAdapter):
             try:
                 result, usage = await _compute_completion()
             except Exception as e:
+                if _atlas_guard_context.get() is not None:
+                    return self._atlas_guard_error(e)
                 logger.error("Error running agent for chat completions: %s", e, exc_info=True)
                 return web.json_response(
                     _openai_error(f"Internal server error: {e}", err_type="server_error"),
                     status=500,
                 )
+
+        atlas_receipt = None
+        binding = _atlas_guard_context.get()
+        if binding is not None:
+            atlas_receipt = usage.get("atlas_resolution")
+            if (not isinstance(atlas_receipt, dict) or atlas_receipt.get("generation_id") != binding[0]
+                    or type(atlas_receipt.get("dispatch_count")) is not int or atlas_receipt["dispatch_count"] < 1):
+                from gateway.atlas_resolution import ResolutionUnavailable
+                return self._atlas_guard_error(ResolutionUnavailable())
 
         final_response = _resolve_media_to_data_urls(result.get("final_response") or "")
         is_partial = bool(result.get("partial"))
@@ -2526,6 +2921,23 @@ class APIServerAdapter(BasePlatformAdapter):
         # Soft-partial path: we have *some* text but the run did not complete
         # (e.g. truncation with partial buffered output). Still 200 but signal
         # truncation via finish_reason="length" + Hermes-specific extras.
+        byok_state = _consistent_usage_byok(usage)
+        byok_components = _complete_byok_cost_components(usage) if byok_state is True else None
+        unresolved_byok = _has_unresolved_openrouter_byok(usage)
+        byok_cost_incomplete = (
+            isinstance(usage.get("calls"), list)
+            and (unresolved_byok or (byok_state is True and byok_components is None))
+        )
+        if byok_components is not None:
+            response_cost, response_upstream_cost = byok_components
+        elif byok_cost_incomplete:
+            # A partial aggregate must not turn absent provider metadata into a
+            # confirmed zero. Keep estimates separate from observed components.
+            response_cost, response_upstream_cost = None, None
+        else:
+            response_cost = usage.get("actual_cost_usd") if usage.get("actual_cost_available") else None
+            response_upstream_cost = usage.get("upstream_cost_usd", 0)
+
         response_data = {
             "id": completion_id,
             "object": "chat.completion",
@@ -2545,8 +2957,31 @@ class APIServerAdapter(BasePlatformAdapter):
                 "prompt_tokens": usage.get("input_tokens", 0),
                 "completion_tokens": usage.get("output_tokens", 0),
                 "total_tokens": usage.get("total_tokens", 0),
+                "prompt_tokens_details": {
+                    "cached_tokens": usage.get("cache_read_tokens", 0),
+                    "cache_write_tokens": usage.get("cache_write_tokens", 0),
+                },
+                "completion_tokens_details": {"reasoning_tokens": usage.get("reasoning_tokens", 0)},
+                "cost": response_cost,
+                "cost_details": {"upstream_inference_cost": response_upstream_cost},
             },
         }
+        if byok_state is not None:
+            response_data["usage"]["is_byok"] = byok_state
+        if byok_cost_incomplete:
+            estimated = usage.get("estimated_cost_usd")
+            try:
+                estimated = float(estimated) if estimated is not None else None
+                if estimated is not None and (not math.isfinite(estimated) or estimated < 0):
+                    estimated = None
+                elif estimated is not None and byok_state is True:
+                    estimated *= 1.05
+            except (TypeError, ValueError):
+                estimated = None
+            response_data["usage"]["actual_cost_estimated"] = True
+            if estimated is not None:
+                estimate_key = "byok_total_cost_usd" if byok_state is True else "estimated_total_usd"
+                response_data["usage"][estimate_key] = estimated
         if is_partial or is_failed or not completed:
             response_data["hermes"] = {
                 "completed": completed,
@@ -2560,6 +2995,9 @@ class APIServerAdapter(BasePlatformAdapter):
             if err_msg:
                 response_headers["X-Hermes-Error"] = _redact_api_error_text(err_msg, limit=200)
 
+        if atlas_receipt is not None:
+            response_headers["X-Atlas-Accepted-Resolution-Generation"] = atlas_receipt["generation_id"]
+            response_data["atlas_resolution"] = atlas_receipt
         return web.json_response(response_data, headers=response_headers)
 
     async def _write_sse_chat_completion(
@@ -4206,6 +4644,8 @@ class APIServerAdapter(BasePlatformAdapter):
         agent_ref: Optional[list] = None,
         gateway_session_key: Optional[str] = None,
         route: Optional[Dict[str, Any]] = None,
+        provider_user_hash: Optional[str] = None,
+        atlas_route_request_id: Optional[str] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -4223,6 +4663,10 @@ class APIServerAdapter(BasePlatformAdapter):
         another thread to stop in-progress LLM calls.
         """
         loop = asyncio.get_running_loop()
+        atlas_binding = _atlas_guard_context.get()
+        if atlas_binding is not None and gateway_session_key != atlas_binding[2]:
+            from gateway.atlas_resolution import ResolutionDrift
+            raise ResolutionDrift()
 
         def _run():
             from gateway.session_context import clear_session_vars
@@ -4233,6 +4677,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 session_id=session_id or "",
             )
             try:
+                atlas_kwargs = {} if atlas_binding is None else {
+                    "atlas_resolution_expected": atlas_binding[0], "atlas_resolution_alias": atlas_binding[1],
+                }
                 agent = self._create_agent(
                     ephemeral_system_prompt=ephemeral_system_prompt,
                     session_id=session_id,
@@ -4242,20 +4689,54 @@ class APIServerAdapter(BasePlatformAdapter):
                     tool_complete_callback=tool_complete_callback,
                     gateway_session_key=gateway_session_key,
                     route=route,
+                    **atlas_kwargs,
                 )
+                if provider_user_hash:
+                    overrides = dict(getattr(agent, "request_overrides", {}) or {})
+                    overrides["user"] = provider_user_hash
+                    agent.request_overrides = overrides
+                if atlas_route_request_id:
+                    agent._atlas_route_request_id = atlas_route_request_id
                 if agent_ref is not None:
                     agent_ref[0] = agent
                 effective_task_id = session_id or str(uuid.uuid4())
+                if atlas_binding is not None:
+                    guard = vars(agent).get("_atlas_resolution_guard")
+                    if guard is None:
+                        from gateway.atlas_resolution import ResolutionUnavailable
+                        raise ResolutionUnavailable()
+                    guard.check_constructed(agent)
                 result = agent.run_conversation(
                     user_message=user_message,
                     conversation_history=conversation_history,
                     task_id=effective_task_id,
                 )
+                if atlas_binding is not None:
+                    guard.check_completion()
                 usage = {
                     "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
                     "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
                     "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
                 }
+                if atlas_binding is not None:
+                    usage["atlas_resolution"] = {"generation_id": guard.expected, "dispatch_count": guard.dispatch_count}
+                # Real AIAgent instances initialize these accounting fields.
+                # Keep lightweight third-party/test agent shims backward
+                # compatible and avoid serializing dynamically-created mocks.
+                if "session_actual_cost_available" in vars(agent):
+                    usage.update({
+                        "cache_read_tokens": getattr(agent, "session_cache_read_tokens", 0) or 0,
+                        "cache_write_tokens": getattr(agent, "session_cache_write_tokens", 0) or 0,
+                        "reasoning_tokens": getattr(agent, "session_reasoning_tokens", 0) or 0,
+                        "estimated_cost_usd": getattr(agent, "session_estimated_cost_usd", 0.0) or 0.0,
+                        "actual_cost_usd": getattr(agent, "session_actual_cost_usd", 0.0) or 0.0,
+                        "actual_cost_available": bool(getattr(agent, "session_actual_cost_available", False)),
+                        "upstream_cost_usd": getattr(agent, "session_upstream_cost_usd", 0.0) or 0.0,
+                        "model": getattr(agent, "model", "") or "",
+                        "provider": getattr(agent, "provider", "") or "",
+                        "request_count": getattr(agent, "session_api_calls", 0) or 0,
+                        "calls": list(getattr(agent, "session_usage_calls", []) or []),
+                    })
                 # Include the effective session ID in the result so callers
                 # (e.g. X-Hermes-Session-Id header) can track compression-
                 # triggered session rotations. (#16938)
@@ -4970,12 +5451,19 @@ class APIServerAdapter(BasePlatformAdapter):
             return False
 
         try:
+            # Existing owner initialization effects belong at startup, never
+            # in a generation probe or an inbound fixed request.
+            if self._atlas_evidence_enabled and self._atlas_resolution_role == "main":
+                await asyncio.to_thread(self._bootstrap_atlas_phase2_resolution)
             mws = [mw for mw in (cors_middleware, body_limit_middleware, security_headers_middleware) if mw is not None]
             self._app = web.Application(middlewares=mws, client_max_size=MAX_REQUEST_BYTES)
             assert self._app is not None
             self._app.router.add_get("/health", self._handle_health)
             self._app.router.add_get("/health/detailed", self._handle_health_detailed)
             self._app.router.add_get("/v1/health", self._handle_health)
+            self._app.router.add_get("/v1/atlas/runtime-evidence", self._handle_atlas_runtime_evidence)
+            self._app.router.add_get("/v1/atlas/resolution-generation", self._handle_atlas_resolution_generation)
+            self._app.router.add_post("/v1/atlas/guarded/chat/completions", self._handle_atlas_guarded_chat)
             self._app.router.add_get("/v1/models", self._handle_models)
             self._app.router.add_get("/v1/capabilities", self._handle_capabilities)
             self._app.router.add_get("/v1/skills", self._handle_skills)

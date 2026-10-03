@@ -2163,6 +2163,9 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
     tools. Used by the concurrent execution path; the sequential path retains
     its own inline invocation for backward-compatible display handling.
     """
+    atlas_guard = vars(agent).get("_atlas_resolution_guard")
+    if atlas_guard is not None:
+        atlas_guard.check_tool_execution(agent)
     if not isinstance(function_args, dict):
         function_args = {}
 

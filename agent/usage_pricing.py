@@ -637,6 +637,26 @@ def _to_int(value: Any) -> int:
         return 0
 
 
+def _provider_cost_fields(response_usage: Any) -> dict[str, Any]:
+    """Preserve billing-only provider fields without retaining response content."""
+    if isinstance(response_usage, dict):
+        cost = response_usage.get("cost")
+        details = response_usage.get("cost_details")
+    else:
+        cost = getattr(response_usage, "cost", None)
+        details = getattr(response_usage, "cost_details", None)
+    if isinstance(details, dict):
+        upstream = details.get("upstream_inference_cost")
+    else:
+        upstream = getattr(details, "upstream_inference_cost", None)
+    result: dict[str, Any] = {}
+    if cost is not None:
+        result["cost"] = cost
+    if upstream is not None:
+        result["cost_details"] = {"upstream_inference_cost": upstream}
+    return result
+
+
 def resolve_billing_route(
     model_name: str,
     provider: Optional[str] = None,
@@ -904,6 +924,7 @@ def normalize_usage(
         cache_read_tokens=cache_read_tokens,
         cache_write_tokens=cache_write_tokens,
         reasoning_tokens=reasoning_tokens,
+        raw_usage=_provider_cost_fields(response_usage),
     )
 
 

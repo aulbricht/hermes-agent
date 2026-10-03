@@ -66,6 +66,7 @@ from agent.retry_utils import (
 )
 from agent.trajectory import has_incomplete_scratchpad
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
+from agent.atlas_sol_budget import openai_usage_fields
 from hermes_constants import PARTIAL_STREAM_STUB_ID
 from hermes_logging import set_session_context
 from tools.skill_provenance import set_current_write_origin
@@ -77,6 +78,34 @@ logger = logging.getLogger(__name__)
 # cancelled while waiting on the provider. Surfaces (ACP, TUI) match on this
 # to treat it as cancellation metadata rather than assistant prose.
 INTERRUPT_WAITING_FOR_MODEL_PREFIX = "Operation interrupted: waiting for model response ("
+
+
+def _atlas_route_usage_fields(agent: Any) -> dict[str, Any]:
+    """Attach request and admission IDs to one provider usage receipt."""
+    fields: dict[str, Any] = {
+        "route_request_id": getattr(agent, "_atlas_route_request_id", None),
+    }
+    admission = getattr(agent, "_atlas_sol_last_call", None)
+    if isinstance(admission, dict):
+        if admission.get("actual_model"):
+            fields["model"] = admission["actual_model"]
+        fields["reservation_id"] = admission.get("reservation_id")
+        if admission.get("max_usd") is not None:
+            fields["maximum_usd"] = admission["max_usd"]
+        if admission.get("settled_usd") is not None:
+            fields["settled_usd"] = admission["settled_usd"]
+        if admission.get("settlement_estimated") is not None:
+            fields["settlement_estimated"] = admission["settlement_estimated"]
+        for key in ("actual_cost_usd", "upstream_cost_usd", "byok_total_cost_usd", "actual_cost_estimated", "is_byok"):
+            if key in admission:
+                fields[key] = admission[key]
+    return fields
+
+
+def _explicit_byok_value(raw_usage: Any) -> bool | None:
+    """Preserve OpenRouter's explicit BYOK declaration when available."""
+    value = raw_usage.get("is_byok") if isinstance(raw_usage, dict) else None
+    return value if isinstance(value, bool) else None
 
 
 def _image_error_max_dimension(error: Exception) -> Optional[int]:
@@ -1332,9 +1361,14 @@ def run_conversation(
 
                 from hermes_cli.middleware import run_llm_execution_middleware
 
+                from agent.atlas_sol_budget import admitted_call
+
+                # Each provider request appends one usage row; clear the prior
+                # per-call admission metadata before this attempt.
+                agent._atlas_sol_last_call = None
                 response = run_llm_execution_middleware(
                     api_kwargs,
-                    _perform_api_call,
+                    lambda next_api_kwargs: admitted_call(agent, next_api_kwargs, _perform_api_call),
                     original_request=_original_api_kwargs,
                     task_id=effective_task_id,
                     turn_id=turn_id,
@@ -2189,6 +2223,53 @@ def run_conversation(
                     )
                     if cost_result.amount_usd is not None:
                         agent.session_estimated_cost_usd += float(cost_result.amount_usd)
+                    # OpenRouter includes the amount charged to the account in
+                    # response.usage.cost. Preserve that provider fact separately
+                    # from catalog estimates so downstream accounting never has
+                    # to infer billed spend from token prices.
+                    _raw_usage = getattr(aggregator_usage, "raw_usage", None)
+                    if not isinstance(_raw_usage, dict):
+                        _raw_usage = {}
+                    _actual_cost = _raw_usage.get("cost")
+                    _cost_details = _raw_usage.get("cost_details")
+                    if not isinstance(_cost_details, dict):
+                        _cost_details = {}
+                    _upstream_cost = _cost_details.get("upstream_inference_cost")
+                    _is_byok = _explicit_byok_value(_raw_usage)
+                    try:
+                        if _actual_cost is not None:
+                            agent.session_actual_cost_usd += max(0.0, float(_actual_cost))
+                            agent.session_actual_cost_available = True
+                    except (TypeError, ValueError):
+                        _actual_cost = None
+                    try:
+                        if _upstream_cost is not None:
+                            agent.session_upstream_cost_usd += max(0.0, float(_upstream_cost))
+                    except (TypeError, ValueError):
+                        _upstream_cost = None
+                    _call_usage = {
+                        "generation_id": str(getattr(response, "id", "") or ""),
+                        "service_tier": getattr(response, "service_tier", None),
+                        "usage_available": getattr(response, "usage", None) is not None,
+                        "model": str(getattr(response, "model", "") or _agg_cost_model or agent.model),
+                        "provider": str(_agg_cost_provider or agent.provider or ""),
+                        "input_tokens": canonical_usage.input_tokens,
+                        "output_tokens": canonical_usage.output_tokens,
+                        "cache_read_tokens": canonical_usage.cache_read_tokens,
+                        "cache_write_tokens": canonical_usage.cache_write_tokens,
+                        "reasoning_tokens": canonical_usage.reasoning_tokens,
+                        "actual_cost_usd": float(_actual_cost) if _actual_cost is not None else None,
+                        "upstream_cost_usd": float(_upstream_cost) if _upstream_cost is not None else None,
+                        **_atlas_route_usage_fields(agent),
+                        **(openai_usage_fields(response) if os.environ.get("ATLAS_MODEL_ROUTING_ENABLED") == "true" and agent.api_mode == "codex_responses" else {}),
+                    }
+                    # Preserve the provider's explicit BYOK bit on each call.
+                    # Downstream non-stream API consumers only see aggregate
+                    # usage, so losing this field would make a genuine zero
+                    # OpenRouter fee look like a zero-cost inference.
+                    if isinstance(_is_byok, bool):
+                        _call_usage["is_byok"] = _is_byok
+                    agent.session_usage_calls.append(_call_usage)
                     # Add MoA advisor cost (already priced per-advisor at each
                     # advisor's own model rate) on top of the aggregator cost.
                     if _moa_ref_cost is not None:
@@ -2236,6 +2317,7 @@ def run_conversation(
                                 cache_write_tokens=canonical_usage.cache_write_tokens,
                                 reasoning_tokens=canonical_usage.reasoning_tokens,
                                 estimated_cost_usd=_cost_delta,
+                                actual_cost_usd=float(_actual_cost) if _actual_cost is not None else None,
                                 cost_status=cost_result.status,
                                 cost_source=cost_result.source,
                                 billing_provider=agent.provider,
@@ -4285,6 +4367,11 @@ def run_conversation(
                 _normalize_kwargs["strip_tool_prefix"] = agent._is_anthropic_oauth
             normalized = _transport.normalize_response(response, **_normalize_kwargs)
             assistant_message = normalized
+            # A dedicated tool-free Atlas turn must reject attempted tool use
+            # before hooks, invalid-name retries, or any execution callback.
+            _atlas_guard = vars(agent).get("_atlas_resolution_guard")
+            if _atlas_guard is not None and assistant_message.tool_calls:
+                _atlas_guard.check_tool_execution(agent)
             finish_reason = normalized.finish_reason
             
             # Normalize content to string — some OpenAI-compatible servers
@@ -5301,6 +5388,11 @@ def run_conversation(
                 break
             
         except Exception as e:
+            # A tool-free denial is terminal for this prepared generation.
+            # Keep the ordinary error/retry path unchanged for other turns.
+            _atlas_guard = vars(agent).get("_atlas_resolution_guard")
+            if _atlas_guard is not None:
+                _atlas_guard.check_completion()
             error_msg = f"Error during OpenAI-compatible API call #{api_call_count}: {str(e)}"
             try:
                 print(f"❌ {error_msg}")
