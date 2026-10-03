@@ -374,3 +374,86 @@ def test_nonpaid_live_callback_signs_exact_resource_and_subject(monkeypatch):
         assert envelope['resource_id'] == request.get_header('X-atlas-resource-id') == 'native_fixture'
         assert envelope['subject_user_id'] == request.get_header('X-atlas-user-key') == 'subject'
         assert opener.return_value.open.call_args.kwargs['timeout'] == 3
+
+
+@pytest.mark.parametrize('held_lock', ['python', 'sqlite'])
+def test_real_state_title_authority_follows_held_write_lock(monkeypatch, tmp_path, held_lock):
+    import sqlite3, threading
+    from agent import atlas_delegation as policy
+    from hermes_state import SessionDB
+    path = tmp_path / 'locked-control.db'
+    db = SessionDB(path)
+    db.create_session('native_fixture', 'api_server')
+    db.set_session_title('native_fixture', 'before')
+    waiting = threading.Event()
+    completed = threading.Event()
+    allowed = [True]
+    calls, failures = [], []
+    external = sqlite3.connect(path) if held_lock == 'sqlite' else None
+    if external is not None:
+        external.execute('BEGIN IMMEDIATE')
+        db._conn.set_trace_callback(lambda sql: waiting.set() if sql == 'BEGIN IMMEDIATE' else None)
+    else:
+        original = db._execute_write
+        def traced_write(fn):
+            waiting.set()
+            return original(fn)  # Real StateDB transaction and native lock.
+        monkeypatch.setattr(db, '_execute_write', traced_write)
+        db._lock.acquire()
+    def live():
+        assert db._conn.in_transaction
+        calls.append(allowed[0])
+        if not allowed[0]:
+            raise policy.DelegationDenied('revoked while waiting for database write lock')
+    def writer():
+        try:
+            db.set_session_title('native_fixture', 'after', before_write=live)
+        except BaseException as exc:
+            failures.append(exc)
+        finally:
+            completed.set()
+    thread = threading.Thread(target=writer)
+    thread.start()
+    try:
+        assert waiting.wait(timeout=3)
+        assert not calls  # No live authorization before acquiring the held lock.
+        allowed[0] = False
+    finally:
+        if external is not None:
+            external.rollback()
+            external.close()
+        else:
+            db._lock.release()
+    try:
+        assert completed.wait(timeout=3)
+        thread.join(timeout=3)
+        assert not thread.is_alive()
+        assert calls == [False]
+        assert len(failures) == 1 and isinstance(failures[0], policy.DelegationDenied)
+        assert db.get_session_title('native_fixture') == 'before'
+        assert not db._conn.in_transaction
+    finally:
+        db._conn.set_trace_callback(None)
+        db.close()
+
+
+def test_title_authority_repeats_on_real_transaction_retry(monkeypatch, tmp_path):
+    import sqlite3
+    from hermes_state import SessionDB
+    db = SessionDB(tmp_path / 'retry-control.db')
+    db.create_session('native_fixture', 'api_server')
+    db.set_session_title('native_fixture', 'before')
+    checks = []
+    def live():
+        assert db._conn.in_transaction
+        checks.append(True)
+        if len(checks) == 1:
+            # Exercise the actual rollback/retry path; no fake database or write.
+            raise sqlite3.OperationalError('database is locked')
+    monkeypatch.setattr('hermes_state.time.sleep', lambda _delay: None)
+    try:
+        assert db.set_session_title('native_fixture', 'after', before_write=live)
+        assert checks == [True, True]
+        assert db.get_session_title('native_fixture') == 'after'
+    finally:
+        db.close()

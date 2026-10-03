@@ -2135,12 +2135,15 @@ class APIServerAdapter(BasePlatformAdapter):
             try:
                 control = verify_session_title_control(request.headers, method=request.method,
                     path=request.raw_path, raw_body=raw_body, native_id=session_id, body=body)
-                validate_session_title_control(control)
             except DelegationDenied:
                 return web.json_response(_openai_error("Atlas session title control is no longer authorized", code="atlas_control_denied"), status=403)
-            # No await or additional resource acquisition after the live callback.
             try:
-                db.set_session_title(session_id, body["title"])
+                # Live authority follows both DB locks/BEGIN IMMEDIATE, inside
+                # each attempted transaction, with no await before the write.
+                db.set_session_title(session_id, body["title"],
+                    before_write=lambda: validate_session_title_control(control))
+            except DelegationDenied:
+                return web.json_response(_openai_error("Atlas session title control is no longer authorized", code="atlas_control_denied"), status=403)
             except ValueError as exc:
                 return web.json_response(_openai_error(str(exc), code="invalid_title"), status=400)
             session = db.get_session(session_id) or session

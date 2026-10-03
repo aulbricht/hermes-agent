@@ -512,7 +512,10 @@ def test_scoped_actual_sdk_uses_process_key_and_rejects_request_auth_override(mo
     def provider(request):
         sent.append(request)
         return httpx.Response(200, json={'id': 'fixture', 'object': 'chat.completion', 'created': 1, 'model': 'gpt-6-luna', 'choices': [{'index': 0, 'message': {'role': 'assistant', 'content': 'ok'}, 'finish_reason': 'stop'}]})
-    monkeypatch.setattr(httpx, 'Client', lambda **kwargs: real_client(transport=httpx.MockTransport(provider), **kwargs))
+    class MockTransportClient(real_client):
+        def __init__(self, **kwargs):
+            super().__init__(transport=httpx.MockTransport(provider), **kwargs)
+    monkeypatch.setattr(httpx, 'Client', MockTransportClient)
     monkeypatch.setenv('OPENROUTER_API_KEY', 'synthetic-process-key')
     monkeypatch.setenv('OPENAI_ORG_ID', 'synthetic-env-org')
     monkeypatch.setenv('OPENAI_PROJECT_ID', 'synthetic-env-project')
