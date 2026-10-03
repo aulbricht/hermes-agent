@@ -241,7 +241,18 @@ def _get_firecrawl_client() -> Any:
         # Import an already installed SDK directly: no lazy-deps installer/proxy.
         from firecrawl import Firecrawl as ScopedFirecrawl
         check_admission_open(current_dispatch_agent())
-        return ScopedFirecrawl(**kwargs)
+        client = ScopedFirecrawl(**kwargs)
+        transport = client._v2_client.http_client
+        def post(endpoint, data, headers=None, timeout=None, **options):
+            from agent.atlas_delegation import scoped_requests_post, DelegationDenied
+            name = "web_search" if endpoint.rstrip("/").endswith("/search") else "web_extract" if endpoint.rstrip("/").endswith("/scrape") else None
+            if name is None:
+                raise DelegationDenied("Atlas delegation Firecrawl endpoint is unavailable")
+            return scoped_requests_post(transport._build_url(endpoint), name,
+                json=data, headers=headers or transport._prepare_headers(), timeout=timeout or 60)
+        # Replace only this instance's v2 transport. SDK parsing stays intact.
+        transport.post = post
+        return client
 
     direct_config = _get_direct_firecrawl_config()
     if direct_config is not None and not _wt.prefers_gateway("web"):

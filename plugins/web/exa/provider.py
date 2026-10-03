@@ -56,6 +56,18 @@ def _get_exa_client() -> Any:
         check_admission_open(current_dispatch_agent())
         client = Exa(api_key=key)
         client.headers["x-exa-integration"] = "hermes-agent"
+        def request(endpoint, data=None, method="POST", params=None, headers=None):
+            from agent.atlas_delegation import scoped_requests_post, DelegationDenied
+            from exa_py.api import ExaJSONEncoder
+            import json
+            name = "web_search" if endpoint == "/search" else "web_extract" if endpoint == "/contents" else None
+            if method != "POST" or name is None:
+                raise DelegationDenied("Atlas delegation Exa endpoint is unavailable")
+            response = scoped_requests_post(client.base_url + endpoint, name,
+                data=json.dumps(data, cls=ExaJSONEncoder), headers={**client.headers, **(headers or {})}, timeout=60)
+            response.raise_for_status()
+            return response.json()
+        client.request = request
         return client
 
     cached = getattr(_wt, "_exa_client", None)

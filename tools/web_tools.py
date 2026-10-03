@@ -544,7 +544,9 @@ def _truncate_with_footer(
         tail = tail[nl + 1:]
 
     total = len(content)
-    stored_path = _store_full_text(url, content)
+    from agent.atlas_delegation import current_dispatch_agent
+    scoped = current_dispatch_agent() is not None
+    stored_path = None if scoped else _store_full_text(url, content)
     shown = len(head) + len(tail)
 
     footer_lines = [
@@ -553,7 +555,9 @@ def _truncate_with_footer(
         f"Showing {len(head):,} chars (head) + {len(tail):,} chars (tail) "
         f"of {total:,} total clean characters.",
     ]
-    if stored_path:
+    if scoped:
+        footer_lines.append("Omitted content was not stored in this View As session. Use a more specific URL to narrow the extraction.")
+    elif stored_path:
         # The omitted middle begins right after the head we're showing. Give
         # the model a concrete starting line (head line count + 1) so its first
         # read_file lands in the gap instead of guessing <line>. read_file is
@@ -731,8 +735,10 @@ def web_search_tool(query: str, limit: int = 5) -> str:
         debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
         result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
         debug_call_data["final_response_size"] = len(result_json)
-        _debug.log_call("web_search_tool", debug_call_data)
-        _debug.save()
+        from agent.atlas_delegation import current_dispatch_agent
+        if current_dispatch_agent() is None:
+            _debug.log_call("web_search_tool", debug_call_data)
+            _debug.save()
         return result_json
 
     except Exception as e:
@@ -740,8 +746,10 @@ def web_search_tool(query: str, limit: int = 5) -> str:
         logger.debug("%s", error_msg)
 
         debug_call_data["error"] = error_msg
-        _debug.log_call("web_search_tool", debug_call_data)
-        _debug.save()
+        from agent.atlas_delegation import current_dispatch_agent
+        if current_dispatch_agent() is None:
+            _debug.log_call("web_search_tool", debug_call_data)
+            _debug.save()
 
         return tool_error(error_msg)
 
@@ -1045,8 +1053,10 @@ async def web_extract_tool(
         debug_call_data["processing_applied"].append("base64_image_conversion")
         
         # Log debug information
-        _debug.log_call("web_extract_tool", debug_call_data)
-        _debug.save()
+        from agent.atlas_delegation import current_dispatch_agent
+        if current_dispatch_agent() is None:
+            _debug.log_call("web_extract_tool", debug_call_data)
+            _debug.save()
         
         return cleaned_result
             
@@ -1055,8 +1065,10 @@ async def web_extract_tool(
         logger.debug("%s", error_msg)
         
         debug_call_data["error"] = error_msg
-        _debug.log_call("web_extract_tool", debug_call_data)
-        _debug.save()
+        from agent.atlas_delegation import current_dispatch_agent
+        if current_dispatch_agent() is None:
+            _debug.log_call("web_extract_tool", debug_call_data)
+            _debug.save()
         
         return tool_error(error_msg)
 

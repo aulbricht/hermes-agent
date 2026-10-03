@@ -76,7 +76,10 @@ def _get_sync_client() -> Any:
             raise ValueError("Scoped Parallel requires a direct process credential")
         from parallel import Parallel
         check_admission_open(current_dispatch_agent())
-        return Parallel(api_key=key, max_retries=0)
+        import httpx
+        from agent.atlas_delegation import validate_web_send
+        transport = httpx.Client(follow_redirects=False, trust_env=False, event_hooks={"request": [lambda request: validate_web_send("web_search")]})
+        return Parallel(api_key=key, max_retries=0, http_client=transport)
 
     cached = getattr(_wt, "_parallel_client", None)
     if cached is not None:
@@ -113,7 +116,12 @@ def _get_async_client() -> Any:
             raise ValueError("Scoped Parallel requires a direct process credential")
         from parallel import AsyncParallel
         check_admission_open(current_dispatch_agent())
-        return AsyncParallel(api_key=key, max_retries=0)
+        import httpx
+        from agent.atlas_delegation import validate_web_send
+        async def authorize(request):
+            validate_web_send("web_extract")
+        transport = httpx.AsyncClient(follow_redirects=False, trust_env=False, event_hooks={"request": [authorize]})
+        return AsyncParallel(api_key=key, max_retries=0, http_client=transport)
 
     cached = getattr(_wt, "_async_parallel_client", None)
     if cached is not None:

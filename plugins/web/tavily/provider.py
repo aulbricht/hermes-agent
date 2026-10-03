@@ -61,7 +61,8 @@ def _tavily_request(endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
 
     from agent.atlas_delegation import validate_web_send
     validate_web_send("web_extract" if endpoint.lstrip("/") == "extract" else "web_search")
-    response = httpx.post(url, json=payload, timeout=60)
+    scoped_options = {"follow_redirects": False} if current_dispatch_agent() is not None else {}
+    response = httpx.post(url, json=payload, timeout=60, **scoped_options)
     response.raise_for_status()
     return response.json()
 

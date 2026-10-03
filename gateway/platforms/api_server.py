@@ -1558,7 +1558,11 @@ class APIServerAdapter(BasePlatformAdapter):
         )
         from hermes_cli.tools_config import _get_platform_tools
 
-        runtime_kwargs = _resolve_runtime_agent_kwargs()
+        if atlas_delegation_context is not None:
+            from agent.atlas_delegation import scoped_runtime_kwargs
+            runtime_kwargs = scoped_runtime_kwargs(_load_gateway_config(), (route or {}).get("provider"))
+        else:
+            runtime_kwargs = _resolve_runtime_agent_kwargs()
         reasoning_config = GatewayRunner._load_reasoning_config()
         model = _resolve_gateway_model()
 
@@ -1590,12 +1594,15 @@ class APIServerAdapter(BasePlatformAdapter):
                 # provider auth instead of the default provider's key.
                 try:
                     from gateway.run import _resolve_runtime_agent_kwargs_for_provider
-                    provider_kwargs = _resolve_runtime_agent_kwargs_for_provider(
-                        route["provider"]
-                    )
+                    if atlas_delegation_context is not None:
+                        provider_kwargs = scoped_runtime_kwargs(_load_gateway_config(), route["provider"])
+                    else:
+                        provider_kwargs = _resolve_runtime_agent_kwargs_for_provider(route["provider"])
                     provider_kwargs.pop("model", None)
                     runtime_kwargs.update(provider_kwargs)
                 except Exception:
+                    if atlas_delegation_context is not None:
+                        raise
                     # Fall back to just switching the provider name; explicit
                     # per-route api_key/base_url below can still complete auth.
                     runtime_kwargs["provider"] = route["provider"]
@@ -1604,9 +1611,9 @@ class APIServerAdapter(BasePlatformAdapter):
             # Per-route secrets are upstream provider credentials. Never log
             # them (compare _check_auth: caller auth stays the global bearer
             # key checked with hmac.compare_digest).
-            if route.get("api_key"):
+            if route.get("api_key") and atlas_delegation_context is None:
                 runtime_kwargs["api_key"] = route["api_key"]
-            if route.get("base_url"):
+            if route.get("base_url") and atlas_delegation_context is None:
                 runtime_kwargs["base_url"] = route["base_url"]
             if route.get("reasoning_effort"):
                 reasoning_config = {

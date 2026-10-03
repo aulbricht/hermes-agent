@@ -188,6 +188,34 @@ def resolve_web_readers():
     return readers
 
 
+def scoped_requests_post(url, name, **kwargs):
+    """One authorized Requests send; never replay redirects or retry implicitly."""
+    import requests
+    validate_web_send(name)
+    response = requests.post(url, allow_redirects=False, **kwargs)
+    if 300 <= response.status_code < 400:
+        raise DelegationDenied("Atlas delegation web redirects are unavailable")
+    return response
+
+
+def scoped_runtime_kwargs(config, requested=None):
+    """Process credentials plus read-only config; no auth pools/recovery/OAuth."""
+    model = config.get("model", {})
+    model = model if isinstance(model, dict) else {}
+    provider = requested or model.get("provider") or "openai-api"
+    routes = {"openai-api": ("OPENAI_API_KEY", "https://api.openai.com/v1"),
+        "openrouter": ("OPENROUTER_API_KEY", "https://openrouter.ai/api/v1")}
+    if provider not in routes:
+        raise DelegationDenied("Atlas delegation model provider is not governed")
+    key_name, base_url = routes[provider]
+    key = os.environ.get(key_name, "").strip()
+    if not key:
+        raise DelegationDenied("Atlas delegation requires a process model credential")
+    return {"provider": provider, "api_key": key, "base_url": base_url,
+        "api_mode": "codex_responses", "credential_pool": None,
+        "max_tokens": model.get("max_tokens") if isinstance(model.get("max_tokens"), int) else None}
+
+
 def readonly_web_env(name):
     """Scoped credentials are process-only; never resolve OAuth or modify auth."""
     check_admission_open(current_dispatch_agent())

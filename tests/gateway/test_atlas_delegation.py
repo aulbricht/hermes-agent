@@ -140,3 +140,23 @@ async def test_uncertain_paid_attempt_withholds_answer_but_returns_durable_ident
     assert row["attempt_id"] == "attempt_fixture" and row["generation_id"] == "observed_failure"
     assert row["actor_user_id"] == "actor" and row["resource_id"] == "turn_fixture"
     assert row["usage_available"] is False and "input_tokens" not in row and "cost_usd" not in row
+
+
+@pytest.mark.parametrize("routed", [False, True])
+def test_scoped_agent_runtime_never_enters_shared_auth_recovery(monkeypatch, routed):
+    from types import SimpleNamespace
+    from agent import atlas_delegation as policy
+    monkeypatch.setenv("OPENROUTER_API_KEY", "process-only-fixture")
+    monkeypatch.setattr(policy, "resolve_web_readers", lambda: {})
+    monkeypatch.setattr(policy, "bind_policy", lambda *args: None)
+    monkeypatch.setattr(policy, "validate_dispatch", lambda *args: None)
+    adapter = APIServerAdapter(PlatformConfig(enabled=True))
+    monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+    config = {"model": {"provider": "openrouter", "default": "gpt-6.1-sol"}}
+    with patch("gateway.run._load_gateway_config", return_value=config), patch("gateway.run._resolve_runtime_agent_kwargs") as ordinary, patch("gateway.run._resolve_runtime_agent_kwargs_for_provider") as routed_resolver, patch("agent.credential_pool._save_auth_store") as write, patch("run_agent.AIAgent", return_value=SimpleNamespace()) as constructor:
+        adapter._create_agent(atlas_delegation_context={"actor_user_id": "actor"}, route={"provider": "openrouter", "model": "gpt-6.1-sol", "api_key": "config-key-must-not-override"} if routed else None)
+    ordinary.assert_not_called()
+    routed_resolver.assert_not_called()
+    write.assert_not_called()
+    assert constructor.call_args.kwargs["api_key"] == "process-only-fixture"
+    assert constructor.call_args.kwargs["credential_pool"] is None

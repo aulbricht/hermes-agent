@@ -138,7 +138,7 @@ def test_scoped_sdk_setup_never_installs_or_resolves_managed_auth(monkeypatch, b
     import importlib
     import sys
     provider = importlib.import_module("plugins.web." + backend + ".provider")
-    create = MagicMock(return_value=SimpleNamespace(headers={}))
+    create = MagicMock(return_value=SimpleNamespace(headers={}, _v2_client=SimpleNamespace(http_client=SimpleNamespace())))
     monkeypatch.setitem(sys.modules, module, SimpleNamespace(**{constructor: create}))
     monkeypatch.setenv(key, "fixture")
     agent = SimpleNamespace(_atlas_delegation_policy=policy.POLICY_VERSION, _atlas_paid_dispatch_lock=threading.Lock())
@@ -223,3 +223,106 @@ def test_closed_tavily_never_reads_credentials_or_sends(monkeypatch):
         tavily._tavily_request("extract", {})
     lookup.assert_not_called()
     send.assert_not_called()
+
+
+@pytest.mark.parametrize("status", [301, 302, 307, 308])
+def test_scoped_firecrawl_redirect_is_rejected_before_second_send(monkeypatch, status):
+    import sys
+    import requests
+    from plugins.web.firecrawl import provider as firecrawl
+    agent = SimpleNamespace(_atlas_delegation_policy=policy.POLICY_VERSION, _atlas_paid_dispatch_lock=threading.Lock())
+    checks = []
+    monkeypatch.setattr(policy, "tool_allowed", lambda agent, name: checks.append(name) or True)
+    monkeypatch.setenv("FIRECRAWL_API_KEY", "fixture")
+    transport = SimpleNamespace(_build_url=lambda endpoint: "https://api.firecrawl.dev" + endpoint, _prepare_headers=lambda: {})
+    sdk = SimpleNamespace(_v2_client=SimpleNamespace(http_client=transport))
+    sdk.search = lambda **kwargs: transport.post("/v2/search", kwargs)
+    monkeypatch.setitem(sys.modules, "firecrawl", SimpleNamespace(Firecrawl=lambda **kwargs: sdk))
+    response = requests.Response()
+    response.status_code = status
+    response.headers["Location"] = "https://api.firecrawl.dev/second"
+    def send(*args, **kwargs):
+        assert kwargs["allow_redirects"] is False
+        agent._atlas_admission_closed = True
+        return response
+    with patch("requests.post", side_effect=send) as actual, policy.dispatch_context(agent):
+        result = firecrawl.FirecrawlWebSearchProvider().search("read")
+    assert result["success"] is False and "redirect" in result["error"]
+    actual.assert_called_once()
+    assert checks == ["web_search", "web_search"]
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+def test_scoped_parallel_transport_does_not_follow_redirects(monkeypatch, async_mode):
+    import sys
+    import httpx
+    from plugins.web.parallel import provider as parallel
+    agent = SimpleNamespace(_atlas_delegation_policy=policy.POLICY_VERSION, _atlas_paid_dispatch_lock=threading.Lock())
+    monkeypatch.setenv("PARALLEL_API_KEY", "fixture")
+    checks, sends = [], []
+    monkeypatch.setattr(policy, "tool_allowed", lambda agent, name: checks.append(name) or True)
+    def sdk(**kwargs):
+        return kwargs["http_client"]
+    monkeypatch.setitem(sys.modules, "parallel", SimpleNamespace(Parallel=sdk, AsyncParallel=sdk))
+    def send(request):
+        sends.append(request.url.path)
+        agent._atlas_admission_closed = True
+        return httpx.Response(307, headers={"location": "/second"})
+    if async_mode:
+        async def run():
+            client = parallel._get_async_client()
+            client._transport = httpx.MockTransport(send)
+            try:
+                return await client.post("https://api.parallel.ai/first")
+            finally:
+                await client.aclose()
+        with policy.dispatch_context(agent):
+            response = asyncio.run(run())
+    else:
+        with policy.dispatch_context(agent):
+            client = parallel._get_sync_client()
+            client._transport = httpx.MockTransport(send)
+            try:
+                response = client.post("https://api.parallel.ai/first")
+            finally:
+                client.close()
+    assert response.status_code == 307 and sends == ["/first"]
+    assert checks == ["web_extract" if async_mode else "web_search"]
+
+
+def test_long_scoped_extraction_has_no_persistent_cache_or_debug_write(monkeypatch):
+    from tools import web_tools
+    async def safe(url):
+        return True
+    monkeypatch.setattr(web_tools, "async_is_safe_url", safe)
+    def extract(urls, **kwargs):
+        return [{"url": urls[0], "content": "x" * 15001}]
+    provider = SimpleNamespace(name="fixture")
+    agent = SimpleNamespace(_atlas_delegation_policy=policy.POLICY_VERSION, _atlas_paid_dispatch_lock=threading.Lock(), _atlas_web_readers={"web_extract": (provider, extract)})
+    monkeypatch.setattr(policy, "tool_allowed", lambda *args: True)
+    with patch.object(web_tools, "_store_full_text") as store, patch.object(web_tools._debug, "save") as debug, policy.dispatch_context(agent):
+        result = json.loads(asyncio.run(web_tools.web_extract_tool(["https://example.com/"], char_limit=15000)))
+    content = result["results"][0]["content"]
+    assert "TRUNCATED" in content and "not stored" in content
+    assert "read_file" not in content and "browser_navigate" not in content
+    store.assert_not_called()
+    debug.assert_not_called()
+
+
+
+def test_scoped_exa_sdk_request_rejects_redirect_without_second_hop(monkeypatch):
+    import sys
+    from plugins.web.exa import provider as exa
+    monkeypatch.setenv("EXA_API_KEY", "fixture")
+    client = SimpleNamespace(headers={}, base_url="https://api.exa.ai")
+    monkeypatch.setitem(sys.modules, "exa_py", SimpleNamespace(Exa=lambda **kwargs: client))
+    monkeypatch.setitem(sys.modules, "exa_py.api", SimpleNamespace(ExaJSONEncoder=json.JSONEncoder))
+    agent = SimpleNamespace(_atlas_delegation_policy=policy.POLICY_VERSION, _atlas_paid_dispatch_lock=threading.Lock())
+    monkeypatch.setattr(policy, "tool_allowed", lambda *args: True)
+    response = SimpleNamespace(status_code=307)
+    with policy.dispatch_context(agent), patch("requests.post", return_value=response) as send:
+        actual = exa._get_exa_client()
+        with pytest.raises(policy.DelegationDenied, match="redirect"):
+            actual.request("/search", {"query": "read"})
+    send.assert_called_once()
+    assert send.call_args.kwargs["allow_redirects"] is False
