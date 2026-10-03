@@ -2078,8 +2078,11 @@ def get_model_context_length(
     8. Hardcoded defaults (broad family patterns, longest-key-first)
     9. Default fallback (256K)"""
     if credential_scope_active():
-        # Conservative static sizing, independent of shared caches/live metadata.
-        return min(config_context_length, 32768) if isinstance(config_context_length, int) and config_context_length > 0 else 32768
+        # Bound the governed lane to Hermes's supported minimum, not the 256K
+        # unknown-model fallback or the deployed profile's larger 100K window.
+        # Keep a smaller explicit limit visible so the constructor still rejects
+        # unsupported configurations; never probe metadata to raise it.
+        return min(config_context_length, MINIMUM_CONTEXT_LENGTH) if isinstance(config_context_length, int) and config_context_length > 0 else MINIMUM_CONTEXT_LENGTH
     # 0. Explicit config override — user knows best
     if config_context_length is not None and isinstance(config_context_length, int) and config_context_length > 0:
         return config_context_length

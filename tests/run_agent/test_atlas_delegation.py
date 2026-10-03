@@ -471,7 +471,7 @@ def test_scoped_metadata_and_shared_auth_are_inert_even_on_cold_cache(monkeypatc
         with policy.dispatch_context(agent):
             assert model_metadata.fetch_model_metadata(force_refresh=True) == {}
             assert model_metadata.fetch_endpoint_model_metadata('https://openrouter.ai/api/v1', force_refresh=True) == {}
-            assert model_metadata.get_model_context_length('unknown', config_context_length=100000) == 32768
+            assert model_metadata.get_model_context_length('unknown', config_context_length=100000) == model_metadata.MINIMUM_CONTEXT_LENGTH
             with pytest.raises(policy.DelegationDenied):
                 model_metadata.save_context_length('unknown', '', 99999)
             with pytest.raises(policy.DelegationDenied):
@@ -543,7 +543,7 @@ def test_actual_scoped_constructor_starts_no_metadata_or_terminal_background_wor
     with patch('hermes_cli.config.load_config', return_value={'agent': {'environment_probe': True}}), patch('agent.agent_init.fetch_model_metadata') as prewarm, patch('tools.env_probe.warm_environment_probe_async') as probe, patch('requests.get') as network, patch('agent.model_metadata.atomic_json_write') as cache, patch('openai.OpenAI') as sdk, patch('agent.credential_pool.load_pool') as pool:
         agent = AIAgent(atlas_delegation_policy=policy.POLICY_VERSION, provider='openrouter', api_key='ignored-config-key', model='openai/gpt-6-luna', quiet_mode=True)
         assert agent._environment_probe is False
-        assert agent.context_compressor.context_length <= 32768
+        assert agent.context_compressor.context_length == 64000
         assert sdk.call_args.kwargs['api_key'] == 'synthetic-process-key'
         prewarm.assert_not_called()
         probe.assert_not_called()
