@@ -25,6 +25,10 @@ def _clean_state():
     while not process_registry.completion_queue.empty():
         process_registry.completion_queue.get_nowait()
     yield
+    # The production reset deliberately does not join daemon workers. Tests
+    # must finish them before draining the shared queue for the next case.
+    if ad._executor is not None:
+        ad._executor.shutdown(wait=True)
     ad._reset_for_tests()
     while not process_registry.completion_queue.empty():
         process_registry.completion_queue.get_nowait()

@@ -273,6 +273,10 @@ def _merge_custom_provider_extra_body(agent, custom_providers: List[Dict[str, An
     agent.request_overrides = overrides
 
 
+from agent.atlas_delegation import scoped_construction
+
+
+@scoped_construction
 def init_agent(
     agent,
     base_url: str = None,
@@ -346,7 +350,12 @@ def init_agent(
     checkpoint_max_total_size_mb: int = 500,
     checkpoint_max_file_size_mb: int = 10,
     pass_session_id: bool = False,
+    atlas_delegation_policy: str = None,
+    atlas_init_snapshot=None,
 ):
+    if atlas_delegation_policy is not None and atlas_init_snapshot is not None:
+        from agent.atlas_delegation import DelegationDenied
+        raise DelegationDenied("Atlas policies cannot be combined")
     """
     Initialize the AI Agent.
 
@@ -396,7 +405,18 @@ def init_agent(
             identity even when skip_context_files=True. Project context files from the cwd
             remain skipped.
     """
+    from agent.atlas_delegation import POLICY_VERSION
+    if atlas_delegation_policy not in (None, POLICY_VERSION):
+        raise ValueError("Unknown Atlas delegation policy")
+    agent._atlas_delegation_policy = atlas_delegation_policy
+    if atlas_delegation_policy is not None:
+        from agent.atlas_delegation import resolve_web_readers
+        resolve_web_readers()  # Before client/auth setup or general tool inventory.
+        skip_memory = skip_context_files = True
+        load_soul_identity = False
     _install_safe_stdio()
+    if atlas_init_snapshot is not None:
+        agent._atlas_init_snapshot = atlas_init_snapshot
 
     agent.model = model
     agent.max_iterations = max_iterations
@@ -540,7 +560,7 @@ def init_agent(
     # AIAgent is created for every gateway request, so without the guard
     # each message leaks one OS thread and the process eventually exhausts
     # the system thread limit (RuntimeError: can't start new thread).
-    if (agent.provider == "openrouter" or agent._is_openrouter_url()) and \
+    if atlas_delegation_policy is None and (agent.provider == "openrouter" or agent._is_openrouter_url()) and \
             not _ra()._openrouter_prewarm_done.is_set():
         _ra()._openrouter_prewarm_done.set()
         threading.Thread(
@@ -644,11 +664,14 @@ def init_agent(
     try:
         from hermes_cli.config import load_config as _load_pc_cfg
 
-        _pc_cfg = _load_pc_cfg().get("prompt_caching", {}) or {}
+        _pc_config = atlas_init_snapshot.config_copy() if atlas_init_snapshot is not None else _load_pc_cfg()
+        _pc_cfg = _pc_config.get("prompt_caching", {}) or {}
         _ttl = _pc_cfg.get("cache_ttl", "5m")
         if _ttl in {"5m", "1h"}:
             agent._cache_ttl = _ttl
     except Exception:
+        if atlas_init_snapshot is not None:
+            raise
         pass
 
     # Iteration budget: the LLM is only notified when it actually exhausts
@@ -762,7 +785,14 @@ def init_agent(
     # every client construction path below (Anthropic native, OpenAI-wire,
     # router-based implicit auth) can apply it consistently.  Bedrock
     # Claude uses its own timeout path and is not covered here.
-    _provider_timeout = get_provider_request_timeout(agent.provider, agent.model)
+    if atlas_init_snapshot is None:
+        _provider_timeout = get_provider_request_timeout(agent.provider, agent.model)
+    else:
+        _provider_timeout = get_provider_request_timeout(
+            agent.provider,
+            agent.model,
+            config=atlas_init_snapshot.config_copy(),
+        )
 
     if agent.api_mode == "anthropic_messages":
         from agent.anthropic_adapter import build_anthropic_client, resolve_anthropic_token
@@ -901,7 +931,9 @@ def init_agent(
         agent._bedrock_guardrail_config = None
         try:
             from hermes_cli.config import load_config as _load_br_cfg
-            _gr = _load_br_cfg().get("bedrock", {}).get("guardrail", {})
+
+            _br_config = atlas_init_snapshot.config_copy() if atlas_init_snapshot is not None else _load_br_cfg()
+            _gr = _br_config.get("bedrock", {}).get("guardrail", {})
             if _gr.get("guardrail_identifier") and _gr.get("guardrail_version"):
                 agent._bedrock_guardrail_config = {
                     "guardrailIdentifier": _gr["guardrail_identifier"],
@@ -912,6 +944,8 @@ def init_agent(
                 if _gr.get("trace"):
                     agent._bedrock_guardrail_config["trace"] = _gr["trace"]
         except Exception:
+            if atlas_init_snapshot is not None:
+                raise
             pass
         agent.client = None
         agent._client_kwargs = {}
@@ -1096,42 +1130,35 @@ def init_agent(
         # OpenAI SDK's identifying headers swap in a plain User-Agent. (#40033)
         # client_kwargs is the same dict object as agent._client_kwargs, so
         # this mutation is reflected in the client built just below.
-        agent._apply_user_default_headers()
+        if atlas_delegation_policy is None:
+            agent._apply_user_default_headers()
 
-        try:
-            from hermes_cli.config import (
-                apply_custom_provider_extra_headers_to_client_kwargs,
-                apply_custom_provider_tls_to_client_kwargs,
-                get_compatible_custom_providers,
-                load_config,
-            )
+            try:
+                from hermes_cli.config import (
+                    apply_custom_provider_extra_headers_to_client_kwargs,
+                    apply_custom_provider_tls_to_client_kwargs,
+                    get_compatible_custom_providers,
+                    load_config,
+                )
 
-            _cp_config = load_config()
-            _cp_entries = get_compatible_custom_providers(_cp_config)
-            _cp_base_url = str(client_kwargs.get("base_url") or agent.base_url or "")
-            apply_custom_provider_tls_to_client_kwargs(
-                client_kwargs,
-                _cp_base_url,
-                _cp_entries,
-            )
-            # Per-provider extra HTTP headers (providers.<name>.extra_headers /
-            # custom_providers[].extra_headers) — proxies, gateways, custom
-            # auth. Applied last so the most specific config level wins.
-            # SECURITY: values may carry credentials — never log them.
-            apply_custom_provider_extra_headers_to_client_kwargs(
-                client_kwargs,
-                _cp_base_url,
-                _cp_entries,
-            )
-        except Exception:
-            logger.debug("custom-provider TLS resolution skipped", exc_info=True)
+                _cp_config = atlas_init_snapshot.config_copy() if atlas_init_snapshot is not None else load_config()
+                _cp_entries = get_compatible_custom_providers(_cp_config)
+                _cp_base_url = str(client_kwargs.get("base_url") or agent.base_url or "")
+                apply_custom_provider_tls_to_client_kwargs(client_kwargs, _cp_base_url, _cp_entries)
+                # These values may carry credentials; never log them.
+                apply_custom_provider_extra_headers_to_client_kwargs(client_kwargs, _cp_base_url, _cp_entries)
+            except Exception:
+                if atlas_init_snapshot is not None:
+                    raise
+                logger.debug("custom-provider TLS resolution skipped", exc_info=True)
 
         agent.api_key = client_kwargs.get("api_key", "")
         agent.base_url = client_kwargs.get("base_url", agent.base_url)
         try:
             from agent.ssl_guard import verify_ca_bundle_with_fallback
 
-            verify_ca_bundle_with_fallback()
+            if atlas_delegation_policy is None:
+                verify_ca_bundle_with_fallback()
             agent.client = agent._create_openai_client(client_kwargs, reason="agent_init", shared=True)
             if not agent.quiet_mode:
                 print(f"🤖 AI Agent initialized with model: {agent.model}")
@@ -1181,16 +1208,28 @@ def init_agent(
     # Get available tools with filtering. Capture the registry generation this
     # snapshot is derived from FIRST, so a later concurrent refresh can tell
     # whether it holds a newer or staler view (see refresh_agent_mcp_tools).
-    try:
-        from tools.registry import registry as _snapshot_registry
-        agent._tool_snapshot_generation = _snapshot_registry._generation
-    except Exception:
-        agent._tool_snapshot_generation = 0
-    agent.tools = _ra().get_tool_definitions(
-        enabled_toolsets=enabled_toolsets,
-        disabled_toolsets=disabled_toolsets,
-        quiet_mode=agent.quiet_mode,
-    )
+    if atlas_delegation_policy is not None:
+        from agent.atlas_delegation import resolve_policy
+        try:
+            from tools.registry import registry as _snapshot_registry
+            agent._tool_snapshot_generation = _snapshot_registry._generation
+        except Exception:
+            agent._tool_snapshot_generation = 0
+        agent.tools = resolve_policy()[0]
+    elif atlas_init_snapshot is not None:
+        agent._tool_snapshot_generation = atlas_init_snapshot.tool_generation
+        agent.tools = atlas_init_snapshot.tools_copy()
+    else:
+        try:
+            from tools.registry import registry as _snapshot_registry
+            agent._tool_snapshot_generation = _snapshot_registry._generation
+        except Exception:
+            agent._tool_snapshot_generation = 0
+        agent.tools = _ra().get_tool_definitions(
+            enabled_toolsets=enabled_toolsets,
+            disabled_toolsets=disabled_toolsets,
+            quiet_mode=agent.quiet_mode,
+        )
     
     # Show tool configuration and store valid tool names for validation
     agent.valid_tool_names = set()
@@ -1219,7 +1258,7 @@ def init_agent(
     )
 
     # Check tool requirements
-    if agent.tools and not agent.quiet_mode:
+    if agent.tools and not agent.quiet_mode and atlas_delegation_policy is None:
         requirements = _ra().check_toolset_requirements()
         missing_reqs = [name for name, available in requirements.items() if not available]
         if missing_reqs:
@@ -1277,9 +1316,13 @@ def init_agent(
     agent._session_json_enabled = False
     try:
         from hermes_cli.config import load_config as _load_sess_cfg
-        _sess_cfg = (_load_sess_cfg().get("sessions") or {})
+
+        _sess_config = atlas_init_snapshot.config_copy() if atlas_init_snapshot is not None else _load_sess_cfg()
+        _sess_cfg = (_sess_config.get("sessions") or {})
         agent._session_json_enabled = bool(_sess_cfg.get("write_json_snapshots", False))
     except Exception:
+        if atlas_init_snapshot is not None:
+            raise
         pass
     # logs_dir is retained unconditionally for request_dump_*.json (debug
     # breadcrumb path written by agent_runtime_helpers.dump_api_request_debug).
@@ -1337,8 +1380,11 @@ def init_agent(
     # Load config once for memory, skills, and compression sections
     try:
         from hermes_cli.config import load_config as _load_agent_config
-        _agent_cfg = _load_agent_config()
+
+        _agent_cfg = atlas_init_snapshot.config_copy() if atlas_init_snapshot is not None else _load_agent_config()
     except Exception:
+        if atlas_init_snapshot is not None:
+            raise
         _agent_cfg = {}
     try:
         agent._tool_guardrails = ToolCallGuardrailController(
@@ -1486,7 +1532,7 @@ def init_agent(
     # the probe is skipped entirely (no subprocess calls, no system-prompt
     # line).  Useful for users on exotic setups where the probe heuristics
     # are noisy.
-    agent._environment_probe = bool(_agent_section.get("environment_probe", True))
+    agent._environment_probe = atlas_delegation_policy is None and bool(_agent_section.get("environment_probe", True))
     # Warm the probe off-thread: it shells out to python3/pip (~0.5s of
     # subprocess round-trips) and its result lands in the FIRST system
     # prompt build, which sits on the time-to-first-token critical path.
@@ -1762,7 +1808,7 @@ def init_agent(
     _engine_name = "compressor"  # default
     try:
         _ctx_cfg = _agent_cfg.get("context", {}) if isinstance(_agent_cfg, dict) else {}
-        _engine_name = _ctx_cfg.get("engine", "compressor") or "compressor"
+        _engine_name = "compressor" if atlas_delegation_policy else (_ctx_cfg.get("engine", "compressor") or "compressor")
     except Exception:
         pass
 
@@ -2131,7 +2177,5 @@ def init_agent(
             "anthropic_base_url": agent._anthropic_base_url,
             "is_anthropic_oauth": agent._is_anthropic_oauth,
         })
-
-
 
 __all__ = ["init_agent"]

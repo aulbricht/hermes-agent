@@ -3864,6 +3864,8 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
     """
 
     def _handler(args: dict, **kwargs) -> str:
+        from agent.atlas_delegation import DelegationDenied, current_dispatch_agent, validate_mcp_send
+        scoped_agent = current_dispatch_agent()
         # Circuit breaker: if this server has failed too many times
         # consecutively, short-circuit with a clear message so the model
         # stops retrying and uses alternative approaches (#10447).
@@ -3934,6 +3936,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
         async def _call():
             _mark_server_call_started(server)
             async with server._rpc_lock:
+                validate_mcp_send(scoped_agent, server_name, server)
                 # Snapshot the agent's context so an elicitation callback
                 # triggered during this call (fired on the MCP recv loop
                 # task, which doesn't inherit our contextvars) can replay
@@ -4002,6 +4005,8 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             return result
         except InterruptedError:
             return _interrupted_call_result()
+        except DelegationDenied:
+            return json.dumps({"error": "Tool is unavailable in this Atlas View As session"})
         except Exception as exc:
             # Auth-specific recovery path: consult the manager, signal
             # reconnect if viable, retry once. Returns None to fall
@@ -5264,6 +5269,10 @@ def refresh_agent_mcp_tools(
     explicit user consent; the late-binding and between-turns paths only rebuild
     at a turn boundary, before that turn's ``tools=`` prefix is assembled).
     """
+    from agent.atlas_delegation import is_scoped
+    if is_scoped(agent):
+        return set()  # Scoped turn schemas/grants remain fixed after authentication.
+
     from model_tools import get_tool_definitions
     from tools.registry import registry
 

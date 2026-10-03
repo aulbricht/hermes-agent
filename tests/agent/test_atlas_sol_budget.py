@@ -1,5 +1,9 @@
+import threading
+
 from decimal import Decimal
 from types import SimpleNamespace
+
+import pytest
 
 from agent import atlas_sol_budget as budget
 
@@ -196,9 +200,9 @@ def test_codex_iteration_summary_and_retry_each_use_admission(monkeypatch):
     assert all(call["model"] == budget.SOL for call in admitted)
 
 
-def test_sol_stream_transport_failure_does_not_hide_billable_retry(monkeypatch):
+@pytest.mark.parametrize("model", ["gpt-6.1-sol", "openai/gpt-6.1-sol"])
+def test_sol_stream_transport_failure_does_not_hide_billable_retry(monkeypatch, model):
     import httpx
-    import pytest
     from agent.codex_runtime import run_codex_stream
 
     monkeypatch.setenv("ATLAS_SOL_ACCOUNTING_SOCKET", "/tmp/accounting.sock")
@@ -219,8 +223,86 @@ def test_sol_stream_transport_failure_does_not_hide_billable_retry(monkeypatch):
         _client_log_context=lambda: "test",
     )
     with pytest.raises(httpx.ConnectError):
-        run_codex_stream(agent, {"model": budget.SOL}, client=client)
+        run_codex_stream(agent, {"model": model}, client=client)
     assert len(calls) == 1
+
+
+@pytest.mark.parametrize("transport,model", [("openai", "gpt-6.1-sol"),
+                                            ("openrouter", "openai/gpt-6.1-sol")])
+@pytest.mark.parametrize("failure_stage", ["connect", "stream"])
+def test_sol_transport_failure_has_one_reservation_and_uncertain_paid_attempt(
+    monkeypatch, transport, model, failure_stage,
+):
+    import httpx
+    from agent import atlas_delegation as delegation
+    from agent.codex_runtime import run_codex_stream
+
+    monkeypatch.setenv("ATLAS_MODEL_ROUTING_ENABLED", "true")
+    monkeypatch.setenv("ATLAS_MODEL_ROUTING_TRANSPORT", transport)
+    monkeypatch.setenv("ATLAS_SOL_ACCOUNTING_SOCKET", "/synthetic/accounting.sock")
+    monkeypatch.setenv("ATLAS_SOL_ACCOUNTING_TOKEN_FILE", "/synthetic/accounting.token")
+    monkeypatch.setattr(budget, "_read_token", lambda _path: "fixture-token")
+    accounting = []
+    def post(_socket, _token, path, body):
+        accounting.append((path, body))
+        return {"status": "reserved"} if path.endswith("reservations") else {"status": "settled"}
+    monkeypatch.setattr(budget, "_post", post)
+    monkeypatch.setattr(delegation, "validate_dispatch", lambda _agent: None)
+    sends = []
+    class Responses:
+        def create(self, **kwargs):
+            sends.append(kwargs)
+            if failure_stage == "connect":
+                raise httpx.ConnectError("uncertain provider send")
+            def interrupted_stream():
+                yield SimpleNamespace(type="response.created", response=SimpleNamespace(id="observed"))
+                raise httpx.ReadTimeout("uncertain stream")
+            return interrupted_stream()
+    client = SimpleNamespace(responses=Responses())
+    agent = SimpleNamespace(
+        model=model, _atlas_delegation_policy=delegation.POLICY_VERSION,
+        _atlas_delegation_identities={"receipt_limit": "256"},
+        _atlas_paid_dispatch_lock=threading.Lock(), _atlas_paid_dispatch_count=0,
+        _atlas_paid_attempts=[], _atlas_paid_uncertain=False,
+        _atlas_paid_active=set(), _atlas_admission_closed=False,
+        _interrupt_requested=False, _fire_stream_delta=lambda _text: None,
+        _fire_reasoning_delta=lambda _text: None, _touch_activity=lambda _text: None,
+        _client_log_context=lambda: "fixture",
+    )
+    with pytest.raises((httpx.ConnectError, httpx.ReadTimeout)):
+        budget.admitted_call(agent, {"model": model, "input": "fixture", "max_output_tokens": 32},
+                             lambda outbound: run_codex_stream(agent, outbound, client=client))
+    assert len(sends) == 1 and sends[0]["model"] == model
+    assert [path.rsplit("/", 1)[-1] for path, _ in accounting] == ["reservations", "settlements"]
+    assert agent._atlas_paid_dispatch_count == 1
+    assert len(agent._atlas_paid_attempts) == 1
+    assert agent._atlas_paid_uncertain is True
+    assert agent._atlas_paid_attempts[0]["dispatch_status"] == "uncertain"
+    assert agent._atlas_paid_attempts[0]["usage_available"] is False
+    assert accounting[1][1]["estimated"] is True
+
+
+def test_ordinary_stream_connect_retry_remains_available(monkeypatch):
+    import httpx
+    from agent.codex_runtime import run_codex_stream
+
+    monkeypatch.delenv("ATLAS_SOL_ACCOUNTING_SOCKET", raising=False)
+    sends = []
+    response = SimpleNamespace(output=[], usage=None)
+    class Responses:
+        def create(self, **kwargs):
+            sends.append(kwargs)
+            if len(sends) == 1:
+                raise httpx.ConnectError("transient")
+            return response
+    client = SimpleNamespace(responses=Responses())
+    agent = SimpleNamespace(
+        _interrupt_requested=False, _fire_stream_delta=lambda _text: None,
+        _fire_reasoning_delta=lambda _text: None, _touch_activity=lambda _text: None,
+        _client_log_context=lambda: "fixture",
+    )
+    assert run_codex_stream(agent, {"model": "gpt-6-luna"}, client=client) is response
+    assert len(sends) == 2
 
 
 def test_accounting_token_rejects_group_writable_file(tmp_path):
@@ -244,3 +326,179 @@ def test_luna_summary_usage_is_included_in_turn_receipts(monkeypatch):
     assert call["provider"] == "openai" and call["route_request_id"] == "turn-fixture"
     assert call["input_tokens"] == 20 and call["input_tokens_total"] == 100 and call["output_tokens"] == 50
     assert call["cache_read_tokens"] == 80 and call["reasoning_tokens"] == 20
+
+
+def test_admission_policy_snapshot_is_frozen_and_projection_excludes_paths(monkeypatch):
+    monkeypatch.setenv("ATLAS_MODEL_ROUTING_ENABLED", "true")
+    monkeypatch.setenv("ATLAS_MODEL_ROUTING_TRANSPORT", "openrouter")
+    monkeypatch.setenv("ATLAS_SOL_ACCOUNTING_SOCKET", "/private/run/accounting.sock")
+    monkeypatch.setenv("ATLAS_SOL_ACCOUNTING_TOKEN_FILE", "/private/run/token")
+    policy = budget.capture_admission_policy()
+    projection = budget.canonical_admission_policy_projection(policy)
+    assert policy.enabled is True
+    assert policy.transport == "openrouter"
+    assert policy.sol_model == "gpt-6.1-sol"
+    assert policy.luna_model == "gpt-6-luna"
+    assert projection["provider_order"] == ["openai"]
+    assert projection["provider_only"] == ["openai"]
+    assert projection["allow_fallbacks"] is False
+    assert projection["require_parameters"] is True
+    assert projection["request_service_tier"] == "auto"
+    assert "/private/run" not in repr(projection)
+    assert policy.accounting_socket_ref_sha256
+    assert policy.accounting_token_file_ref_sha256
+    monkeypatch.setenv("ATLAS_MODEL_ROUTING_TRANSPORT", "openai")
+    monkeypatch.setattr(budget, "SOL", "changed-sol")
+    assert policy.transport == "openrouter"
+    assert policy.sol_model == "gpt-6.1-sol"
+    assert budget.canonical_admission_policy_projection() != projection
+
+
+def test_guarded_admission_uses_one_policy_snapshot_through_luna_fallback(monkeypatch):
+    monkeypatch.setenv("ATLAS_MODEL_ROUTING_ENABLED", "true")
+    monkeypatch.setenv("ATLAS_MODEL_ROUTING_TRANSPORT", "openrouter")
+    monkeypatch.setenv("ATLAS_SOL_ACCOUNTING_SOCKET", "/tmp/test-accounting.sock")
+    monkeypatch.setenv("ATLAS_SOL_ACCOUNTING_TOKEN_FILE", "/tmp/test-accounting-token")
+    monkeypatch.setattr(budget, "_read_token", lambda _path: "fixture-token")
+    events = []
+
+    def post(_socket, _token, path, body):
+        events.append((path, body))
+        return {"status": "denied"}
+
+    monkeypatch.setattr(budget, "_post", post)
+    checked = []
+    prepared_policy = budget.capture_admission_policy()
+
+    class Guard:
+        prepared = SimpleNamespace(policy=prepared_policy)
+
+        def check_policy(self, policy):
+            checked.append(("policy", policy))
+            # Prove routing/limit/pinning after this point use the frozen input.
+            monkeypatch.setenv("ATLAS_MODEL_ROUTING_TRANSPORT", "openai")
+            monkeypatch.setattr(budget, "SOL", "changed-sol")
+            monkeypatch.setattr(budget, "LUNA", "changed-luna")
+
+        def check_dispatch(self, agent, outbound, policy):
+            checked.append(("dispatch", policy, dict(outbound)))
+
+        def authorize_budget_fallback(self, policy, source_model, target_model, effort):
+            checked.append(("fallback-authorized", policy, source_model, target_model, effort))
+            return "authorized-marker"
+
+    agent = SimpleNamespace(model=budget.SOL, _atlas_resolution_guard=Guard())
+    seen = {}
+
+    def perform(payload):
+        seen.update(payload)
+        return "ok"
+
+    assert budget.admitted_call(
+        agent, {"model": "gpt-6.1-sol", "max_output_tokens": 500, "input": "hello"}, perform,
+    ) == "ok"
+    reserved_payload = budget._pin_openrouter_provider(
+        {"model": "openai/gpt-6.1-sol", "max_output_tokens": 500, "input": "hello"}, checked[0][1],
+    )
+    assert Decimal(events[0][1]["max_usd"]) == budget._maximum_usd(reserved_payload, checked[0][1])
+    assert seen["model"] == "openai/gpt-6-luna"
+    assert seen["extra_body"]["provider"] == {
+        "order": ["openai"], "only": ["openai"],
+        "allow_fallbacks": False, "require_parameters": True,
+    }
+    assert seen["service_tier"] == "auto"
+    assert seen["reasoning"]["effort"] == "xhigh"
+    assert [item[0] for item in checked] == ["policy", "fallback-authorized", "dispatch"]
+    assert checked[2][1] is prepared_policy
+    assert checked[2][2]["model"] == "openai/gpt-6-luna"
+    assert agent._atlas_sol_budget_fallback == "authorized-marker"
+
+
+def test_guard_rejections_propagate_before_reservation_or_provider_dispatch(monkeypatch):
+    import pytest
+
+    monkeypatch.setenv("ATLAS_MODEL_ROUTING_ENABLED", "true")
+    monkeypatch.setenv("ATLAS_SOL_ACCOUNTING_SOCKET", "/tmp/test-accounting.sock")
+    monkeypatch.setenv("ATLAS_SOL_ACCOUNTING_TOKEN_FILE", "/tmp/test-accounting-token")
+    monkeypatch.setattr(budget, "_read_token", lambda _path: "fixture-token")
+    events = []
+    monkeypatch.setattr(budget, "_post", lambda *_args: events.append("reserve") or {"status": "reserved"})
+
+    class PolicyGuard:
+        prepared = SimpleNamespace(policy=budget.capture_admission_policy())
+
+        def check_policy(self, _policy):
+            raise RuntimeError("policy drift")
+
+        def check_dispatch(self, _agent, _payload, _policy):
+            raise RuntimeError("dispatch drift")
+
+    with pytest.raises(RuntimeError, match="policy drift"):
+        budget.admitted_call(
+            SimpleNamespace(model=budget.SOL, _atlas_resolution_guard=PolicyGuard()),
+            {"model": budget.SOL, "max_output_tokens": 500}, lambda _payload: pytest.fail("dispatched"),
+        )
+    assert events == []
+
+    # When dispatch validation rejects after reservation, it still propagates
+    # and the provider callable remains untouched.
+    class DispatchGuard:
+        prepared = SimpleNamespace(policy=budget.capture_admission_policy())
+
+        def check_policy(self, _policy):
+            return None
+
+        def check_dispatch(self, _agent, _payload, _policy):
+            raise RuntimeError("dispatch drift")
+
+    with pytest.raises(RuntimeError, match="dispatch drift"):
+        budget.admitted_call(
+            SimpleNamespace(model=budget.SOL, _atlas_resolution_guard=DispatchGuard()),
+            {"model": budget.SOL, "max_output_tokens": 500}, lambda _payload: pytest.fail("dispatched"),
+        )
+    assert events == ["reserve", "reserve"]
+
+
+def test_accounting_tokens_fail_closed_without_posix_identity(tmp_path, monkeypatch):
+    import pytest
+    from agent import atlas_auxiliary_accounting
+
+    token_file = tmp_path / "accounting-token"
+    token_file.write_text("fixture-only\n", encoding="utf-8")
+    token_file.chmod(0o600)
+    for name in ("geteuid", "getegid", "getgroups"):
+        with monkeypatch.context() as patch:
+            patch.delattr(budget.os, name, raising=False)
+            for module in (budget, atlas_auxiliary_accounting):
+                with pytest.raises(ValueError, match="posix_identity_unavailable"):
+                    module._read_token(token_file)
+
+
+def test_accounting_tokens_enforce_owner_group_and_modes(tmp_path, monkeypatch):
+    import pytest
+    from agent import atlas_auxiliary_accounting
+
+    token_file = tmp_path / "accounting-token"
+    token_file.write_text("fixture-only\n", encoding="utf-8")
+    owner = token_file.stat().st_uid
+    group = token_file.stat().st_gid
+    monkeypatch.setattr(budget.os, "geteuid", lambda: owner, raising=False)
+    monkeypatch.setattr(budget.os, "getegid", lambda: group + 1, raising=False)
+    monkeypatch.setattr(budget.os, "getgroups", lambda: [group], raising=False)
+    for module in (budget, atlas_auxiliary_accounting):
+        token_file.chmod(0o600)
+        assert module._read_token(token_file) == "fixture-only"
+        token_file.chmod(0o640)
+        assert module._read_token(token_file) == "fixture-only"
+        with monkeypatch.context() as patch:
+            patch.setattr(budget.os, "getgroups", lambda: [])
+            with pytest.raises(ValueError, match="unavailable_atlas_accounting_token_group"):
+                module._read_token(token_file)
+        with monkeypatch.context() as patch:
+            patch.setattr(budget.os, "geteuid", lambda: owner + 1)
+            if owner != 0:
+                with pytest.raises(ValueError, match="untrusted_atlas_accounting_token_owner"):
+                    module._read_token(token_file)
+        token_file.chmod(0o660)
+        with pytest.raises(ValueError, match="unsafe_atlas_accounting_token_file"):
+            module._read_token(token_file)

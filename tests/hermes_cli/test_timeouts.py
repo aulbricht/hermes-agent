@@ -268,6 +268,27 @@ def test_resolved_api_call_stale_timeout_priority(monkeypatch, tmp_path):
     assert agent2._resolved_api_call_stale_timeout_base() == (90.0, True)
 
 
+def test_guarded_stale_timeout_uses_original_snapshot_without_config_reload(monkeypatch, tmp_path):
+    from agent.atlas_init_snapshot import capture_atlas_init_snapshot
+    from run_agent import AIAgent
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _write_config(tmp_path, "providers:\n  openai-codex:\n    stale_timeout_seconds: 10\n")
+    snapshot = capture_atlas_init_snapshot(
+        config={"providers": {"openai-codex": {"stale_timeout_seconds": 600}}},
+        tool_definitions=[], tool_generation=0,
+    )
+    agent = object.__new__(AIAgent)
+    agent.provider = "openai-codex"
+    agent.model = "gpt-5.4"
+    agent._atlas_init_snapshot = snapshot
+    import hermes_cli.config
+    def forbidden():
+        raise AssertionError("guarded timeout reloaded mutable config")
+    monkeypatch.setattr(hermes_cli.config, "load_config_readonly", forbidden)
+    assert agent._resolved_api_call_stale_timeout_base() == (600.0, False)
+
+
 def test_default_non_stream_stale_timeout_auto_disables_for_local_endpoints(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     (tmp_path / ".env").write_text("", encoding="utf-8")
