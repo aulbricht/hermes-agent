@@ -234,13 +234,15 @@ def test_optional_observer_failure_does_not_skip_provider_dispatch(failure, monk
 
 
 def test_process_identity_parses_parentheses_and_unavailable_platform(monkeypatch):
-    def read(path):
+    def read(path, *, encoding):
+        assert encoding == "utf-8"
         if str(path) == "/proc/self/stat":
             return "123 (python (worker)) " + " ".join(["S"] + ["0"] * 18 + ["54321"])
         return "12345678-1234-1234-1234-123456789abc\n"
     monkeypatch.setattr(evidence.Path, "read_text", read)
     assert evidence.process_identity()["start_ticks"] == 54321
-    def unavailable(_):
+    def unavailable(_, *, encoding):
+        assert encoding == "utf-8"
         raise FileNotFoundError
     monkeypatch.setattr(evidence.Path, "read_text", unavailable)
     assert evidence.process_identity()["state"] == "start_identity_unavailable"

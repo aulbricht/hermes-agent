@@ -375,3 +375,48 @@ def test_guard_rejections_propagate_before_reservation_or_provider_dispatch(monk
             {"model": budget.SOL, "max_output_tokens": 500}, lambda _payload: pytest.fail("dispatched"),
         )
     assert events == ["reserve", "reserve"]
+
+
+def test_accounting_tokens_fail_closed_without_posix_identity(tmp_path, monkeypatch):
+    import pytest
+    from agent import atlas_auxiliary_accounting
+
+    token_file = tmp_path / "accounting-token"
+    token_file.write_text("fixture-only\n", encoding="utf-8")
+    token_file.chmod(0o600)
+    for name in ("geteuid", "getegid", "getgroups"):
+        with monkeypatch.context() as patch:
+            patch.delattr(budget.os, name, raising=False)
+            for module in (budget, atlas_auxiliary_accounting):
+                with pytest.raises(ValueError, match="posix_identity_unavailable"):
+                    module._read_token(token_file)
+
+
+def test_accounting_tokens_enforce_owner_group_and_modes(tmp_path, monkeypatch):
+    import pytest
+    from agent import atlas_auxiliary_accounting
+
+    token_file = tmp_path / "accounting-token"
+    token_file.write_text("fixture-only\n", encoding="utf-8")
+    owner = token_file.stat().st_uid
+    group = token_file.stat().st_gid
+    monkeypatch.setattr(budget.os, "geteuid", lambda: owner, raising=False)
+    monkeypatch.setattr(budget.os, "getegid", lambda: group + 1, raising=False)
+    monkeypatch.setattr(budget.os, "getgroups", lambda: [group], raising=False)
+    for module in (budget, atlas_auxiliary_accounting):
+        token_file.chmod(0o600)
+        assert module._read_token(token_file) == "fixture-only"
+        token_file.chmod(0o640)
+        assert module._read_token(token_file) == "fixture-only"
+        with monkeypatch.context() as patch:
+            patch.setattr(budget.os, "getgroups", lambda: [])
+            with pytest.raises(ValueError, match="unavailable_atlas_accounting_token_group"):
+                module._read_token(token_file)
+        with monkeypatch.context() as patch:
+            patch.setattr(budget.os, "geteuid", lambda: owner + 1)
+            if owner != 0:
+                with pytest.raises(ValueError, match="untrusted_atlas_accounting_token_owner"):
+                    module._read_token(token_file)
+        token_file.chmod(0o660)
+        with pytest.raises(ValueError, match="unsafe_atlas_accounting_token_file"):
+            module._read_token(token_file)

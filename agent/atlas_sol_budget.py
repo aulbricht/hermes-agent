@@ -196,12 +196,18 @@ def _validate_bounded_text_request(payload: dict[str, Any]) -> None:
 
 
 def _read_token(path: Path) -> str:
+    # The protected accounting socket and token ownership policy require POSIX.
+    geteuid = getattr(os, "geteuid", None)
+    getegid = getattr(os, "getegid", None)
+    getgroups = getattr(os, "getgroups", None)
+    if not all(callable(fn) for fn in (geteuid, getegid, getgroups)):
+        raise ValueError("atlas_accounting_posix_identity_unavailable")
     info = path.lstat()
     if not stat.S_ISREG(info.st_mode) or info.st_mode & 0o037:
         raise ValueError("unsafe_atlas_accounting_token_file")
-    if info.st_uid not in {0, os.geteuid()}:
+    if info.st_uid not in {0, geteuid()}:
         raise ValueError("untrusted_atlas_accounting_token_owner")
-    if info.st_mode & 0o040 and info.st_gid not in {os.getegid(), *os.getgroups()}:
+    if info.st_mode & 0o040 and info.st_gid not in {getegid(), *getgroups()}:
         raise ValueError("unavailable_atlas_accounting_token_group")
     value = path.read_text(encoding="utf-8").strip()
     if not value:

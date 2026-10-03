@@ -168,9 +168,9 @@ def process_identity():
               "state": "start_identity_unavailable"}
     try:
         # Linux proc stat's command field can contain spaces and parentheses.
-        fields = Path("/proc/self/stat").read_text().rsplit(")", 1)[1].split()
+        fields = Path("/proc/self/stat").read_text(encoding="utf-8").rsplit(")", 1)[1].split()
         ticks = int(fields[19])  # field 22, tail starts at field 3
-        boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+        boot = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="utf-8").strip()
         import uuid
         if ticks > 0 and str(uuid.UUID(boot)) == boot:
             result.update(start_ticks=ticks, boot_id=boot, state="linux_proc_identity")
