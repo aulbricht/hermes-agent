@@ -1477,6 +1477,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_complete_callback=None,
         gateway_session_key: Optional[str] = None,
         route: Optional[Dict[str, Any]] = None,
+        toolset_scope: Optional[List[str]] = None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -1576,6 +1577,10 @@ class APIServerAdapter(BasePlatformAdapter):
 
         user_config = _load_gateway_config()
         enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
+        if toolset_scope is not None:
+            # Request scope can only remove configured tools. Keep it local to
+            # this agent instance; the API server's default remains unchanged.
+            enabled_toolsets = sorted(set(enabled_toolsets).intersection(toolset_scope))
 
         max_iterations = _current_max_iterations()
         if route and not session_override and route.get("max_iterations"):
@@ -2196,6 +2201,22 @@ class APIServerAdapter(BasePlatformAdapter):
         body, err = await self._read_json_body(request)
         if err:
             return err
+        toolset_scope = body.get("toolset_scope")
+        if toolset_scope is not None:
+            if (not isinstance(toolset_scope, list) or len(toolset_scope) > 32
+                    or any(not isinstance(name, str) or not name or len(name) > 80
+                           for name in toolset_scope)
+                    or len(toolset_scope) != len(set(toolset_scope))):
+                return web.json_response(_openai_error(
+                    "toolset_scope must be a list of distinct toolset names",
+                    code="invalid_toolset_scope"), status=400)
+            from gateway.run import _load_gateway_config
+            from hermes_cli.tools_config import _get_platform_tools
+            configured = _get_platform_tools(_load_gateway_config(), "api_server")
+            if not set(toolset_scope).issubset(configured):
+                return web.json_response(_openai_error(
+                    "toolset_scope cannot enable unconfigured toolsets",
+                    code="invalid_toolset_scope"), status=400)
         user_message, err = _session_chat_user_message(body)
         if err is not None:
             return err
@@ -2266,6 +2287,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     provider_user_hash=provider_user_hash or None,
                     atlas_route_request_id=atlas_route_request_id,
                     route=route,
+                    toolset_scope=toolset_scope,
                 )
                 final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
                 effective_session_id = result.get("session_id", session_id) if isinstance(result, dict) else session_id
@@ -4359,6 +4381,7 @@ class APIServerAdapter(BasePlatformAdapter):
         route: Optional[Dict[str, Any]] = None,
         provider_user_hash: Optional[str] = None,
         atlas_route_request_id: Optional[str] = None,
+        toolset_scope: Optional[List[str]] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -4395,6 +4418,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     tool_complete_callback=tool_complete_callback,
                     gateway_session_key=gateway_session_key,
                     route=route,
+                    toolset_scope=toolset_scope,
                 )
                 if provider_user_hash:
                     overrides = dict(getattr(agent, "request_overrides", {}) or {})

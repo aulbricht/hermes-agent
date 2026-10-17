@@ -102,6 +102,7 @@ async def test_run_agent_binds_api_session_context_for_tool_env(adapter, monkeyp
             return {"final_response": "ok"}
 
     def fake_create_agent(**kwargs):
+        observed["toolset_scope"] = kwargs["toolset_scope"]
         return FakeAgent(kwargs["session_id"])
 
     monkeypatch.setattr(adapter, "_create_agent", fake_create_agent)
@@ -112,6 +113,7 @@ async def test_run_agent_binds_api_session_context_for_tool_env(adapter, monkeyp
         session_id="request-session",
         gateway_session_key="request-key",
         atlas_route_request_id="atlas-route-123",
+        toolset_scope=["web"],
     )
 
     assert result["session_id"] == "request-session"
@@ -123,6 +125,7 @@ async def test_run_agent_binds_api_session_context_for_tool_env(adapter, monkeyp
         "context_platform": "api_server",
         "context_session_key": "request-key",
         "child_session_id": "request-session",
+        "toolset_scope": ["web"],
     }
 
 
@@ -338,6 +341,46 @@ async def test_session_chat_stream_uses_configured_model_route(session_db):
             await response.text()
     assert captured["route"] == {"model": "gpt-6.1-sol", "provider": "openai-api", "reasoning_effort": "low"}
     assert captured["atlas_route_request_id"] == "atlas-route-abc_123"
+
+
+@pytest.mark.asyncio
+async def test_session_chat_stream_scopes_tools_for_one_turn(adapter, session_db):
+    session_id = session_db.create_session("scoped-session", "api_server")
+    scopes = []
+
+    async def fake_run(**kwargs):
+        scopes.append(kwargs["toolset_scope"])
+        return {"final_response": "done", "session_id": session_id}, {"total_tokens": 2}
+
+    with patch.object(adapter, "_run_agent", side_effect=fake_run):
+        async with TestClient(TestServer(_create_session_app(adapter))) as cli:
+            scoped = await cli.post(
+                f"/api/sessions/{session_id}/chat/stream",
+                json={"message": "use web", "toolset_scope": ["web"]},
+            )
+            assert scoped.status == 200
+            await scoped.text()
+            ordinary = await cli.post(
+                f"/api/sessions/{session_id}/chat/stream", json={"message": "hello"},
+            )
+            assert ordinary.status == 200
+            await ordinary.text()
+    assert scopes == [["web"], None]
+
+
+@pytest.mark.asyncio
+async def test_session_chat_stream_rejects_toolset_widening(adapter, session_db):
+    session_id = session_db.create_session("scope-reject-session", "api_server")
+    with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as run:
+        async with TestClient(TestServer(_create_session_app(adapter))) as cli:
+            for scope in (["not-a-configured-toolset"], "web", ["web", "web"]):
+                response = await cli.post(
+                    f"/api/sessions/{session_id}/chat/stream",
+                    json={"message": "hello", "toolset_scope": scope},
+                )
+                assert response.status == 400
+                assert (await response.json())["error"]["code"] == "invalid_toolset_scope"
+    run.assert_not_called()
 
 
 @pytest.mark.asyncio

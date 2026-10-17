@@ -118,6 +118,26 @@ class TestApiServerPlatformConfig:
 
 class TestApiServerAdapterToolset:
     @patch("gateway.platforms.api_server.AIOHTTP_AVAILABLE", True)
+    def test_create_agent_turn_scope_only_narrows_configured_tools(self):
+        from gateway.platforms.api_server import APIServerAdapter
+        from gateway.config import PlatformConfig
+
+        adapter = APIServerAdapter(PlatformConfig())
+        with patch("gateway.run._resolve_runtime_agent_kwargs") as mock_kwargs, \
+             patch("gateway.run._resolve_gateway_model", return_value="test/model"), \
+             patch("gateway.run._load_gateway_config", return_value={
+                 "platform_toolsets": {"api_server": ["web", "terminal"]}
+             }), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_kwargs.return_value = {"api_key": "test-key", "base_url": None,
+                                        "provider": None, "api_mode": None,
+                                        "command": None, "args": []}
+            adapter._create_agent(toolset_scope=["web", "not-configured"])
+            assert mock_agent_cls.call_args.kwargs["enabled_toolsets"] == ["web"]
+            adapter._create_agent()
+            assert mock_agent_cls.call_args.kwargs["enabled_toolsets"] == ["terminal", "web"]
+
+    @patch("gateway.platforms.api_server.AIOHTTP_AVAILABLE", True)
     def test_create_agent_reads_config_toolsets(self):
         """API server resolves toolsets from config like all other platforms."""
         from gateway.platforms.api_server import APIServerAdapter
