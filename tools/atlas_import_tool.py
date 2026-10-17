@@ -11,6 +11,11 @@ from tools.registry import registry
 _capability: ContextVar[str] = ContextVar("atlas_import_capability", default="")
 _CALLBACK = "http://127.0.0.1:8243/api/v1/internal/import-tool"
 _READ_OPERATIONS = {"evidence", "catalog", "lookup"}
+_READ_ARGUMENT_KEYS = {
+    "evidence": {"offset", "limit"},
+    "catalog": {"logical_ids"},
+    "lookup": {"property_query", "property_id", "tenant_names"},
+}
 _PROPOSAL_OPERATIONS = {"propose", "revise"}
 _MAX_REQUEST_BYTES = 128 * 1024
 _MAX_RESPONSE_BYTES = 32_768
@@ -67,17 +72,23 @@ _PROPOSAL_SCHEMA = {
 
 _READ_ARGUMENTS_SCHEMA = {
     "type": "object",
-    "description": "For evidence: offset/limit. For catalog: logical_ids. For lookup: property_query or verified property_id and optional tenant_names.",
-    "properties": {
-        "offset": {"type": "integer"},
-        "limit": {"type": "integer"},
-        "logical_ids": {"type": "array", "items": {"type": "string"}},
-        "property_query": {"type": "string"},
-        "property_id": {"type": "string", "description": "Exact PRO-... ID returned by a verified Property lookup."},
-        "tenant_names": {"type": "array", "items": {"type": "string"}},
-    },
-    "additionalProperties": False,
+    "description": "Choose only the argument shape matching operation; no fields from other read operations.",
+    "anyOf": [
+        {"type": "object", "description": "evidence: cited lines, at most 50 per call",
+         "properties": {"offset": {"type": "integer", "minimum": 0},
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 50}},
+         "additionalProperties": False},
+        {"type": "object", "description": "catalog: shared Acre meanings",
+         "properties": {"logical_ids": {"type": "array", "items": {"type": "string"}}},
+         "additionalProperties": False},
+        {"type": "object", "description": "lookup: a Property query or verified Property ID",
+         "properties": {"property_query": {"type": "string"},
+                        "property_id": {"type": "string", "description": "Exact PRO-... ID returned by a verified Property lookup."},
+                        "tenant_names": {"type": "array", "items": {"type": "string"}}},
+         "additionalProperties": False},
+    ],
 }
+_READ_ARGUMENT_FIELDS = set().union(*_READ_ARGUMENT_KEYS.values())
 
 
 def bind_import_capability(value: str):
@@ -90,6 +101,23 @@ def clear_import_capability(token) -> None:
 
 def import_capability_available() -> bool:
     return bool(_capability.get())
+
+
+def _read_arguments(operation: str, arguments: dict) -> tuple[dict | None, str | None]:
+    allowed = _READ_ARGUMENT_KEYS[operation]
+    for key, value in arguments.items():
+        if key not in _READ_ARGUMENT_FIELDS:
+            return None, f"arguments.{key} is not a supported read field"
+        if key not in allowed and value not in ("", [], None) and not (key == "offset" and value == 0):
+            return None, f"arguments.{key} is not valid for {operation}"
+    selected = {key: value for key, value in arguments.items()
+                if key in allowed and value not in ("", [], None)}
+    if operation == "evidence":
+        if "limit" in selected and (type(selected["limit"]) is not int or not 1 <= selected["limit"] <= 50):
+            return None, "arguments.limit must be an integer from 1 to 50"
+        if "offset" in selected and (type(selected["offset"]) is not int or selected["offset"] < 0):
+            return None, "arguments.offset must be a nonnegative integer"
+    return selected, None
 
 
 def _forward_operation(operation: str, arguments: dict) -> str:
@@ -113,6 +141,24 @@ def _forward_operation(operation: str, arguments: dict) -> str:
                 "Content-Type": "application/json",
             }, content=encoded) as response:
                 if response.status_code != 200:
+                    if response.status_code == 422:
+                        # The callback is fixed loopback; expose only short printable
+                        # validation detail, never auth or transport errors.
+                        chunks = []
+                        size = 0
+                        for chunk in response.iter_bytes():
+                            size += len(chunk)
+                            if size > 1024:
+                                break
+                            chunks.append(chunk)
+                        if size <= 1024:
+                            try:
+                                detail = json.loads(b"".join(chunks)).get("detail")
+                                if (isinstance(detail, str) and 0 < len(detail) <= 160
+                                        and detail.isprintable()):
+                                    return json.dumps({"error": detail})
+                            except (ValueError, AttributeError):
+                                pass
                     return json.dumps({"error": "Import operation unavailable"})
                 chunks = []
                 size = 0
@@ -133,7 +179,10 @@ def _handle_atlas_import(args: dict, **_kwargs) -> str:
     if (not isinstance(args, dict) or args.get("operation") not in _READ_OPERATIONS
             or not isinstance(args.get("arguments"), dict)):
         return json.dumps({"error": "Invalid import operation"})
-    return _forward_operation(args["operation"], args["arguments"])
+    arguments, error = _read_arguments(args["operation"], args["arguments"])
+    if error:
+        return json.dumps({"error": error})
+    return _forward_operation(args["operation"], arguments)
 
 
 def _handle_atlas_import_proposal(args: dict, **_kwargs) -> str:
