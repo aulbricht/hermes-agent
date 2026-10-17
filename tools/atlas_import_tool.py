@@ -41,7 +41,9 @@ def _handle_atlas_import(args: dict, **_kwargs) -> str:
     if len(encoded) > _MAX_REQUEST_BYTES:
         return json.dumps({"error": "Import request exceeds limit"})
     try:
-        with httpx.Client(timeout=httpx.Timeout(8, connect=2), follow_redirects=False,
+        # Atlas can perform two sequential 35-second read-only FileMaker lookups
+        # while validating a proposal; keep this bounded above that budget.
+        with httpx.Client(timeout=httpx.Timeout(90, connect=2), follow_redirects=False,
                           trust_env=False) as client:
             with client.stream("POST", _CALLBACK, headers={
                 "Authorization": "Bearer " + token,

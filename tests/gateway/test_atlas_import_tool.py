@@ -75,6 +75,23 @@ def test_import_tool_accepts_a_bounded_multirow_proposal():
     assert 20_000 < seen[0] < 128 * 1024
 
 
+def test_import_tool_timeout_covers_bounded_filemaker_lookups():
+    captured = {}
+    bound = tool.bind_import_capability("atimp_" + "f" * 32)
+    try:
+        real_client = httpx.Client(transport=httpx.MockTransport(
+            lambda _request: httpx.Response(200, json={"accepted": True})))
+        def client_factory(**kwargs):
+            captured["timeout"] = kwargs["timeout"]
+            return real_client
+        with patch.object(tool.httpx, "Client", side_effect=client_factory):
+            assert json.loads(tool._handle_atlas_import({
+                "operation": "propose", "arguments": {"proposal": {}}})) == {"accepted": True}
+    finally:
+        tool.clear_import_capability(bound)
+    assert captured["timeout"].read == 90
+
+
 def test_import_tool_schema_requires_an_explicit_bound_turn():
     from model_tools import get_tool_definitions
 
