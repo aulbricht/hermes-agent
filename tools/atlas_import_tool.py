@@ -11,7 +11,7 @@ from tools.registry import registry
 _capability: ContextVar[str] = ContextVar("atlas_import_capability", default="")
 _CALLBACK = "http://127.0.0.1:8243/api/v1/internal/import-tool"
 _OPERATIONS = {"evidence", "catalog", "lookup", "propose", "revise"}
-_MAX_REQUEST_BYTES = 8_192
+_MAX_REQUEST_BYTES = 128 * 1024
 _MAX_RESPONSE_BYTES = 32_768
 
 

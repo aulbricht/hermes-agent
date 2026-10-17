@@ -50,13 +50,29 @@ def test_import_tool_rejects_bad_payload_and_redirect_without_leaking_token():
     try:
         assert "error" in json.loads(tool._handle_atlas_import({"operation": "execute", "arguments": {}}))
         assert "error" in json.loads(tool._handle_atlas_import({
-            "operation": "propose", "arguments": {"data": "x" * 9_000}}))
+            "operation": "propose", "arguments": {"data": "x" * (128 * 1024)}}))
         with patch.object(tool.httpx, "Client", return_value=client):
             assert json.loads(tool._handle_atlas_import({"operation": "catalog", "arguments": {}})) == {
                 "error": "Import operation unavailable"}
     finally:
         tool.clear_import_capability(bound)
     assert len(requests) == 1
+
+
+def test_import_tool_accepts_a_bounded_multirow_proposal():
+    seen = []
+    client = httpx.Client(transport=httpx.MockTransport(
+        lambda request: (seen.append(len(request.content)), httpx.Response(200, json={"accepted": True}))[1]),
+        follow_redirects=False)
+    bound = tool.bind_import_capability("atimp_" + "e" * 32)
+    try:
+        with patch.object(tool.httpx, "Client", return_value=client):
+            result = json.loads(tool._handle_atlas_import({
+                "operation": "propose", "arguments": {"proposal": {"cited_rows": "x" * 20_000}}}))
+    finally:
+        tool.clear_import_capability(bound)
+    assert result == {"accepted": True}
+    assert 20_000 < seen[0] < 128 * 1024
 
 
 def test_import_tool_schema_requires_an_explicit_bound_turn():
