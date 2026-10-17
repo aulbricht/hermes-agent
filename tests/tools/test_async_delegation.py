@@ -146,6 +146,7 @@ def test_rich_reinjection_block_is_self_contained():
 
 def test_dispatch_rejected_at_capacity():
     ev = threading.Event()
+    dispatched_ids = set()
 
     def blocker():
         ev.wait(timeout=5)
@@ -157,6 +158,7 @@ def test_dispatch_rejected_at_capacity():
             model="m", session_key="", runner=blocker, max_async_children=2,
         )
         assert r["status"] == "dispatched"
+        dispatched_ids.add(r["delegation_id"])
 
     r3 = ad.dispatch_async_delegation(
         goal="task3", context=None, toolsets=None, role="leaf", model="m",
@@ -165,6 +167,14 @@ def test_dispatch_rejected_at_capacity():
     assert r3["status"] == "rejected"
     assert "capacity reached" in r3["error"]
     ev.set()
+    # Both workers must finish before the next test drains the shared queue;
+    # otherwise a late completion can be mistaken for the crash test's event.
+    completed_ids = set()
+    for _ in dispatched_ids:
+        completion = _drain_one()
+        assert completion is not None
+        completed_ids.add(completion["delegation_id"])
+    assert completed_ids == dispatched_ids
 
 
 def test_crashed_runner_produces_error_completion():
