@@ -136,6 +136,26 @@ class TestApiServerAdapterToolset:
             assert mock_agent_cls.call_args.kwargs["enabled_toolsets"] == ["web"]
             adapter._create_agent()
             assert mock_agent_cls.call_args.kwargs["enabled_toolsets"] == ["terminal", "web"]
+            adapter._create_agent(atlas_import_authorized=True)
+            assert mock_agent_cls.call_args.kwargs["enabled_toolsets"] == ["terminal", "web", "atlas_import"]
+
+    @patch("gateway.platforms.api_server.AIOHTTP_AVAILABLE", True)
+    def test_import_tool_stays_off_even_if_platform_config_lists_it(self):
+        from gateway.platforms.api_server import APIServerAdapter
+        from gateway.config import PlatformConfig
+
+        adapter = APIServerAdapter(PlatformConfig())
+        with patch("gateway.run._resolve_runtime_agent_kwargs", return_value={
+                 "api_key": "test-key", "base_url": None, "provider": None,
+                 "api_mode": None, "command": None, "args": []}), \
+             patch("gateway.run._resolve_gateway_model", return_value="test/model"), \
+             patch("gateway.run._load_gateway_config", return_value={}), \
+             patch("hermes_cli.tools_config._get_platform_tools", return_value={"web", "atlas_import"}), \
+             patch("run_agent.AIAgent") as agent:
+            adapter._create_agent()
+            assert agent.call_args.kwargs["enabled_toolsets"] == ["web"]
+            adapter._create_agent(atlas_import_authorized=True)
+            assert agent.call_args.kwargs["enabled_toolsets"] == ["web", "atlas_import"]
 
     @patch("gateway.platforms.api_server.AIOHTTP_AVAILABLE", True)
     def test_create_agent_reads_config_toolsets(self):

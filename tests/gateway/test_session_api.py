@@ -92,6 +92,7 @@ async def test_run_agent_binds_api_session_context_for_tool_env(adapter, monkeyp
         def run_conversation(self, user_message, conversation_history, task_id):
             from gateway.session_context import get_session_env
             from tools.environments.local import _make_run_env
+            from tools.atlas_import_tool import import_capability_available
 
             observed["task_id"] = task_id
             observed["atlas_route_request_id"] = self._atlas_route_request_id
@@ -99,6 +100,7 @@ async def test_run_agent_binds_api_session_context_for_tool_env(adapter, monkeyp
             observed["context_platform"] = get_session_env("HERMES_SESSION_PLATFORM")
             observed["context_session_key"] = get_session_env("HERMES_SESSION_KEY")
             observed["child_session_id"] = _make_run_env({}).get("HERMES_SESSION_ID")
+            observed["import_capability_available"] = import_capability_available()
             return {"final_response": "ok"}
 
     def fake_create_agent(**kwargs):
@@ -114,6 +116,7 @@ async def test_run_agent_binds_api_session_context_for_tool_env(adapter, monkeyp
         gateway_session_key="request-key",
         atlas_route_request_id="atlas-route-123",
         toolset_scope=["web"],
+        atlas_import_capability="atimp_" + "a" * 32,
     )
 
     assert result["session_id"] == "request-session"
@@ -126,7 +129,10 @@ async def test_run_agent_binds_api_session_context_for_tool_env(adapter, monkeyp
         "context_session_key": "request-key",
         "child_session_id": "request-session",
         "toolset_scope": ["web"],
+        "import_capability_available": True,
     }
+    from tools.atlas_import_tool import import_capability_available
+    assert not import_capability_available()
 
 
 @pytest.mark.asyncio
@@ -381,6 +387,32 @@ async def test_session_chat_stream_rejects_toolset_widening(adapter, session_db)
                 assert response.status == 400
                 assert (await response.json())["error"]["code"] == "invalid_toolset_scope"
     run.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_session_chat_stream_import_token_is_out_of_band(adapter, session_db):
+    session_id = session_db.create_session("import-token-session", "api_server")
+    captured = []
+
+    async def fake_run(**kwargs):
+        captured.append(kwargs)
+        return {"final_response": "done", "session_id": session_id}, {"total_tokens": 2}
+
+    with patch.object(adapter, "_run_agent", side_effect=fake_run):
+        async with TestClient(TestServer(_create_session_app(adapter))) as cli:
+            invalid = await cli.post(f"/api/sessions/{session_id}/chat/stream", json={
+                "message": "import", "atlas_import_capability": "bad-token"})
+            assert invalid.status == 400
+            assert (await invalid.json())["error"]["code"] == "invalid_import_capability"
+            token = "atimp_" + "b" * 32
+            valid = await cli.post(f"/api/sessions/{session_id}/chat/stream", json={
+                "message": "import", "atlas_import_capability": token})
+            assert valid.status == 200
+            output = await valid.text()
+            assert token not in output
+    assert len(captured) == 1
+    assert captured[0]["atlas_import_capability"] == token
+    assert captured[0]["user_message"] == "import"
 
 
 @pytest.mark.asyncio

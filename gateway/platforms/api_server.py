@@ -1478,6 +1478,7 @@ class APIServerAdapter(BasePlatformAdapter):
         gateway_session_key: Optional[str] = None,
         route: Optional[Dict[str, Any]] = None,
         toolset_scope: Optional[List[str]] = None,
+        atlas_import_authorized: bool = False,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -1576,11 +1577,13 @@ class APIServerAdapter(BasePlatformAdapter):
             )
 
         user_config = _load_gateway_config()
-        enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
+        enabled_toolsets = sorted(set(_get_platform_tools(user_config, "api_server")) - {"atlas_import"})
         if toolset_scope is not None:
             # Request scope can only remove configured tools. Keep it local to
             # this agent instance; the API server's default remains unchanged.
             enabled_toolsets = sorted(set(enabled_toolsets).intersection(toolset_scope))
+        if atlas_import_authorized:
+            enabled_toolsets.append("atlas_import")
 
         max_iterations = _current_max_iterations()
         if route and not session_override and route.get("max_iterations"):
@@ -2202,6 +2205,12 @@ class APIServerAdapter(BasePlatformAdapter):
         if err:
             return err
         toolset_scope = body.get("toolset_scope")
+        atlas_import_capability = body.get("atlas_import_capability")
+        if atlas_import_capability is not None:
+            if (not isinstance(atlas_import_capability, str) or not re.fullmatch(
+                    r"atimp_[A-Za-z0-9_-]{32,128}", atlas_import_capability)):
+                return web.json_response(_openai_error(
+                    "Invalid import capability", code="invalid_import_capability"), status=400)
         if toolset_scope is not None:
             if (not isinstance(toolset_scope, list) or len(toolset_scope) > 32
                     or any(not isinstance(name, str) or not name or len(name) > 80
@@ -2212,7 +2221,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     code="invalid_toolset_scope"), status=400)
             from gateway.run import _load_gateway_config
             from hermes_cli.tools_config import _get_platform_tools
-            configured = _get_platform_tools(_load_gateway_config(), "api_server")
+            configured = set(_get_platform_tools(_load_gateway_config(), "api_server")) - {"atlas_import"}
             if not set(toolset_scope).issubset(configured):
                 return web.json_response(_openai_error(
                     "toolset_scope cannot enable unconfigured toolsets",
@@ -2288,6 +2297,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     atlas_route_request_id=atlas_route_request_id,
                     route=route,
                     toolset_scope=toolset_scope,
+                    atlas_import_capability=atlas_import_capability,
                 )
                 final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
                 effective_session_id = result.get("session_id", session_id) if isinstance(result, dict) else session_id
@@ -4382,6 +4392,7 @@ class APIServerAdapter(BasePlatformAdapter):
         provider_user_hash: Optional[str] = None,
         atlas_route_request_id: Optional[str] = None,
         toolset_scope: Optional[List[str]] = None,
+        atlas_import_capability: Optional[str] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -4402,12 +4413,14 @@ class APIServerAdapter(BasePlatformAdapter):
 
         def _run():
             from gateway.session_context import clear_session_vars
+            from tools.atlas_import_tool import bind_import_capability, clear_import_capability
 
             tokens = self._bind_api_server_session(
                 chat_id=session_id or "",
                 session_key=gateway_session_key or session_id or "",
                 session_id=session_id or "",
             )
+            import_token = bind_import_capability(atlas_import_capability or "")
             try:
                 agent = self._create_agent(
                     ephemeral_system_prompt=ephemeral_system_prompt,
@@ -4419,6 +4432,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     gateway_session_key=gateway_session_key,
                     route=route,
                     toolset_scope=toolset_scope,
+                    atlas_import_authorized=bool(atlas_import_capability),
                 )
                 if provider_user_hash:
                     overrides = dict(getattr(agent, "request_overrides", {}) or {})
@@ -4464,6 +4478,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     result["session_id"] = _eff_sid
                 return result, usage
             finally:
+                clear_import_capability(import_token)
                 clear_session_vars(tokens)
 
         self._activate_admitted_request()
