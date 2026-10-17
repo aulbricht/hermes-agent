@@ -101,6 +101,34 @@ def _cleanup(mcp_tool_module, name: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+def test_tool_rejections_do_not_trip_transport_breaker(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from tools import mcp_tool
+    from mcp.types import CallToolResult, TextContent
+
+    calls = []
+
+    async def reject(tool_name, arguments):
+        calls.append(tool_name)
+        return CallToolResult(isError=tool_name == "find", content=[
+            TextContent(type="text", text="Invalid criteria" if tool_name == "find" else "healthy")
+        ])
+
+    _install_stub_server(mcp_tool, "srv", reject)
+    mcp_tool._ensure_mcp_loop()
+    try:
+        mcp_tool._server_error_counts["srv"] = 1
+        handler = mcp_tool._make_tool_handler("srv", "find", 10.0)
+        for _ in range(mcp_tool._CIRCUIT_BREAKER_THRESHOLD + 1):
+            assert "Invalid criteria" in json.loads(handler({}))["error"]
+        assert mcp_tool._server_error_counts.get("srv", 0) == 0
+        health = mcp_tool._make_tool_handler("srv", "health", 10.0)
+        assert json.loads(health({}))["result"] == "healthy"
+        assert calls[-1] == "health"
+    finally:
+        _cleanup(mcp_tool, "srv")
+
+
 def test_circuit_breaker_half_opens_after_cooldown(monkeypatch, tmp_path):
     """After a tripped breaker's cooldown elapses, the *next* call must
     actually execute against the session (half-open probe). When the

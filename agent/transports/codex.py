@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional
 
 from agent.transports.base import ProviderTransport
 from agent.transports.types import NormalizedResponse, ToolCall
+from utils import base_url_host_matches
 
 
 def _content_cache_key(instructions: str, tools: Optional[List[Dict[str, Any]]]) -> Optional[str]:
@@ -303,6 +304,35 @@ class ResponsesApiTransport(ProviderTransport):
         request_overrides = params.get("request_overrides")
         if request_overrides:
             kwargs.update(request_overrides)
+
+        # GPT-6 reasoning requests reject sampling controls.  The OpenAI
+        # deployment checklist calls out temperature, top_p, and
+        # top_logprobs when effort is not `none`; Responses also rejects the
+        # Chat Completions `logprobs` include item.  Apply this only for the
+        # known OpenAI/OpenRouter routes so a custom Responses gateway can
+        # keep its own model contract.
+        model_leaf = (model or "").lower().rsplit("/", 1)[-1]
+        provider = str(params.get("provider") or "").strip().lower()
+        base_url = str(params.get("base_url") or "").lower()
+        is_openai_route = (
+            provider in {"openai", "openrouter"}
+            or base_url_host_matches(base_url, "api.openai.com")
+            or base_url_host_matches(base_url, "openrouter.ai")
+        )
+        if (
+            is_openai_route
+            and model_leaf.startswith("gpt-6")
+            and reasoning_enabled
+            and reasoning_effort != "none"
+        ):
+            for unsupported in ("temperature", "top_p", "top_logprobs", "logprobs"):
+                kwargs.pop(unsupported, None)
+            include = kwargs.get("include")
+            if isinstance(include, list):
+                kwargs["include"] = [
+                    item for item in include
+                    if item != "message.output_text.logprobs"
+                ]
 
         # xAI Responses API rejects ``service_tier`` (HTTP 400 "Argument not
         # supported: service_tier") — hit when ``/fast`` priority-processing

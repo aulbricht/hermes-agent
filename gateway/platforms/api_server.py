@@ -39,6 +39,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from functools import wraps
 import logging
+import math
 import os
 import socket as _socket
 import re
@@ -105,6 +106,62 @@ MAX_REQUEST_BYTES = 10_000_000  # 10 MB — accommodates long agent conversation
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
+
+
+def _consistent_usage_byok(usage: dict) -> bool | None:
+    """Return a BYOK flag only when every recorded call agrees explicitly."""
+    direct = usage.get("is_byok")
+    calls = usage.get("calls")
+    if calls is None:
+        return direct if isinstance(direct, bool) else None
+    if not isinstance(calls, list) or not calls:
+        return None
+    values = [call.get("is_byok") for call in calls if isinstance(call, dict)]
+    if len(values) != len(calls) or not values or not all(isinstance(value, bool) for value in values):
+        return None
+    calls_value = values[0] if all(value is values[0] for value in values) else None
+    if calls_value is None or (isinstance(direct, bool) and direct is not calls_value):
+        return None
+    return calls_value
+
+
+def _complete_byok_cost_components(usage: dict) -> tuple[float, float] | None:
+    """Aggregate BYOK cost components only when every call reports both."""
+    calls = usage.get("calls")
+    if not isinstance(calls, list) or not calls:
+        return None
+    charged_total = 0.0
+    upstream_total = 0.0
+    for call in calls:
+        if not isinstance(call, dict) or call.get("provider") != "openrouter" or call.get("is_byok") is not True:
+            return None
+        charged = call.get("actual_cost_usd")
+        upstream = call.get("upstream_cost_usd")
+        if charged is None or upstream is None or isinstance(charged, bool) or isinstance(upstream, bool):
+            return None
+        try:
+            charged_value = float(charged)
+            upstream_value = float(upstream)
+        except (TypeError, ValueError):
+            return None
+        if (not math.isfinite(charged_value) or not math.isfinite(upstream_value)
+                or charged_value < 0 or upstream_value < 0):
+            return None
+        charged_total += charged_value
+        upstream_total += upstream_value
+        if not math.isfinite(charged_total) or not math.isfinite(upstream_total):
+            return None
+    return charged_total, upstream_total
+
+
+def _has_unresolved_openrouter_byok(usage: dict) -> bool:
+    """Detect OpenRouter call records whose BYOK status is missing or mixed."""
+    calls = usage.get("calls")
+    return (
+        isinstance(calls, list)
+        and any(isinstance(call, dict) and call.get("provider") == "openrouter" for call in calls)
+        and _consistent_usage_byok(usage) is None
+    )
 
 
 def _coerce_port(value: Any, default: int = DEFAULT_PORT) -> int:
@@ -374,6 +431,18 @@ def _session_chat_user_message(body: Dict[str, Any], *, param: str = "message") 
         return _normalize_multimodal_content(user_message), None
     except ValueError as exc:
         return None, _multimodal_validation_error(exc, param=param)
+
+
+def _atlas_route_request_id(request: "web.Request") -> tuple[str | None, Optional["web.Response"]]:
+    value = request.headers.get("X-Atlas-Route-Request-ID", "")
+    if not value:
+        return None, None
+    if len(value) > 180 or not re.fullmatch(r"[A-Za-z0-9_.:-]+", value):
+        return None, web.json_response(
+            _openai_error("Invalid Atlas route request ID", code="invalid_route_request_id"),
+            status=400,
+        )
+    return value, None
 
 
 def check_api_server_requirements() -> bool:
@@ -1338,7 +1407,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 )
             return {}
 
-        allowed_keys = ("model", "provider", "api_key", "base_url")
+        allowed_keys = ("model", "provider", "api_key", "base_url", "reasoning_effort", "max_iterations")
         routes: Dict[str, Dict[str, Any]] = {}
         for alias, cfg in raw.items():
             alias_str = str(alias).strip()
@@ -1357,6 +1426,17 @@ class APIServerAdapter(BasePlatformAdapter):
                     "api_server model_routes: route %r has no 'model'; dropping", alias_str
                 )
                 continue
+            if route.get("reasoning_effort") and route["reasoning_effort"] not in {"none", "low", "medium", "high", "xhigh", "max"}:
+                logger.warning("api_server model_routes: dropping route %r with invalid reasoning effort", alias_str)
+                continue
+            if route.get("max_iterations"):
+                try:
+                    bound = int(route["max_iterations"])
+                except ValueError:
+                    bound = 0
+                if not 1 <= bound <= 90:
+                    logger.warning("api_server model_routes: dropping route %r with invalid iteration cap", alias_str)
+                    continue
             routes[alias_str] = route
         return routes
 
@@ -1397,6 +1477,8 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_complete_callback=None,
         gateway_session_key: Optional[str] = None,
         route: Optional[Dict[str, Any]] = None,
+        toolset_scope: Optional[List[str]] = None,
+        atlas_import_authorized: bool = False,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -1478,6 +1560,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 runtime_kwargs["api_key"] = route["api_key"]
             if route.get("base_url"):
                 runtime_kwargs["base_url"] = route["base_url"]
+            if route.get("reasoning_effort"):
+                reasoning_config = {
+                    "enabled": route["reasoning_effort"] != "none",
+                    "effort": route["reasoning_effort"],
+                }
             logger.debug(
                 "api_server model route applied: model=%s provider=%s",
                 model,
@@ -1490,9 +1577,17 @@ class APIServerAdapter(BasePlatformAdapter):
             )
 
         user_config = _load_gateway_config()
-        enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
+        enabled_toolsets = sorted(set(_get_platform_tools(user_config, "api_server")) - {"atlas_import"})
+        if toolset_scope is not None:
+            # Request scope can only remove configured tools. Keep it local to
+            # this agent instance; the API server's default remains unchanged.
+            enabled_toolsets = sorted(set(enabled_toolsets).intersection(toolset_scope))
+        if atlas_import_authorized:
+            enabled_toolsets.append("atlas_import")
 
         max_iterations = _current_max_iterations()
+        if route and not session_override and route.get("max_iterations"):
+            max_iterations = min(max_iterations, int(route["max_iterations"]))
 
         # Load fallback provider chain so the API server platform has the
         # same fallback behaviour as Telegram/Discord/Slack (fixes #4954).
@@ -2059,6 +2154,17 @@ class APIServerAdapter(BasePlatformAdapter):
         system_prompt = body.get("system_message") or body.get("instructions")
         if system_prompt is not None and not isinstance(system_prompt, str):
             return web.json_response(_openai_error("system_message must be a string", code="invalid_system_message"), status=400)
+        provider_user_hash = request.headers.get("X-Atlas-Provider-User", "")
+        if provider_user_hash and not re.fullmatch(r"atlas-(?:system|[0-9a-f]{48})", provider_user_hash):
+            return web.json_response(_openai_error("Invalid provider user attribution", code="invalid_provider_user"), status=400)
+        atlas_route_request_id, route_id_err = _atlas_route_request_id(request)
+        if route_id_err is not None:
+            return route_id_err
+        # Session turns need the same per-request model routes as the
+        # OpenAI-compatible endpoints. A route is selected only from the
+        # server's configured alias map; callers cannot supply arbitrary
+        # provider URLs, keys, or reasoning settings.
+        route = self._resolve_route(body.get("model"))
         history = self._conversation_history_for_session(session_id)
         result, usage = await self._run_agent(
             user_message=user_message,
@@ -2066,6 +2172,9 @@ class APIServerAdapter(BasePlatformAdapter):
             ephemeral_system_prompt=system_prompt,
             session_id=session_id,
             gateway_session_key=gateway_session_key,
+            provider_user_hash=provider_user_hash or None,
+            atlas_route_request_id=atlas_route_request_id,
+            route=route,
         )
         effective_session_id = result.get("session_id") if isinstance(result, dict) else session_id
         final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
@@ -2095,12 +2204,41 @@ class APIServerAdapter(BasePlatformAdapter):
         body, err = await self._read_json_body(request)
         if err:
             return err
+        toolset_scope = body.get("toolset_scope")
+        atlas_import_capability = body.get("atlas_import_capability")
+        if atlas_import_capability is not None:
+            if (not isinstance(atlas_import_capability, str) or not re.fullmatch(
+                    r"atimp_[A-Za-z0-9_-]{32,128}", atlas_import_capability)):
+                return web.json_response(_openai_error(
+                    "Invalid import capability", code="invalid_import_capability"), status=400)
+        if toolset_scope is not None:
+            if (not isinstance(toolset_scope, list) or len(toolset_scope) > 32
+                    or any(not isinstance(name, str) or not name or len(name) > 80
+                           for name in toolset_scope)
+                    or len(toolset_scope) != len(set(toolset_scope))):
+                return web.json_response(_openai_error(
+                    "toolset_scope must be a list of distinct toolset names",
+                    code="invalid_toolset_scope"), status=400)
+            from gateway.run import _load_gateway_config
+            from hermes_cli.tools_config import _get_platform_tools
+            configured = set(_get_platform_tools(_load_gateway_config(), "api_server")) - {"atlas_import"}
+            if not set(toolset_scope).issubset(configured):
+                return web.json_response(_openai_error(
+                    "toolset_scope cannot enable unconfigured toolsets",
+                    code="invalid_toolset_scope"), status=400)
         user_message, err = _session_chat_user_message(body)
         if err is not None:
             return err
         system_prompt = body.get("system_message") or body.get("instructions")
         if system_prompt is not None and not isinstance(system_prompt, str):
             return web.json_response(_openai_error("system_message must be a string", code="invalid_system_message"), status=400)
+        provider_user_hash = request.headers.get("X-Atlas-Provider-User", "")
+        if provider_user_hash and not re.fullmatch(r"atlas-(?:system|[0-9a-f]{48})", provider_user_hash):
+            return web.json_response(_openai_error("Invalid provider user attribution", code="invalid_provider_user"), status=400)
+        atlas_route_request_id, route_id_err = _atlas_route_request_id(request)
+        if route_id_err is not None:
+            return route_id_err
+        route = self._resolve_route(body.get("model"))
 
         loop = asyncio.get_running_loop()
         queue: "asyncio.Queue[Optional[tuple[str, Dict[str, Any]]]]" = asyncio.Queue()
@@ -2155,6 +2293,11 @@ class APIServerAdapter(BasePlatformAdapter):
                     stream_delta_callback=_delta,
                     tool_progress_callback=_tool_progress,
                     gateway_session_key=gateway_session_key,
+                    provider_user_hash=provider_user_hash or None,
+                    atlas_route_request_id=atlas_route_request_id,
+                    route=route,
+                    toolset_scope=toolset_scope,
+                    atlas_import_capability=atlas_import_capability,
                 )
                 final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
                 effective_session_id = result.get("session_id", session_id) if isinstance(result, dict) else session_id
@@ -2526,6 +2669,23 @@ class APIServerAdapter(BasePlatformAdapter):
         # Soft-partial path: we have *some* text but the run did not complete
         # (e.g. truncation with partial buffered output). Still 200 but signal
         # truncation via finish_reason="length" + Hermes-specific extras.
+        byok_state = _consistent_usage_byok(usage)
+        byok_components = _complete_byok_cost_components(usage) if byok_state is True else None
+        unresolved_byok = _has_unresolved_openrouter_byok(usage)
+        byok_cost_incomplete = (
+            isinstance(usage.get("calls"), list)
+            and (unresolved_byok or (byok_state is True and byok_components is None))
+        )
+        if byok_components is not None:
+            response_cost, response_upstream_cost = byok_components
+        elif byok_cost_incomplete:
+            # A partial aggregate must not turn absent provider metadata into a
+            # confirmed zero. Keep estimates separate from observed components.
+            response_cost, response_upstream_cost = None, None
+        else:
+            response_cost = usage.get("actual_cost_usd") if usage.get("actual_cost_available") else None
+            response_upstream_cost = usage.get("upstream_cost_usd", 0)
+
         response_data = {
             "id": completion_id,
             "object": "chat.completion",
@@ -2545,8 +2705,31 @@ class APIServerAdapter(BasePlatformAdapter):
                 "prompt_tokens": usage.get("input_tokens", 0),
                 "completion_tokens": usage.get("output_tokens", 0),
                 "total_tokens": usage.get("total_tokens", 0),
+                "prompt_tokens_details": {
+                    "cached_tokens": usage.get("cache_read_tokens", 0),
+                    "cache_write_tokens": usage.get("cache_write_tokens", 0),
+                },
+                "completion_tokens_details": {"reasoning_tokens": usage.get("reasoning_tokens", 0)},
+                "cost": response_cost,
+                "cost_details": {"upstream_inference_cost": response_upstream_cost},
             },
         }
+        if byok_state is not None:
+            response_data["usage"]["is_byok"] = byok_state
+        if byok_cost_incomplete:
+            estimated = usage.get("estimated_cost_usd")
+            try:
+                estimated = float(estimated) if estimated is not None else None
+                if estimated is not None and (not math.isfinite(estimated) or estimated < 0):
+                    estimated = None
+                elif estimated is not None and byok_state is True:
+                    estimated *= 1.05
+            except (TypeError, ValueError):
+                estimated = None
+            response_data["usage"]["actual_cost_estimated"] = True
+            if estimated is not None:
+                estimate_key = "byok_total_cost_usd" if byok_state is True else "estimated_total_usd"
+                response_data["usage"][estimate_key] = estimated
         if is_partial or is_failed or not completed:
             response_data["hermes"] = {
                 "completed": completed,
@@ -4206,6 +4389,10 @@ class APIServerAdapter(BasePlatformAdapter):
         agent_ref: Optional[list] = None,
         gateway_session_key: Optional[str] = None,
         route: Optional[Dict[str, Any]] = None,
+        provider_user_hash: Optional[str] = None,
+        atlas_route_request_id: Optional[str] = None,
+        toolset_scope: Optional[List[str]] = None,
+        atlas_import_capability: Optional[str] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -4226,12 +4413,14 @@ class APIServerAdapter(BasePlatformAdapter):
 
         def _run():
             from gateway.session_context import clear_session_vars
+            from tools.atlas_import_tool import bind_import_capability, clear_import_capability
 
             tokens = self._bind_api_server_session(
                 chat_id=session_id or "",
                 session_key=gateway_session_key or session_id or "",
                 session_id=session_id or "",
             )
+            import_token = bind_import_capability(atlas_import_capability or "")
             try:
                 agent = self._create_agent(
                     ephemeral_system_prompt=ephemeral_system_prompt,
@@ -4242,7 +4431,15 @@ class APIServerAdapter(BasePlatformAdapter):
                     tool_complete_callback=tool_complete_callback,
                     gateway_session_key=gateway_session_key,
                     route=route,
+                    toolset_scope=toolset_scope,
+                    atlas_import_authorized=bool(atlas_import_capability),
                 )
+                if provider_user_hash:
+                    overrides = dict(getattr(agent, "request_overrides", {}) or {})
+                    overrides["user"] = provider_user_hash
+                    agent.request_overrides = overrides
+                if atlas_route_request_id:
+                    agent._atlas_route_request_id = atlas_route_request_id
                 if agent_ref is not None:
                     agent_ref[0] = agent
                 effective_task_id = session_id or str(uuid.uuid4())
@@ -4256,6 +4453,23 @@ class APIServerAdapter(BasePlatformAdapter):
                     "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
                     "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
                 }
+                # Real AIAgent instances initialize these accounting fields.
+                # Keep lightweight third-party/test agent shims backward
+                # compatible and avoid serializing dynamically-created mocks.
+                if "session_actual_cost_available" in vars(agent):
+                    usage.update({
+                        "cache_read_tokens": getattr(agent, "session_cache_read_tokens", 0) or 0,
+                        "cache_write_tokens": getattr(agent, "session_cache_write_tokens", 0) or 0,
+                        "reasoning_tokens": getattr(agent, "session_reasoning_tokens", 0) or 0,
+                        "estimated_cost_usd": getattr(agent, "session_estimated_cost_usd", 0.0) or 0.0,
+                        "actual_cost_usd": getattr(agent, "session_actual_cost_usd", 0.0) or 0.0,
+                        "actual_cost_available": bool(getattr(agent, "session_actual_cost_available", False)),
+                        "upstream_cost_usd": getattr(agent, "session_upstream_cost_usd", 0.0) or 0.0,
+                        "model": getattr(agent, "model", "") or "",
+                        "provider": getattr(agent, "provider", "") or "",
+                        "request_count": getattr(agent, "session_api_calls", 0) or 0,
+                        "calls": list(getattr(agent, "session_usage_calls", []) or []),
+                    })
                 # Include the effective session ID in the result so callers
                 # (e.g. X-Hermes-Session-Id header) can track compression-
                 # triggered session rotations. (#16938)
@@ -4264,6 +4478,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     result["session_id"] = _eff_sid
                 return result, usage
             finally:
+                clear_import_capability(import_token)
                 clear_session_vars(tokens)
 
         self._activate_admitted_request()

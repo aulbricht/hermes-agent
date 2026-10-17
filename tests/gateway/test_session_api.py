@@ -92,15 +92,19 @@ async def test_run_agent_binds_api_session_context_for_tool_env(adapter, monkeyp
         def run_conversation(self, user_message, conversation_history, task_id):
             from gateway.session_context import get_session_env
             from tools.environments.local import _make_run_env
+            from tools.atlas_import_tool import import_capability_available
 
             observed["task_id"] = task_id
+            observed["atlas_route_request_id"] = self._atlas_route_request_id
             observed["context_session_id"] = get_session_env("HERMES_SESSION_ID")
             observed["context_platform"] = get_session_env("HERMES_SESSION_PLATFORM")
             observed["context_session_key"] = get_session_env("HERMES_SESSION_KEY")
             observed["child_session_id"] = _make_run_env({}).get("HERMES_SESSION_ID")
+            observed["import_capability_available"] = import_capability_available()
             return {"final_response": "ok"}
 
     def fake_create_agent(**kwargs):
+        observed["toolset_scope"] = kwargs["toolset_scope"]
         return FakeAgent(kwargs["session_id"])
 
     monkeypatch.setattr(adapter, "_create_agent", fake_create_agent)
@@ -110,17 +114,25 @@ async def test_run_agent_binds_api_session_context_for_tool_env(adapter, monkeyp
         conversation_history=[],
         session_id="request-session",
         gateway_session_key="request-key",
+        atlas_route_request_id="atlas-route-123",
+        toolset_scope=["web"],
+        atlas_import_capability="atimp_" + "a" * 32,
     )
 
     assert result["session_id"] == "request-session"
     assert usage == {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
     assert observed == {
         "task_id": "request-session",
+        "atlas_route_request_id": "atlas-route-123",
         "context_session_id": "request-session",
         "context_platform": "api_server",
         "context_session_key": "request-key",
         "child_session_id": "request-session",
+        "toolset_scope": ["web"],
+        "import_capability_available": True,
     }
+    from tools.atlas_import_tool import import_capability_available
+    assert not import_capability_available()
 
 
 @pytest.mark.asyncio
@@ -309,6 +321,98 @@ async def test_session_chat_stream_accepts_multimodal_message(adapter, session_d
 
     assert "event: assistant.completed" in body
     assert captured_kwargs["user_message"] == expected_user_message
+
+
+@pytest.mark.asyncio
+async def test_session_chat_stream_uses_configured_model_route(session_db):
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={"model_routes": {
+        "atlas-sol": {"model": "gpt-6.1-sol", "provider": "openai-api", "reasoning_effort": "low"},
+    }}))
+    adapter._session_db = session_db
+    session_id = session_db.create_session("routed-session", "api_server")
+    captured = {}
+
+    async def fake_run(**kwargs):
+        captured.update(kwargs)
+        return {"final_response": "done", "session_id": session_id}, {"total_tokens": 2}
+
+    with patch.object(adapter, "_run_agent", side_effect=fake_run):
+        async with TestClient(TestServer(_create_session_app(adapter))) as cli:
+            response = await cli.post(
+                f"/api/sessions/{session_id}/chat/stream",
+                headers={"X-Atlas-Route-Request-ID": "atlas-route-abc_123"},
+                json={"message": "hello", "model": "atlas-sol"},
+            )
+            assert response.status == 200
+            await response.text()
+    assert captured["route"] == {"model": "gpt-6.1-sol", "provider": "openai-api", "reasoning_effort": "low"}
+    assert captured["atlas_route_request_id"] == "atlas-route-abc_123"
+
+
+@pytest.mark.asyncio
+async def test_session_chat_stream_scopes_tools_for_one_turn(adapter, session_db):
+    session_id = session_db.create_session("scoped-session", "api_server")
+    scopes = []
+
+    async def fake_run(**kwargs):
+        scopes.append(kwargs["toolset_scope"])
+        return {"final_response": "done", "session_id": session_id}, {"total_tokens": 2}
+
+    with patch.object(adapter, "_run_agent", side_effect=fake_run):
+        async with TestClient(TestServer(_create_session_app(adapter))) as cli:
+            scoped = await cli.post(
+                f"/api/sessions/{session_id}/chat/stream",
+                json={"message": "use web", "toolset_scope": ["web"]},
+            )
+            assert scoped.status == 200
+            await scoped.text()
+            ordinary = await cli.post(
+                f"/api/sessions/{session_id}/chat/stream", json={"message": "hello"},
+            )
+            assert ordinary.status == 200
+            await ordinary.text()
+    assert scopes == [["web"], None]
+
+
+@pytest.mark.asyncio
+async def test_session_chat_stream_rejects_toolset_widening(adapter, session_db):
+    session_id = session_db.create_session("scope-reject-session", "api_server")
+    with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as run:
+        async with TestClient(TestServer(_create_session_app(adapter))) as cli:
+            for scope in (["not-a-configured-toolset"], "web", ["web", "web"]):
+                response = await cli.post(
+                    f"/api/sessions/{session_id}/chat/stream",
+                    json={"message": "hello", "toolset_scope": scope},
+                )
+                assert response.status == 400
+                assert (await response.json())["error"]["code"] == "invalid_toolset_scope"
+    run.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_session_chat_stream_import_token_is_out_of_band(adapter, session_db):
+    session_id = session_db.create_session("import-token-session", "api_server")
+    captured = []
+
+    async def fake_run(**kwargs):
+        captured.append(kwargs)
+        return {"final_response": "done", "session_id": session_id}, {"total_tokens": 2}
+
+    with patch.object(adapter, "_run_agent", side_effect=fake_run):
+        async with TestClient(TestServer(_create_session_app(adapter))) as cli:
+            invalid = await cli.post(f"/api/sessions/{session_id}/chat/stream", json={
+                "message": "import", "atlas_import_capability": "bad-token"})
+            assert invalid.status == 400
+            assert (await invalid.json())["error"]["code"] == "invalid_import_capability"
+            token = "atimp_" + "b" * 32
+            valid = await cli.post(f"/api/sessions/{session_id}/chat/stream", json={
+                "message": "import", "atlas_import_capability": token})
+            assert valid.status == 200
+            output = await valid.text()
+            assert token not in output
+    assert len(captured) == 1
+    assert captured[0]["atlas_import_capability"] == token
+    assert captured[0]["user_message"] == "import"
 
 
 @pytest.mark.asyncio

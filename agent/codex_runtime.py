@@ -669,6 +669,8 @@ def _consume_codex_event_stream(
     terminal_status: str = "completed"
     terminal_usage: Any = None
     terminal_response_id: str = None
+    terminal_model: str = model
+    terminal_service_tier: str = None
     terminal_incomplete_details: Any = None
     terminal_error: Any = None
     saw_terminal = False
@@ -774,6 +776,8 @@ def _consume_codex_event_stream(
                 if rid is None and isinstance(resp_obj, dict):
                     rid = resp_obj.get("id")
                 terminal_response_id = rid
+                terminal_model = _event_field(resp_obj, "model", model) or model
+                terminal_service_tier = _event_field(resp_obj, "service_tier", None)
                 rstatus = getattr(resp_obj, "status", None)
                 if rstatus is None and isinstance(resp_obj, dict):
                     rstatus = resp_obj.get("status")
@@ -831,7 +835,8 @@ def _consume_codex_event_stream(
         usage=terminal_usage,
         status=terminal_status,
         id=terminal_response_id,
-        model=model,
+        model=terminal_model,
+        service_tier=terminal_service_tier,
         incomplete_details=terminal_incomplete_details,
         error=terminal_error,
     )
@@ -851,6 +856,10 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
 
     active_client = client or agent._ensure_primary_openai_client(reason="codex_stream_direct")
     max_stream_retries = 1
+    if os.environ.get("ATLAS_SOL_ACCOUNTING_SOCKET") and api_kwargs.get("model") == "gpt-6.1-sol":
+        # The outer conversation retry obtains a fresh atomic reservation.
+        # Do not hide a second billable request inside one Sol reservation.
+        max_stream_retries = 0
     # Accumulate streamed text so callers / compat shims can read it.
     agent._codex_streamed_text_parts: list = []
 
