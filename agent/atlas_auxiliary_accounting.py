@@ -136,9 +136,15 @@ def _read_token(path: Path) -> str:
     info = path.lstat()
     if not stat.S_ISREG(info.st_mode) or info.st_mode & 0o037:
         raise ValueError("unsafe_atlas_accounting_token_file")
-    if info.st_uid not in {0, os.geteuid()}:
+    geteuid = getattr(os, "geteuid", None)
+    getegid = getattr(os, "getegid", None)
+    getgroups = getattr(os, "getgroups", None)
+    if not all(callable(fn) for fn in (geteuid, getegid, getgroups)):
+        raise ValueError("atlas_accounting_token_owner_check_unavailable")
+    assert geteuid is not None and getegid is not None and getgroups is not None
+    if info.st_uid not in {0, geteuid()}:
         raise ValueError("untrusted_atlas_accounting_token_owner")
-    if info.st_mode & 0o040 and info.st_gid not in {os.getegid(), *os.getgroups()}:
+    if info.st_mode & 0o040 and info.st_gid not in {getegid(), *getgroups()}:
         raise ValueError("unavailable_atlas_accounting_token_group")
     token = path.read_text(encoding="utf-8").strip()
     if not token:
