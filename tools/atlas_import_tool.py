@@ -72,17 +72,23 @@ _PROPOSAL_SCHEMA = {
 
 _READ_ARGUMENTS_SCHEMA = {
     "type": "object",
-    "description": "Use only the selected operation's fields: evidence offset and limit (1–50); catalog logical_ids; lookup property_query or verified property_id with optional tenant_names. Leave unrelated fields empty.",
-    "properties": {
-        "offset": {"type": "integer"},
-        "limit": {"type": "integer", "minimum": 1, "maximum": 50},
-        "logical_ids": {"type": "array", "items": {"type": "string"}},
-        "property_query": {"type": "string"},
-        "property_id": {"type": "string", "description": "Exact PRO-... ID returned by a verified Property lookup."},
-        "tenant_names": {"type": "array", "items": {"type": "string"}},
-    },
-    "additionalProperties": False,
+    "description": "Choose only the argument shape matching operation; no fields from other read operations.",
+    "anyOf": [
+        {"type": "object", "description": "evidence: cited lines, at most 50 per call",
+         "properties": {"offset": {"type": "integer", "minimum": 0},
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 50}},
+         "additionalProperties": False},
+        {"type": "object", "description": "catalog: shared Acre meanings",
+         "properties": {"logical_ids": {"type": "array", "items": {"type": "string"}}},
+         "additionalProperties": False},
+        {"type": "object", "description": "lookup: a Property query or verified Property ID",
+         "properties": {"property_query": {"type": "string"},
+                        "property_id": {"type": "string", "description": "Exact PRO-... ID returned by a verified Property lookup."},
+                        "tenant_names": {"type": "array", "items": {"type": "string"}}},
+         "additionalProperties": False},
+    ],
 }
+_READ_ARGUMENT_FIELDS = set().union(*_READ_ARGUMENT_KEYS.values())
 
 
 def bind_import_capability(value: str):
@@ -99,9 +105,11 @@ def import_capability_available() -> bool:
 
 def _read_arguments(operation: str, arguments: dict) -> tuple[dict | None, str | None]:
     allowed = _READ_ARGUMENT_KEYS[operation]
-    for key in arguments:
-        if key not in _READ_ARGUMENTS_SCHEMA["properties"]:
+    for key, value in arguments.items():
+        if key not in _READ_ARGUMENT_FIELDS:
             return None, f"arguments.{key} is not a supported read field"
+        if key not in allowed and value not in ("", [], None) and not (key == "offset" and value == 0):
+            return None, f"arguments.{key} is not valid for {operation}"
     selected = {key: value for key, value in arguments.items()
                 if key in allowed and value not in ("", [], None)}
     if operation == "evidence":

@@ -83,10 +83,18 @@ def test_live_read_argument_shapes_keep_atlas_operation_scopes():
             assert json.loads(tool._handle_atlas_import({
                 "operation": "evidence", "arguments": {**neutral, "limit": 50}})) == {"accepted": True}
             assert json.loads(tool._handle_atlas_import({
-                "operation": "catalog", "arguments": neutral})) == {"accepted": True}
+                "operation": "catalog", "arguments": neutral})) == {"error": "arguments.limit is not valid for catalog"}
+            assert json.loads(tool._handle_atlas_import({
+                "operation": "catalog", "arguments": {}})) == {"accepted": True}
             lookup = {**neutral, "limit": 25, "property_query": "Wheatland"}
             assert json.loads(tool._handle_atlas_import({
-                "operation": "lookup", "arguments": lookup})) == {"error": "Choose one Property lookup"}
+                "operation": "lookup", "arguments": lookup})) == {"error": "arguments.limit is not valid for lookup"}
+            assert json.loads(tool._handle_atlas_import({
+                "operation": "lookup", "arguments": {"property_query": "Wheatland"}})) == {"error": "Choose one Property lookup"}
+            assert json.loads(tool._handle_atlas_import({
+                "operation": "evidence", "arguments": {"limit": 51}})) == {"error": "arguments.limit must be an integer from 1 to 50"}
+            assert json.loads(tool._handle_atlas_import({
+                "operation": "evidence", "arguments": {"limit": 20, "property_query": "Wheatland"}})) == {"error": "arguments.property_query is not valid for evidence"}
     finally:
         tool.clear_import_capability(bound)
     assert forwarded == [
@@ -163,6 +171,9 @@ def test_proposal_tool_exposes_required_typed_payload_to_the_model():
     read = definitions["atlas_import"]
     proposal = definitions["atlas_import_proposal"]
     assert read["properties"]["operation"]["enum"] == ["catalog", "evidence", "lookup"]
+    assert {frozenset(shape["properties"]) for shape in read["properties"]["arguments"]["anyOf"]} == {
+        frozenset({"offset", "limit"}), frozenset({"logical_ids"}),
+        frozenset({"property_query", "property_id", "tenant_names"})}
     assert proposal["required"] == ["operation", "property_id", "proposal"]
     assert proposal["properties"]["proposal"]["required"] == ["rows", "unmapped", "warnings"]
     assert proposal["properties"]["proposal"]["properties"]["rows"]["items"]["properties"]["fields"]["items"]["required"] == [
