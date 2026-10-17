@@ -398,6 +398,7 @@ def _compute_tool_definitions(
             tools_to_include.update(resolve_toolset(ts_name))
     if not import_allowed:
         tools_to_include.discard("atlas_import")
+        tools_to_include.discard("atlas_import_proposal")
 
     # Always apply disabled toolsets as a subtraction step at the end.
     # This ensures that even if a composite toolset (like hermes-cli)

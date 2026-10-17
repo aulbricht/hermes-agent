@@ -49,8 +49,9 @@ def test_import_tool_rejects_bad_payload_and_redirect_without_leaking_token():
     bound = tool.bind_import_capability("atimp_" + "b" * 32)
     try:
         assert "error" in json.loads(tool._handle_atlas_import({"operation": "execute", "arguments": {}}))
-        assert "error" in json.loads(tool._handle_atlas_import({
-            "operation": "propose", "arguments": {"data": "x" * (128 * 1024)}}))
+        assert "error" in json.loads(tool._handle_atlas_import({"operation": "propose", "arguments": {}}))
+        assert "error" in json.loads(tool._handle_atlas_import_proposal({
+            "operation": "propose", "property_id": "PRO-test", "proposal": {"data": "x" * (128 * 1024)}}))
         with patch.object(tool.httpx, "Client", return_value=client):
             assert json.loads(tool._handle_atlas_import({"operation": "catalog", "arguments": {}})) == {
                 "error": "Import operation unavailable"}
@@ -62,17 +63,20 @@ def test_import_tool_rejects_bad_payload_and_redirect_without_leaking_token():
 def test_import_tool_accepts_a_bounded_multirow_proposal():
     seen = []
     client = httpx.Client(transport=httpx.MockTransport(
-        lambda request: (seen.append(len(request.content)), httpx.Response(200, json={"accepted": True}))[1]),
+        lambda request: (seen.append(json.loads(request.content)), httpx.Response(200, json={"accepted": True}))[1]),
         follow_redirects=False)
     bound = tool.bind_import_capability("atimp_" + "e" * 32)
     try:
         with patch.object(tool.httpx, "Client", return_value=client):
-            result = json.loads(tool._handle_atlas_import({
-                "operation": "propose", "arguments": {"proposal": {"cited_rows": "x" * 20_000}}}))
+            result = json.loads(tool._handle_atlas_import_proposal({
+                "operation": "propose", "property_id": "PRO-" + "a" * 36,
+                "proposal": {"rows": [{"cited_rows": "x" * 20_000}], "unmapped": [], "warnings": []}}))
     finally:
         tool.clear_import_capability(bound)
     assert result == {"accepted": True}
-    assert 20_000 < seen[0] < 128 * 1024
+    assert seen[0]["operation"] == "propose"
+    assert seen[0]["arguments"]["property_id"] == "PRO-" + "a" * 36
+    assert 20_000 < len(json.dumps(seen[0])) < 128 * 1024
 
 
 def test_import_tool_timeout_covers_bounded_filemaker_lookups():
@@ -85,8 +89,9 @@ def test_import_tool_timeout_covers_bounded_filemaker_lookups():
             captured["timeout"] = kwargs["timeout"]
             return real_client
         with patch.object(tool.httpx, "Client", side_effect=client_factory):
-            assert json.loads(tool._handle_atlas_import({
-                "operation": "propose", "arguments": {"proposal": {}}})) == {"accepted": True}
+            assert json.loads(tool._handle_atlas_import_proposal({
+                "operation": "propose", "property_id": "PRO-" + "a" * 36,
+                "proposal": {}})) == {"accepted": True}
     finally:
         tool.clear_import_capability(bound)
     assert captured["timeout"].read == 90
@@ -100,12 +105,38 @@ def test_import_tool_schema_requires_an_explicit_bound_turn():
             enabled_toolsets=["atlas_import"], quiet_mode=True)}
 
     assert "atlas_import" not in names()
+    assert "atlas_import_proposal" not in names()
     bound = tool.bind_import_capability("atimp_" + "c" * 32)
     try:
         assert "atlas_import" in names()
+        assert "atlas_import_proposal" in names()
     finally:
         tool.clear_import_capability(bound)
     assert "atlas_import" not in names()
+    assert "atlas_import_proposal" not in names()
+
+
+def test_proposal_tool_exposes_required_typed_payload_to_the_model():
+    from model_tools import get_tool_definitions
+    bound = tool.bind_import_capability("atimp_" + "a" * 32)
+    try:
+        definitions = {item["function"]["name"]: item["function"]["parameters"]
+                       for item in get_tool_definitions(enabled_toolsets=["atlas_import"], quiet_mode=True)}
+    finally:
+        tool.clear_import_capability(bound)
+    read = definitions["atlas_import"]
+    proposal = definitions["atlas_import_proposal"]
+    assert read["properties"]["operation"]["enum"] == ["catalog", "evidence", "lookup"]
+    assert proposal["required"] == ["operation", "property_id", "proposal"]
+    assert proposal["properties"]["proposal"]["required"] == ["rows", "unmapped", "warnings"]
+    assert proposal["properties"]["proposal"]["properties"]["rows"]["items"]["properties"]["fields"]["items"]["required"] == [
+        "field", "value", "source_value", "source_evidence", "transformation"]
+
+
+def test_proposal_tool_refuses_empty_property_and_payload_before_callback():
+    assert "error" in json.loads(tool._handle_atlas_import_proposal({"operation": "propose"}))
+    assert "error" in json.loads(tool._handle_atlas_import_proposal({
+        "operation": "revise", "property_id": "PRO-" + "a" * 36, "proposal": {}}))
 
 
 def test_import_tool_rejects_oversized_callback_response():
