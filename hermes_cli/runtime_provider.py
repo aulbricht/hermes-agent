@@ -317,6 +317,25 @@ def _provider_supports_explicit_api_mode(provider: Optional[str], configured_pro
     return normalized_configured == normalized_provider
 
 
+def _openrouter_api_mode(model_cfg: Dict[str, Any], base_url: str, target_model: Optional[str] = None) -> str:
+    """Choose the transport before the gateway passes api_mode explicitly.
+
+    AIAgent's model-based Responses upgrade only runs when api_mode is None;
+    gateway runtime resolution otherwise pins Chat Completions for OpenRouter.
+    Preserve deliberate profile overrides and never infer Responses on mirrors.
+    """
+    configured = _parse_api_mode(model_cfg.get("api_mode"))
+    if configured:
+        return configured
+    detected = _detect_api_mode_for_url(base_url)
+    if detected:
+        return detected
+    model = str(target_model or model_cfg.get("default") or "").lower().rsplit("/", 1)[-1]
+    if base_url_host_matches(base_url, "openrouter.ai") and model.startswith(("gpt-5", "gpt-6")):
+        return "codex_responses"
+    return "chat_completions"
+
+
 def _copilot_runtime_api_mode(model_cfg: Dict[str, Any], api_key: str) -> str:
     configured_provider = str(model_cfg.get("provider") or "").strip().lower()
     configured_mode = _parse_api_mode(model_cfg.get("api_mode"))
@@ -443,6 +462,7 @@ def _resolve_runtime_from_pool_entry(
         base_url = cfg_base_url or base_url or "https://api.anthropic.com"
     elif provider == "openrouter":
         base_url = base_url or OPENROUTER_BASE_URL
+        api_mode = _openrouter_api_mode(model_cfg, base_url, target_model)
     elif provider == "xai":
         api_mode = "codex_responses"
     elif provider == "nous":
@@ -1051,6 +1071,7 @@ def _resolve_openrouter_runtime(
     requested_provider: str,
     explicit_api_key: Optional[str] = None,
     explicit_base_url: Optional[str] = None,
+    target_model: Optional[str] = None,
 ) -> Dict[str, Any]:
     model_cfg = _get_model_config()
     cfg_base_url = model_cfg.get("base_url") if isinstance(model_cfg.get("base_url"), str) else ""
@@ -1179,9 +1200,7 @@ def _resolve_openrouter_runtime(
         "provider": effective_provider,
         "api_mode": _resolve_plain_custom_api_mode(model_cfg, base_url)
         if effective_provider == "custom"
-        else _parse_api_mode(model_cfg.get("api_mode"))
-        or _detect_api_mode_for_url(base_url)
-        or "chat_completions",
+        else _openrouter_api_mode(model_cfg, base_url, target_model),
         "base_url": base_url,
         "api_key": api_key,
         "source": source,
@@ -1364,6 +1383,7 @@ def _resolve_explicit_runtime(
     model_cfg: Dict[str, Any],
     explicit_api_key: Optional[str] = None,
     explicit_base_url: Optional[str] = None,
+    target_model: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     explicit_api_key = str(explicit_api_key or "").strip()
     explicit_base_url = str(explicit_base_url or "").strip().rstrip("/")
@@ -1489,6 +1509,8 @@ def _resolve_explicit_runtime(
             api_mode = _copilot_runtime_api_mode(model_cfg, api_key)
         elif provider == "xai":
             api_mode = "codex_responses"
+        elif provider == "openrouter":
+            api_mode = _openrouter_api_mode(model_cfg, base_url, target_model)
         else:
             configured_mode = _parse_api_mode(model_cfg.get("api_mode"))
             if configured_mode:
@@ -1651,6 +1673,7 @@ def resolve_runtime_provider(
                     requested_provider=requested_provider,
                     explicit_api_key=explicit_api_key,
                     explicit_base_url=explicit_base_url,
+                    target_model=target_model,
                 )
                 runtime["requested_provider"] = requested_provider
                 return runtime
@@ -1667,6 +1690,7 @@ def resolve_runtime_provider(
         model_cfg=model_cfg,
         explicit_api_key=explicit_api_key,
         explicit_base_url=explicit_base_url,
+        target_model=target_model,
     )
     if explicit_runtime:
         return explicit_runtime
@@ -2079,6 +2103,7 @@ def resolve_runtime_provider(
         requested_provider=requested_provider,
         explicit_api_key=explicit_api_key,
         explicit_base_url=explicit_base_url,
+        target_model=target_model,
     )
     runtime["requested_provider"] = requested_provider
     return runtime

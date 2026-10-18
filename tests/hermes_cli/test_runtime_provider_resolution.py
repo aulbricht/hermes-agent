@@ -565,6 +565,43 @@ def test_resolve_runtime_provider_auto_uses_openrouter_pool(monkeypatch):
     assert resolved.get("credential_pool") is not None
 
 
+def test_openrouter_gpt6_pool_route_uses_responses_for_gateway(monkeypatch):
+    """Gateway passes resolved api_mode explicitly, so the resolver owns it."""
+    class _Entry:
+        access_token = "pool-key"
+        source = "manual"
+        base_url = "https://openrouter.ai/api/v1"
+
+    class _Pool:
+        def has_credentials(self):
+            return True
+
+        def select(self):
+            return _Entry()
+
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "openrouter")
+    monkeypatch.setattr(rp, "_get_model_config", lambda: {
+        "provider": "openrouter", "default": "openai/gpt-6-luna",
+    })
+    monkeypatch.setattr(rp, "load_pool", lambda provider: _Pool())
+    for name in ("OPENAI_BASE_URL", "OPENROUTER_BASE_URL", "OPENAI_API_KEY", "OPENROUTER_API_KEY"):
+        monkeypatch.delenv(name, raising=False)
+
+    resolved = rp.resolve_runtime_provider(requested="openrouter")
+    assert resolved["provider"] == "openrouter"
+    assert resolved["api_mode"] == "codex_responses"
+
+
+def test_openrouter_api_mode_preserves_override_and_custom_endpoint():
+    model_cfg = {"provider": "openrouter", "default": "openai/gpt-6-luna"}
+    assert rp._openrouter_api_mode(model_cfg, "https://openrouter.ai/api/v1") == "codex_responses"
+    assert rp._openrouter_api_mode({**model_cfg, "api_mode": "chat_completions"},
+                                   "https://openrouter.ai/api/v1") == "chat_completions"
+    assert rp._openrouter_api_mode(model_cfg, "https://example.com/v1") == "chat_completions"
+    assert rp._openrouter_api_mode(model_cfg, "https://openrouter.ai/api/v1",
+                                   target_model="anthropic/claude-sonnet-4") == "chat_completions"
+
+
 def test_resolve_runtime_provider_openrouter_explicit_api_key_skips_pool(monkeypatch):
     class _Entry:
         access_token = "pool-key"
