@@ -1729,8 +1729,15 @@ def run_conversation(
                         agent.session_actual_cost_usd += actual_cost
                         agent.session_actual_cost_available = True
                     agent.session_upstream_cost_usd += upstream_cost
-                    agent.session_usage_calls.append({
-                        "generation_id": str(getattr(response, "id", "") or ""),
+                    agent.session_cost_status = cost_result.status
+                    agent.session_cost_source = cost_result.source
+                    truncated_call = {
+                        "generation_id": str(getattr(
+                            response, "_provider_generation_id",
+                            getattr(response, "id", ""),
+                        ) or ""),
+                        "service_tier": getattr(response, "service_tier", None),
+                        "usage_available": True,
                         "model": str(getattr(response, "model", "") or agent.model),
                         "provider": str(agent.provider or ""),
                         "input_tokens": truncated_usage.input_tokens,
@@ -1740,7 +1747,12 @@ def run_conversation(
                         "reasoning_tokens": truncated_usage.reasoning_tokens,
                         "actual_cost_usd": actual_cost,
                         "upstream_cost_usd": upstream_cost,
-                    })
+                        **_atlas_route_usage_fields(agent),
+                    }
+                    is_byok = _explicit_byok_value(raw_usage)
+                    if isinstance(is_byok, bool):
+                        truncated_call["is_byok"] = is_byok
+                    agent.session_usage_calls.append(truncated_call)
                     if agent._session_db and agent.session_id:
                         try:
                             if not agent._session_db_created:
@@ -2343,7 +2355,10 @@ def run_conversation(
                     except (TypeError, ValueError):
                         _upstream_cost = None
                     _call_usage = {
-                        "generation_id": str(getattr(response, "id", "") or ""),
+                        "generation_id": str(getattr(
+                            response, "_provider_generation_id",
+                            getattr(response, "id", ""),
+                        ) or ""),
                         "service_tier": getattr(response, "service_tier", None),
                         "usage_available": getattr(response, "usage", None) is not None,
                         "model": str(getattr(response, "model", "") or _agg_cost_model or agent.model),

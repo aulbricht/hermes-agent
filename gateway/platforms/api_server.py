@@ -1535,22 +1535,27 @@ class APIServerAdapter(BasePlatformAdapter):
             gateway_session_key or session_id
         )
         if route and not session_override:
-            if route.get("provider"):
+            if route.get("provider") or route.get("model") or route.get("base_url"):
                 # Resolve real credentials for the routed provider (mirrors
                 # the channel_overrides path in gateway/run.py) so a route
-                # without an explicit api_key/base_url still gets the right
-                # provider auth instead of the default provider's key.
+                # uses the selected model and endpoint when choosing api_mode.
+                # In particular, OpenRouter GPT-6 needs Responses even when
+                # the global default model uses Chat Completions (and vice versa).
+                effective_provider = route.get("provider") or runtime_kwargs.get("provider")
                 try:
                     from gateway.run import _resolve_runtime_agent_kwargs_for_provider
                     provider_kwargs = _resolve_runtime_agent_kwargs_for_provider(
-                        route["provider"]
+                        effective_provider,
+                        target_model=route.get("model") or model,
+                        explicit_base_url=route.get("base_url"),
                     )
                     provider_kwargs.pop("model", None)
                     runtime_kwargs.update(provider_kwargs)
                 except Exception:
                     # Fall back to just switching the provider name; explicit
                     # per-route api_key/base_url below can still complete auth.
-                    runtime_kwargs["provider"] = route["provider"]
+                    if route.get("provider"):
+                        runtime_kwargs["provider"] = route["provider"]
             if route.get("model"):
                 model = route["model"]
             # Per-route secrets are upstream provider credentials. Never log
