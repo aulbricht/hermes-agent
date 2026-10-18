@@ -92,6 +92,24 @@ class TestPartialStreamStubFinishReason:
 
     @patch("run_agent.AIAgent._create_request_openai_client")
     @patch("run_agent.AIAgent._close_request_openai_client")
+    def test_complete_stream_retains_provider_generation_id(self, _mock_close, mock_create):
+        first = _make_stream_chunk(content="Answer")
+        first.id = "gen_provider_123"
+        terminal = _make_stream_chunk(finish_reason="length")
+        terminal.id = "gen_provider_123"
+        usage = SimpleNamespace(prompt_tokens=30, completion_tokens=80, total_tokens=110)
+        usage_chunk = SimpleNamespace(id="gen_provider_123", choices=[], model="test/model", usage=usage)
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.return_value = iter([first, terminal, usage_chunk])
+        mock_create.return_value = mock_client
+
+        response = _make_agent()._interruptible_streaming_api_call({})
+        assert response.id == "gen_provider_123"
+        assert response.usage is usage
+        assert response.choices[0].finish_reason == "length"
+
+    @patch("run_agent.AIAgent._create_request_openai_client")
+    @patch("run_agent.AIAgent._close_request_openai_client")
     def test_partial_tool_call_uses_length(self, _mock_close, mock_create, monkeypatch):
         """Mid-tool-call partials now use finish_reason=length so the
         conversation loop's continuation machinery fires — bounded 3-retry
