@@ -4162,6 +4162,48 @@ class TestModelRoutesHandlers:
 
 
 class TestModelRoutesAgentCreation:
+    def test_route_resolves_api_mode_from_selected_model(self, monkeypatch):
+        captured = {}
+        calls = []
+
+        class FakeAgent:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+        _patch_create_agent_runtime(monkeypatch, captured, FakeAgent)
+
+        def resolve(provider, *, target_model=None, explicit_base_url=None):
+            calls.append((provider, target_model, explicit_base_url))
+            return {
+                "provider": provider, "api_key": "sk-route",
+                "base_url": explicit_base_url or "https://openrouter.ai/api/v1",
+                "api_mode": "codex_responses" if target_model.startswith("openai/gpt-6")
+                            else "chat_completions",
+            }
+
+        monkeypatch.setattr("gateway.run._resolve_runtime_agent_kwargs_for_provider", resolve)
+        adapter = _make_routing_adapter({
+            "gpt": {"model": "openai/gpt-6-luna", "provider": "openrouter"},
+            "other": {"model": "anthropic/claude-sonnet-4", "provider": "openrouter"},
+        })
+        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+        monkeypatch.setattr(adapter, "_session_model_override_for", lambda *_: None)
+
+        adapter._create_agent(session_id="s-gpt", route=adapter._resolve_route("gpt"))
+        assert calls[-1] == ("openrouter", "openai/gpt-6-luna", None)
+        assert captured["api_mode"] == "codex_responses"
+
+        # A non-GPT route must also override a GPT-6 global default.
+        monkeypatch.setattr("gateway.run._resolve_runtime_agent_kwargs", lambda: {
+            "provider": "openrouter", "api_key": "sk-global",
+            "base_url": "https://openrouter.ai/api/v1",
+            "api_mode": "codex_responses",
+        })
+        captured.clear()
+        adapter._create_agent(session_id="s-other", route=adapter._resolve_route("other"))
+        assert calls[-1] == ("openrouter", "anthropic/claude-sonnet-4", None)
+        assert captured["api_mode"] == "chat_completions"
+
     def test_route_overrides_model_and_credentials(self, monkeypatch):
         captured = {}
 
@@ -4199,7 +4241,7 @@ class TestModelRoutesAgentCreation:
         _patch_create_agent_runtime(monkeypatch, captured, FakeAgent)
         monkeypatch.setattr(
             "gateway.run._resolve_runtime_agent_kwargs_for_provider",
-            lambda provider: {
+            lambda provider, **kwargs: {
                 "provider": provider,
                 "api_key": f"sk-{provider}",
                 "base_url": f"https://{provider}.example/v1",

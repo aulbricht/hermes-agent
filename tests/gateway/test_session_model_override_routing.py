@@ -186,7 +186,8 @@ fallback_providers:
     )
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
 
-    def fake_resolve_runtime_provider(*, requested=None, explicit_base_url=None, explicit_api_key=None):
+    def fake_resolve_runtime_provider(*, requested=None, explicit_base_url=None,
+                                      explicit_api_key=None, target_model=None):
         if requested in {None, "", "openai-codex"}:
             from hermes_cli.auth import AuthError
             raise AuthError("No Codex credentials stored. Run `hermes auth` to authenticate.")
@@ -235,10 +236,12 @@ fallback_providers:
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.setenv("MY_FALLBACK_KEY", "env-secret")
 
-    def fake_resolve_runtime_provider(*, requested=None, explicit_base_url=None, explicit_api_key=None):
+    def fake_resolve_runtime_provider(*, requested=None, explicit_base_url=None,
+                                      explicit_api_key=None, target_model=None):
         assert requested == "custom"
         assert explicit_base_url == "https://fallback.example/v1"
         assert explicit_api_key == "env-secret"
+        assert target_model == "fallback-model"
         return {
             "api_key": explicit_api_key,
             "base_url": explicit_base_url,

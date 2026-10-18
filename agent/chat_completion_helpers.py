@@ -2624,6 +2624,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         )
         return SimpleNamespace(
             id=provider_generation_id or "stream-" + str(uuid.uuid4()),
+            _provider_generation_id=provider_generation_id or "",
             model=model_name,
             choices=[mock_choice],
             usage=usage_obj,

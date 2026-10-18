@@ -105,6 +105,7 @@ class TestPartialStreamStubFinishReason:
 
         response = _make_agent()._interruptible_streaming_api_call({})
         assert response.id == "gen_provider_123"
+        assert response._provider_generation_id == "gen_provider_123"
         assert response.usage is usage
         assert response.choices[0].finish_reason == "length"
 
