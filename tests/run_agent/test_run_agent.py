@@ -5104,11 +5104,15 @@ class TestRunConversation:
         assert "Thinking Budget Exhausted" in result["final_response"]
         assert "/thinkon" in result["final_response"]
 
-    def test_length_empty_content_without_think_tags_retries_normally(self, agent):
-        """When finish_reason='length' and content is None but no think tags,
-        fall through to normal continuation retry (not thinking-exhaustion)."""
+    def test_length_empty_content_stops_and_accounts_for_paid_call(self, agent):
+        """An empty truncated response must not trigger paid continuations."""
         self._setup_agent(agent)
-        resp = _mock_response(content=None, finish_reason="length")
+        resp = _mock_response(
+            content=None, finish_reason="length",
+            usage={"prompt_tokens": 300, "completion_tokens": 8192,
+                   "total_tokens": 8492, "cost": 0.012},
+        )
+        resp.id = "gen_real_length_1"
         agent.client.chat.completions.create.return_value = resp
 
         with (
@@ -5118,10 +5122,13 @@ class TestRunConversation:
         ):
             result = agent.run_conversation("hello")
 
-        # Without think tags, the agent should attempt continuation retries
-        # (up to 4), not immediately fire thinking-exhaustion.
-        assert result["api_calls"] == 4
+        assert result["api_calls"] == 1
         assert result["completed"] is False
+        assert result["final_response"] is None
+        assert "output limit" in result["error"]
+        assert agent.session_usage_calls[0]["generation_id"] == "gen_real_length_1"
+        assert agent.session_usage_calls[0]["output_tokens"] == 8192
+        assert agent.session_usage_calls[0]["actual_cost_usd"] == 0.012
 
     def test_length_with_tool_calls_returns_partial_without_executing_tools(self, agent):
         self._setup_agent(agent)

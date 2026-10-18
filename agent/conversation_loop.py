@@ -1686,6 +1686,85 @@ def run_conversation(
                         )
                         finish_reason = "length"
 
+                if finish_reason == "length" and getattr(response, "usage", None):
+                    # The truncation branch below can return or continue before
+                    # the normal accounting block. Preserve this paid call's
+                    # generation, token counts and provider charge first.
+                    truncated_usage = normalize_usage(
+                        response.usage, provider=agent.provider,
+                        api_mode=agent.api_mode,
+                    )
+                    raw_usage = getattr(truncated_usage, "raw_usage", None)
+                    if not isinstance(raw_usage, dict):
+                        raw_usage = {}
+                    cost_details = raw_usage.get("cost_details")
+                    if not isinstance(cost_details, dict):
+                        cost_details = {}
+                    upstream_cost = cost_details.get("upstream_inference_cost")
+                    try:
+                        upstream_cost = max(0.0, float(upstream_cost)) if upstream_cost is not None else 0.0
+                    except (TypeError, ValueError):
+                        upstream_cost = 0.0
+                    actual_cost = raw_usage.get("cost")
+                    try:
+                        actual_cost = max(0.0, float(actual_cost)) if actual_cost is not None else None
+                    except (TypeError, ValueError):
+                        actual_cost = None
+                    cost_result = estimate_usage_cost(
+                        agent.model, truncated_usage, provider=agent.provider,
+                        base_url=agent.base_url, api_key=getattr(agent, "api_key", ""),
+                    )
+                    agent.session_prompt_tokens += truncated_usage.prompt_tokens
+                    agent.session_completion_tokens += truncated_usage.output_tokens
+                    agent.session_total_tokens += truncated_usage.total_tokens
+                    agent.session_input_tokens += truncated_usage.input_tokens
+                    agent.session_output_tokens += truncated_usage.output_tokens
+                    agent.session_cache_read_tokens += truncated_usage.cache_read_tokens
+                    agent.session_cache_write_tokens += truncated_usage.cache_write_tokens
+                    agent.session_reasoning_tokens += truncated_usage.reasoning_tokens
+                    agent.session_api_calls += 1
+                    if cost_result.amount_usd is not None:
+                        agent.session_estimated_cost_usd += float(cost_result.amount_usd)
+                    if actual_cost is not None:
+                        agent.session_actual_cost_usd += actual_cost
+                        agent.session_actual_cost_available = True
+                    agent.session_upstream_cost_usd += upstream_cost
+                    agent.session_usage_calls.append({
+                        "generation_id": str(getattr(response, "id", "") or ""),
+                        "model": str(getattr(response, "model", "") or agent.model),
+                        "provider": str(agent.provider or ""),
+                        "input_tokens": truncated_usage.input_tokens,
+                        "output_tokens": truncated_usage.output_tokens,
+                        "cache_read_tokens": truncated_usage.cache_read_tokens,
+                        "cache_write_tokens": truncated_usage.cache_write_tokens,
+                        "reasoning_tokens": truncated_usage.reasoning_tokens,
+                        "actual_cost_usd": actual_cost,
+                        "upstream_cost_usd": upstream_cost,
+                    })
+                    if agent._session_db and agent.session_id:
+                        try:
+                            if not agent._session_db_created:
+                                agent._ensure_db_session()
+                            agent._session_db.update_token_counts(
+                                agent.session_id,
+                                input_tokens=truncated_usage.input_tokens,
+                                output_tokens=truncated_usage.output_tokens,
+                                cache_read_tokens=truncated_usage.cache_read_tokens,
+                                cache_write_tokens=truncated_usage.cache_write_tokens,
+                                reasoning_tokens=truncated_usage.reasoning_tokens,
+                                estimated_cost_usd=cost_result.amount_usd,
+                                actual_cost_usd=actual_cost,
+                                cost_status=cost_result.status,
+                                cost_source=cost_result.source,
+                                billing_provider=agent.provider,
+                                billing_base_url=agent.base_url,
+                                billing_mode="subscription_included"
+                                if cost_result.status == "included" else None,
+                                model=agent.model, api_call_count=1,
+                            )
+                        except Exception as exc:
+                            logger.debug("Truncated-call usage persistence failed: %s", exc)
+
                 # ── Content-policy refusal (HTTP 200) ──────────────────
                 # The model — or the provider's safety system — returned a
                 # *successful* response whose stop/finish reason is a refusal:
@@ -1936,6 +2015,22 @@ def run_conversation(
                                 force=True,
                             )
                         if assistant_message is not None and not _trunc_has_tool_calls:
+                            # No visible text exists to continue from. Avoid
+                            # repeating the same paid empty completion.
+                            if not (assistant_message.content or "").strip():
+                                partial_response = agent._strip_think_blocks(
+                                    "".join(truncated_response_parts)
+                                ).strip()
+                                agent._cleanup_task_resources(effective_task_id)
+                                agent._persist_session(messages, conversation_history)
+                                return {
+                                    "final_response": partial_response or None,
+                                    "messages": messages,
+                                    "api_calls": api_call_count,
+                                    "completed": False,
+                                    "partial": True,
+                                    "error": "Model output limit reached without visible content",
+                                }
                             length_continue_retries += 1
                             interim_msg = agent._build_assistant_message(assistant_message, finish_reason)
                             messages.append(interim_msg)

@@ -2343,12 +2343,18 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         _active_slot_by_idx: dict = {}  # raw_index -> current slot in tool_calls_acc
         finish_reason = None
         model_name = None
+        provider_generation_id = None
         role = "assistant"
         reasoning_parts: list = []
         usage_obj = None
         for chunk in stream:
             last_chunk_time["t"] = time.time()
             agent._touch_activity("receiving stream response")
+            # The provider generation ID is normally on the first chunk, while
+            # usage arrives on the last (often choice-less) chunk. Keep the
+            # actual ID across both so billed calls can be reconciled.
+            if not provider_generation_id:
+                provider_generation_id = getattr(chunk, "id", None) or None
 
             # Update per-attempt diagnostic counters.  Best-effort —
             # failures are swallowed so the streaming hot path is never
@@ -2617,7 +2623,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             finish_reason=effective_finish_reason,
         )
         return SimpleNamespace(
-            id="stream-" + str(uuid.uuid4()),
+            id=provider_generation_id or "stream-" + str(uuid.uuid4()),
             model=model_name,
             choices=[mock_choice],
             usage=usage_obj,
