@@ -232,3 +232,40 @@ def test_sanitize_model_override():
         "provider": "openai",
         "base_url": "https://api.openai.example/v1",
     }
+
+
+@pytest.mark.parametrize("endpoint,expected_mode", [
+    ("https://mirror.example/v1", "chat_completions"),
+    ("https://openrouter.ai/api/v1", "codex_responses"),
+])
+def test_restart_resolves_transport_for_saved_endpoint(
+    store_factory, tmp_path, monkeypatch, endpoint, expected_mode
+):
+    from pathlib import Path
+
+    home = tmp_path / "home"
+    hermes_home = home / ".hermes"
+    hermes_home.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("OPENROUTER_API_KEY", "synthetic-openrouter-key")
+    (hermes_home / "config.yaml").write_text(json.dumps({"model": {
+        "provider": "openrouter", "default": "openai/gpt-6",
+    }}))
+    saved = {"model": "openai/gpt-6", "provider": "openrouter", "base_url": endpoint}
+    store = store_factory()
+    session_key = store.get_or_create_session(_make_source()).session_key
+    store.set_model_override(session_key, saved)
+    runner = _make_runner(store_factory())
+    runner._rehydrate_session_model_override(session_key)
+
+    override = runner._session_model_overrides[session_key]
+    assert {key: override[key] for key in saved} == saved
+    assert override["api_mode"] == expected_mode
+    assert "synthetic-openrouter-key" not in _sessions_json(tmp_path)
+    # Subsequent lazy rehydration must preserve the in-memory selection.
+    live = {"model": "live-model", "provider": "custom"}
+    runner._session_model_overrides[session_key] = live
+    runner._rehydrate_session_model_override(session_key)
+    assert runner._session_model_overrides[session_key] is live
