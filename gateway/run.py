@@ -1935,6 +1935,7 @@ def _resolve_runtime_agent_kwargs() -> dict:
 def _resolve_runtime_agent_kwargs_for_provider(
     provider: str, *, target_model: str | None = None,
     explicit_base_url: str | None = None,
+    explicit_api_key: str | None = None,
 ) -> dict:
     """Resolve runtime credentials for a specific provider (e.g. from channel override)."""
     from hermes_cli.runtime_provider import (
@@ -1945,6 +1946,7 @@ def _resolve_runtime_agent_kwargs_for_provider(
         runtime = resolve_runtime_provider(
             requested=provider, target_model=target_model,
             explicit_base_url=explicit_base_url,
+            explicit_api_key=explicit_api_key,
         )
     except Exception as exc:
         raise RuntimeError(format_runtime_provider_error(exc)) from exc
@@ -3882,6 +3884,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # did not specify an explicit model.
                     if ch_runtime_model and not ch.model:
                         model = ch_runtime_model
+                elif ch.model:
+                    # A model-only override retains the established route and
+                    # credentials, but its transport must follow the selected
+                    # model rather than the global default.
+                    selected_runtime = _resolve_runtime_agent_kwargs_for_provider(
+                        runtime_kwargs.get("provider"), target_model=model,
+                        explicit_base_url=runtime_kwargs.get("base_url"),
+                        explicit_api_key=runtime_kwargs.get("api_key"),
+                    )
+                    runtime_kwargs["api_mode"] = selected_runtime.get("api_mode")
 
         if override and resolved_session_key:
             model, runtime_kwargs = self._apply_session_model_override(
@@ -16134,6 +16146,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             try:
                 runtime = _resolve_runtime_agent_kwargs_for_provider(
                     provider, target_model=persisted.get("model"),
+                    explicit_base_url=persisted.get("base_url"),
                 )
                 override["api_key"] = runtime.get("api_key")
                 override["api_mode"] = runtime.get("api_mode")

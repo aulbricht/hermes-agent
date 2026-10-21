@@ -300,3 +300,54 @@ class TestResolveSessionAgentRuntimePriority:
              }):
             model, _runtime = runner._resolve_session_agent_runtime(source=source)
         assert model == "parent/model"
+
+
+@pytest.mark.parametrize(
+    "global_model,channel_model,endpoint,explicit_mode,expected_mode",
+    [
+        ("openai/gpt-6", "anthropic/claude-sonnet-4", None, None, "chat_completions"),
+        ("anthropic/claude-sonnet-4", "openai/gpt-6", None, None, "codex_responses"),
+        ("anthropic/claude-sonnet-4", "openai/gpt-6", None, "chat_completions", "chat_completions"),
+        ("openai/gpt-6", "anthropic/claude-sonnet-4", None, "codex_responses", "codex_responses"),
+        ("anthropic/claude-sonnet-4", "openai/gpt-6", "https://mirror.example/v1", None, "chat_completions"),
+    ],
+)
+def test_model_only_channel_resolves_selected_transport(
+    tmp_path, monkeypatch, global_model, channel_model, endpoint, explicit_mode, expected_mode
+):
+    import json
+    from pathlib import Path
+    from gateway.run import _resolve_runtime_agent_kwargs
+
+    home = tmp_path / "home"
+    hermes_home = home / ".hermes"
+    hermes_home.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("OPENROUTER_API_KEY", "synthetic-openrouter-key")
+    if endpoint:
+        monkeypatch.setenv("OPENROUTER_BASE_URL", endpoint)
+    model_config = {"provider": "openrouter", "default": global_model, "max_tokens": 1234}
+    if explicit_mode:
+        model_config["api_mode"] = explicit_mode
+    (hermes_home / "config.yaml").write_text(json.dumps({"model": model_config}))
+
+    runner = object.__new__(GatewayRunner)
+    runner._session_model_overrides = {}
+    runner.config = GatewayConfig(platforms={
+        Platform.DISCORD: PlatformConfig(enabled=True, channel_overrides={
+            "chan_1": ChannelOverride(model=channel_model),
+        }),
+    })
+    source = SessionSource(platform=Platform.DISCORD, chat_id="chan_1", user_id="u1")
+    before = _resolve_runtime_agent_kwargs()
+    model, runtime = runner._resolve_session_agent_runtime(source=source, user_config={"model": model_config})
+
+    assert model == channel_model
+    assert runtime["api_mode"] == expected_mode
+    # A model-only selection must retain the established endpoint, credential,
+    # output cap, pool and process transport rather than selecting a new route.
+    assert {k: v for k, v in runtime.items() if k != "api_mode"} == {
+        k: v for k, v in before.items() if k != "api_mode"
+    }
