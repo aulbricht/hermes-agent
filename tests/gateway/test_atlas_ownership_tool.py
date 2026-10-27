@@ -126,6 +126,28 @@ def test_create_agent_subtracts_configured_ownership_unless_authorized(adapter):
         assert agent.call_args.kwargs["enabled_toolsets"] == ["web", "atlas_import"]
 
 
+@pytest.mark.parametrize("scope", [None, [], ["hermes-api-server", "web", "browser", "terminal", "memory", "cronjob", "delegation"]])
+def test_ownership_authority_restricts_real_configured_tool_assembly(adapter, scope):
+    from model_tools import get_tool_definitions
+
+    def assemble(**kwargs):
+        assert kwargs["enabled_toolsets"] == ["atlas_ownership"]
+        return get_tool_definitions(enabled_toolsets=kwargs["enabled_toolsets"], quiet_mode=True)
+
+    bound = tool.bind_ownership_capability(TOKEN)
+    try:
+        with patch("gateway.run._resolve_runtime_agent_kwargs", return_value={}), \
+             patch("gateway.run._resolve_gateway_model", return_value="test/model"), \
+             patch("gateway.run._load_gateway_config", return_value={
+                 "platform_toolsets": {"api_server": ["hermes-api-server", "delegation", "atlas_import"]}}), \
+             patch("run_agent.AIAgent", side_effect=assemble):
+            definitions = adapter._create_agent(atlas_ownership_authorized=True, toolset_scope=scope)
+        assert {item["function"]["name"] for item in definitions} == OWNERSHIP
+    finally:
+        tool.clear_ownership_capability(bound)
+    assert not tool.ownership_capability_available()
+
+
 @pytest.mark.parametrize("wire_request", CONTRACT["requests"])
 def test_valid_fixture_references_reach_fixed_callback_unchanged(wire_request, callback, caplog):
     request = wire_request
@@ -481,8 +503,8 @@ async def test_scripted_provider_through_real_stream_agent_and_dispatch(
         "api_key": "synthetic", "base_url": "http://example.invalid/v1", "provider": "openai",
         "api_mode": "chat_completions", "command": None, "args": []})
     monkeypatch.setattr("gateway.run._resolve_gateway_model", lambda: "synthetic-model")
-    monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {})
-    monkeypatch.setattr("hermes_cli.tools_config._get_platform_tools", lambda *args: set())
+    monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {
+        "platform_toolsets": {"api_server": ["hermes-api-server", "delegation", "atlas_import"]}})
     sid = adapter._session_db.create_session("fixture-stream", "api_server")
     async with TestClient(TestServer(app_for(adapter))) as client:
         resp = await client.post(f"/api/sessions/{sid}/chat/stream", json={
@@ -494,7 +516,8 @@ async def test_scripted_provider_through_real_stream_agent_and_dispatch(
     assert observed[0].headers["Authorization"] == "Bearer " + TOKEN
     assert observed[0].content == json.dumps(wire_request, ensure_ascii=False, separators=(",", ":")).encode()
     assert len(provider_calls) >= 2
-    assert OWNERSHIP <= {item["function"]["name"] for item in provider_calls[0]["tools"]}
+    for call in provider_calls:
+        assert {item["function"]["name"] for item in call["tools"]} == OWNERSHIP
     tool_results = [message["content"] for message in provider_calls[-1]["messages"] if message["role"] == "tool"]
     expected = reply["body"] if reply["status"] == 200 else ERROR
     assert any(json.loads(value) == expected for value in tool_results)

@@ -1591,7 +1591,10 @@ class APIServerAdapter(BasePlatformAdapter):
         if atlas_import_authorized:
             enabled_toolsets.append("atlas_import")
         if atlas_ownership_authorized:
-            enabled_toolsets.append("atlas_ownership")
+            # Ownership evidence is untrusted input and may contain personal
+            # data. Enforce its boundary here even if caller scope is absent
+            # or broad; configured outbound/persistent tools must not survive.
+            enabled_toolsets = ["atlas_ownership"]
 
         max_iterations = _current_max_iterations()
         if route and not session_override and route.get("max_iterations"):
