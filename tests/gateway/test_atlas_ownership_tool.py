@@ -66,7 +66,10 @@ def callback(monkeypatch):
         assert kwargs["timeout"].connect == 2
         return real_client(transport=httpx.MockTransport(receive), **kwargs)
 
-    monkeypatch.setattr(tool.httpx, "Client", factory)
+    # Patch only this tool's namespace. OpenAI subclasses the real httpx.Client
+    # on first import; replacing that global class makes test order observable.
+    monkeypatch.setattr(tool, "httpx", SimpleNamespace(
+        Client=factory, Timeout=httpx.Timeout, HTTPError=httpx.HTTPError))
     return observed, response
 
 
