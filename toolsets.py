@@ -93,6 +93,11 @@ _HERMES_WEBHOOK_SAFE_TOOLS = [
 # Core toolset definitions
 # These can include individual tools or reference other toolsets
 TOOLSETS = {
+    "atlas_ownership": {
+        "description": "One-turn Atlas ownership previews (requires request capability)",
+        "tools": ["atlas_ownership", "atlas_ownership_proposal"],
+        "includes": [],
+    },
     # Basic toolsets - individual tool categories
     "web": {
         "description": "Web research and content extraction tools",
