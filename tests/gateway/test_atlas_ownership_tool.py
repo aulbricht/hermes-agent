@@ -425,7 +425,7 @@ async def test_scripted_provider_through_real_stream_agent_and_dispatch(
         request_index, reply, adapter, callback, monkeypatch, caplog):
     """H11: real endpoint, _create_agent, AIAgent loop and tool dispatcher.
 
-    Only the provider and fixed callback's HTTP transport are synthetic.
+    Provider, model metadata and callback HTTP are synthetic; no paid/network calls.
     """
     import run_agent
     from openai.types.chat import ChatCompletion
@@ -461,14 +461,18 @@ async def test_scripted_provider_through_real_stream_agent_and_dispatch(
 
     real_agent = run_agent.AIAgent
 
-    def create(**kwargs):
-        agent = real_agent(**{**kwargs, "skip_memory": True, "skip_context_files": True,
-                              "max_iterations": 4})
-        agent._disable_streaming = True
-        return agent
+    class SyntheticAgent(real_agent):
+        def __init__(self, **kwargs):
+            super().__init__(**{**kwargs, "skip_memory": True, "skip_context_files": True,
+                                "max_iterations": 4})
+            self._disable_streaming = True
 
+    # Runtime helpers read AIAgent class constants; preserve its class identity
+    # and inherited behavior while configuring this synthetic provider run.
     monkeypatch.setattr(run_agent, "OpenAI", Client)
-    monkeypatch.setattr(run_agent, "AIAgent", create)
+    monkeypatch.setattr(run_agent, "AIAgent", SyntheticAgent)
+    monkeypatch.setattr("agent.agent_init.fetch_model_metadata", lambda *args, **kwargs: None)
+    monkeypatch.setattr("agent.context_compressor.get_model_context_length", lambda *args, **kwargs: 32000)
     monkeypatch.setattr("gateway.run._resolve_runtime_agent_kwargs", lambda: {
         "api_key": "synthetic", "base_url": "http://example.invalid/v1", "provider": "openai",
         "api_mode": "chat_completions", "command": None, "args": []})
