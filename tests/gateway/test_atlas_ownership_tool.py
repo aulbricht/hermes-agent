@@ -429,6 +429,7 @@ async def test_scripted_provider_through_real_stream_agent_and_dispatch(
     """
     import run_agent
     from openai.types.chat import ChatCompletion
+    from agent.model_metadata import MINIMUM_CONTEXT_LENGTH
 
     wire_request = CONTRACT["requests"][request_index]
     observed, response = callback
@@ -472,7 +473,7 @@ async def test_scripted_provider_through_real_stream_agent_and_dispatch(
     monkeypatch.setattr(run_agent, "OpenAI", Client)
     monkeypatch.setattr(run_agent, "AIAgent", SyntheticAgent)
     monkeypatch.setattr("agent.agent_init.fetch_model_metadata", lambda *args, **kwargs: None)
-    monkeypatch.setattr("agent.context_compressor.get_model_context_length", lambda *args, **kwargs: 32000)
+    monkeypatch.setattr("agent.context_compressor.get_model_context_length", lambda *args, **kwargs: MINIMUM_CONTEXT_LENGTH * 2)
     monkeypatch.setattr("gateway.run._resolve_runtime_agent_kwargs", lambda: {
         "api_key": "synthetic", "base_url": "http://example.invalid/v1", "provider": "openai",
         "api_mode": "chat_completions", "command": None, "args": []})
