@@ -302,6 +302,8 @@ def get_tool_definitions(
     """
     from tools.atlas_import_tool import import_capability_available
     import_allowed = import_capability_available() and enabled_toolsets is not None and "atlas_import" in enabled_toolsets
+    from tools.atlas_ownership_tool import ownership_capability_available
+    ownership_allowed = ownership_capability_available() and enabled_toolsets is not None and "atlas_ownership" in enabled_toolsets
     # Fast path: memoized result when the caller doesn't need stdout prints.
     # The cache key captures every argument-level input; the registry
     # generation captures registry mutations (MCP refresh, plugin load).
@@ -326,6 +328,7 @@ def get_tool_definitions(
             bool(os.environ.get("HERMES_KANBAN_TASK")),
             bool(skip_tool_search_assembly),
             import_allowed,
+            ownership_allowed,
         )
         cached = _tool_defs_cache.get(cache_key)
         if cached is not None:
@@ -368,6 +371,8 @@ def _compute_tool_definitions(
     tools_to_include: set = set()
     from tools.atlas_import_tool import import_capability_available
     import_allowed = import_capability_available() and enabled_toolsets is not None and "atlas_import" in enabled_toolsets
+    from tools.atlas_ownership_tool import ownership_capability_available
+    ownership_allowed = ownership_capability_available() and enabled_toolsets is not None and "atlas_ownership" in enabled_toolsets
 
     if enabled_toolsets is not None:
         effective_enabled_toolsets = list(enabled_toolsets)
@@ -396,6 +401,9 @@ def _compute_tool_definitions(
         from toolsets import get_all_toolsets
         for ts_name in get_all_toolsets():
             tools_to_include.update(resolve_toolset(ts_name))
+    if not ownership_allowed:
+        tools_to_include.discard("atlas_ownership")
+        tools_to_include.discard("atlas_ownership_proposal")
     if not import_allowed:
         tools_to_include.discard("atlas_import")
         tools_to_include.discard("atlas_import_proposal")

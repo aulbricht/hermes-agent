@@ -1,0 +1,231 @@
+{
+  "protocol": "acre.ownership-tool.v1",
+  "bindings": {
+    "evidence_hash": "EVIDENCE_HASH",
+    "bearer": "CAPABILITY_PLACEHOLDER"
+  },
+  "source_values": {
+    "name": "EXAMPLE HOLDINGS LLC",
+    "email": "person@example.com(v)",
+    "address": {
+      "line1": "123 Example Street",
+      "city": "EXAMPLE CITY",
+      "state": "WA",
+      "postal_code": "00000"
+    }
+  },
+  "requests": [
+    {
+      "protocol": "acre.ownership-tool.v1",
+      "operation": "evidence",
+      "arguments": {
+        "offset": 0,
+        "limit": 20
+      }
+    },
+    {
+      "protocol": "acre.ownership-tool.v1",
+      "operation": "catalog",
+      "arguments": {}
+    },
+    {
+      "protocol": "acre.ownership-tool.v1",
+      "operation": "propose",
+      "arguments": {
+        "expected_version": 1,
+        "proposal": {
+          "property_id": "PRO-00000000-0000-0000-0000-000000000001",
+          "evidence_hash": "EVIDENCE_HASH",
+          "associations": [
+            {
+              "source_ref": "saved:1",
+              "contact_id": "c1",
+              "display_values": {
+                "display_name": "Company Alpha"
+              },
+              "rationale": "Saved evidence supports this association.",
+              "role": "Property Manager"
+            }
+          ],
+          "unresolved_questions": [],
+          "changes": [
+            {
+              "id": "name",
+              "source_ref": "saved:1",
+              "association_index": 0,
+              "kind": "name",
+              "intent": "create",
+              "proposed_value": "Example Holdings LLC",
+              "possible_cleaned_value": null,
+              "depends_on": [],
+              "uncertainty": [
+                "Branding unresolved"
+              ],
+              "rationale": "Synthetic source retained for review."
+            },
+            {
+              "id": "email",
+              "source_ref": "saved:1",
+              "association_index": 0,
+              "kind": "email",
+              "intent": "create",
+              "proposed_value": null,
+              "possible_cleaned_value": "person@example.com",
+              "depends_on": [
+                "name"
+              ],
+              "uncertainty": [],
+              "rationale": "Synthetic source retained for review."
+            },
+            {
+              "id": "address",
+              "source_ref": "saved:1",
+              "association_index": 0,
+              "kind": "address",
+              "intent": "create",
+              "proposed_value": {
+                "entityType": "Address",
+                "addressStreet1": "123 Example Street",
+                "addressCity": "EXAMPLE CITY",
+                "addressState": "WA",
+                "addressZip": "00000"
+              },
+              "possible_cleaned_value": null,
+              "depends_on": [
+                "name",
+                "email"
+              ],
+              "uncertainty": [],
+              "rationale": "Synthetic source retained for review."
+            }
+          ]
+        }
+      }
+    },
+    {
+      "protocol": "acre.ownership-tool.v1",
+      "operation": "revise",
+      "arguments": {
+        "expected_version": 2,
+        "base_revision": 1,
+        "correction_text": "Hold naming",
+        "proposal": {
+          "property_id": "PRO-00000000-0000-0000-0000-000000000001",
+          "evidence_hash": "EVIDENCE_HASH",
+          "associations": [
+            {
+              "source_ref": "saved:1",
+              "contact_id": "c1",
+              "display_values": {
+                "display_name": "Company Alpha"
+              },
+              "rationale": "Saved evidence supports this association.",
+              "role": "Property Manager"
+            }
+          ],
+          "unresolved_questions": [],
+          "changes": [
+            {
+              "id": "name",
+              "source_ref": "saved:1",
+              "association_index": 0,
+              "kind": "name",
+              "intent": "create",
+              "proposed_value": "Example Holdings LLC",
+              "possible_cleaned_value": null,
+              "depends_on": [],
+              "uncertainty": [
+                "Branding unresolved"
+              ],
+              "rationale": "Synthetic source retained for review."
+            },
+            {
+              "id": "email",
+              "source_ref": "saved:1",
+              "association_index": 0,
+              "kind": "email",
+              "intent": "create",
+              "proposed_value": null,
+              "possible_cleaned_value": "person@example.com",
+              "depends_on": [
+                "name"
+              ],
+              "uncertainty": [],
+              "rationale": "Synthetic source retained for review."
+            },
+            {
+              "id": "address",
+              "source_ref": "saved:1",
+              "association_index": 0,
+              "kind": "address",
+              "intent": "create",
+              "proposed_value": {
+                "entityType": "Address",
+                "addressStreet1": "123 Example Street",
+                "addressCity": "EXAMPLE CITY",
+                "addressState": "WA",
+                "addressZip": "00000"
+              },
+              "possible_cleaned_value": null,
+              "depends_on": [
+                "name",
+                "email"
+              ],
+              "uncertainty": [],
+              "rationale": "Synthetic source retained for review."
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "responses": [
+    {
+      "status": 200,
+      "body": {
+        "protocol": "acre.ownership-tool.v1",
+        "ok": true,
+        "operation": "catalog",
+        "result": {}
+      }
+    },
+    {
+      "status": 200,
+      "body": {
+        "protocol": "acre.ownership-tool.v1",
+        "ok": false,
+        "error": {
+          "code": "OWNERSHIP_STATE_CHANGED"
+        }
+      }
+    },
+    {
+      "status": 200,
+      "body": {
+        "protocol": "acre.ownership-tool.v1",
+        "ok": false,
+        "error": {
+          "code": "OWNERSHIP_TOO_LARGE"
+        }
+      }
+    },
+    {
+      "status": 403,
+      "body": {
+        "detail": "Ownership capability unavailable"
+      }
+    },
+    {
+      "status": 413,
+      "body": {
+        "detail": "Ownership request exceeds limit"
+      }
+    },
+    {
+      "status": 422,
+      "body": {
+        "detail": "Invalid ownership request"
+      }
+    }
+  ]
+}

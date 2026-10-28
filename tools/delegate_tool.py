@@ -50,6 +50,8 @@ DELEGATE_BLOCKED_TOOLS = frozenset(
         "send_message",  # no cross-platform side effects
         "execute_code",  # children should reason step-by-step, not write scripts
         "cronjob",  # no scheduling more work in the parent's name
+        "atlas_ownership",  # ownership authority is never delegated
+        "atlas_ownership_proposal",
     ]
 )
 
