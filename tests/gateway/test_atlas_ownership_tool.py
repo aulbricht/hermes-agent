@@ -25,6 +25,8 @@ from tools.thread_context import propagate_context_to_thread
 
 FIXTURE_BYTES = (Path(__file__).parents[1] / "fixtures/ownership_tool_contract.v1.json").read_bytes()
 CONTRACT = json.loads(FIXTURE_BYTES)
+WIRE_REQUESTS = (CONTRACT["requests"] + CONTRACT["execution_case"]["requests"]
+                 + CONTRACT["transformation_case"]["requests"] + CONTRACT["generic_case"]["requests"])
 TOKEN = "atown_" + "a" * 32
 OTHER_TOKEN = "atown_" + "b" * 32
 ERROR = {"error": "Ownership operation unavailable"}
@@ -89,7 +91,7 @@ def app_for(adapter):
 
 
 def test_fixture_identity():
-    assert hashlib.sha256(FIXTURE_BYTES).hexdigest() == "b9611becd2de2a8b655ffc608ff414519f92893575dcf83a0cd1183ff90543cf"
+    assert hashlib.sha256(FIXTURE_BYTES).hexdigest() == "df58c7504823e871f2be2bab50f8fa7244155e70bbe2a22d2869f99ad5da858f"
 
 
 @pytest.mark.parametrize("quiet", [True, False])
@@ -148,7 +150,7 @@ def test_ownership_authority_restricts_real_configured_tool_assembly(adapter, sc
     assert not tool.ownership_capability_available()
 
 
-@pytest.mark.parametrize("wire_request", CONTRACT["requests"])
+@pytest.mark.parametrize("wire_request", WIRE_REQUESTS)
 def test_valid_fixture_references_reach_fixed_callback_unchanged(wire_request, callback, caplog):
     request = wire_request
     observed, _ = callback
@@ -165,7 +167,7 @@ def test_valid_fixture_references_reach_fixed_callback_unchanged(wire_request, c
 
 
 @pytest.mark.parametrize("field", ["work_id", "session_id", "turn_id", "principal", "user_id", "token", "callback_url", "database"])
-@pytest.mark.parametrize("location", ["top", "proposal", "association", "display", "change", "address"])
+@pytest.mark.parametrize("location", ["top", "proposal", "association", "display", "change", "address", "action", "dependency", "fields", "probe"])
 def test_authority_injection_refused_at_every_object(field, location, callback):
     observed, _ = callback
     request = copy.deepcopy(CONTRACT["requests"][2])
@@ -174,7 +176,11 @@ def test_authority_injection_refused_at_every_object(field, location, callback):
               "association": proposal["associations"][0],
               "display": proposal["associations"][0]["display_values"],
               "change": proposal["changes"][0],
-              "address": proposal["changes"][2]["proposed_value"]}[location]
+              "address": proposal["changes"][2]["proposed_value"],
+              "action": proposal["execution_plan"][0],
+              "dependency": proposal["execution_plan"][1]["dependencies"][0],
+              "fields": proposal["execution_plan"][0]["fields"],
+              "probe": proposal["execution_plan"][0]["duplicate_probe"]}[location]
     target[field] = "untrusted"
     bound = tool.bind_ownership_capability(TOKEN)
     try:
@@ -182,6 +188,104 @@ def test_authority_injection_refused_at_every_object(field, location, callback):
     finally:
         tool.clear_ownership_capability(bound)
     assert observed == []
+
+
+@pytest.mark.parametrize("operation", ["propose", "revise"])
+def test_execution_plan_schema_and_real_dispatch_preserve_agent_choices(operation, callback):
+    from model_tools import get_tool_definitions, handle_function_call
+
+    request = copy.deepcopy(CONTRACT["requests"][2 if operation == "propose" else 3])
+    # A previously unseen field name passes only inside the two bounded maps.
+    # Hermes transports agent choices; it does not maintain a field allowlist.
+    action = request["arguments"]["proposal"]["execution_plan"][0]
+    action["fields"]["agentChosenField"] = "Agent chosen value"
+    action["duplicate_probe"]["agentChosenField"] = "Agent chosen value"
+    bound = tool.bind_ownership_capability(TOKEN)
+    try:
+        definitions = get_tool_definitions(enabled_toolsets=["atlas_ownership"], quiet_mode=True)
+        parameters = next(d["function"]["parameters"] for d in definitions
+                          if d["function"]["name"] == "atlas_ownership_proposal")
+        args = {"operation": operation, **request["arguments"]}
+        # Definitions are provider-sanitized (nullable unions become hints).
+        # Validate raw arguments against the handler's schema, and check the
+        # emitted schema still offers plans/maps and nullable business IDs.
+        assert tool._matches(args, tool._PROPOSAL_TOOL_SCHEMA)
+        emitted = parameters["properties"]["proposal"]["properties"]
+        action_schema = emitted["execution_plan"]["items"]
+        for slot in ("fields", "duplicate_probe"):
+            assert action_schema["properties"][slot]["additionalProperties"]["type"] == "string"
+            assert action_schema["properties"][slot]["properties"] == {}
+        assert emitted["associations"]["items"]["properties"]["contact_id"]["nullable"] is True
+        assert action_schema["properties"]["target_id"]["nullable"] is True
+        assert json.loads(handle_function_call("atlas_ownership_proposal", args)) == success(operation)
+    finally:
+        tool.clear_ownership_capability(bound)
+    observed, _ = callback
+    assert len(observed) == 1
+    assert json.loads(observed[0].content) == request
+    assert not tool.ownership_capability_available()
+
+
+@pytest.mark.parametrize("field", ["id", "owner_id", "principal_id", "capability",
+                                    "atlas_ownership_capability", "atlas_import_capability"])
+@pytest.mark.parametrize("location", ["fields", "duplicate_probe"])
+def test_execution_plan_field_maps_refuse_authority_keys(field, location, callback):
+    request = copy.deepcopy(CONTRACT["requests"][2])
+    request["arguments"]["proposal"]["execution_plan"][0][location][field] = "foreign"
+    bound = tool.bind_ownership_capability(TOKEN)
+    try:
+        assert json.loads(invoke(request)) == ERROR
+    finally:
+        tool.clear_ownership_capability(bound)
+    assert not callback[0]
+
+
+@pytest.mark.parametrize("operation", ["propose", "revise"])
+@pytest.mark.parametrize("with_plan", [False, True])
+def test_optional_plan_and_scoped_update_reference_forward_unchanged(operation, with_plan, callback):
+    request = copy.deepcopy(CONTRACT["requests"][2 if operation == "propose" else 3])
+    proposal = request["arguments"]["proposal"]
+    if with_plan:
+        # target_id is only an untrusted business reference, checked by Atlas.
+        proposal["execution_plan"][0].update(action="update", target_id="existing-contact")
+    else:
+        del proposal["execution_plan"]
+    bound = tool.bind_ownership_capability(TOKEN)
+    try:
+        assert json.loads(invoke(request)) == success(operation)
+    finally:
+        tool.clear_ownership_capability(bound)
+    assert json.loads(callback[0][0].content) == request
+
+
+@pytest.mark.parametrize("location,value", [
+    ("plan", []), ("plan", {}), ("plan", [None]),
+    ("plan", [{"operation": "execute"}]),
+    ("table", "API_User"), ("action", "delete"), ("target_id", True),
+    ("fields", {}), ("fields", {"nested": {"owner_id": "foreign"}}),
+    ("fields", {"numeric": 1}), ("fields", {"long": "x" * 2001}),
+    ("fields", {str(i): "v" for i in range(101)}),
+    ("fields", {"secret": TOKEN}), ("probe", {"secret": TOKEN}),
+    ("probe", {"nested": []}), ("dependency", {"field": "owner_id", "action_id": "contact"}),
+    ("dependency", {"field": "id__contact", "action_id": TOKEN}),
+    ("holds", ["unresolved"]),
+])
+def test_invalid_execution_plan_never_dispatches(location, value, callback):
+    request = copy.deepcopy(CONTRACT["requests"][2])
+    proposal = request["arguments"]["proposal"]
+    if location == "plan":
+        proposal["execution_plan"] = value
+    elif location == "dependency":
+        proposal["execution_plan"][1]["dependencies"] = [value]
+    else:
+        key = "duplicate_probe" if location == "probe" else location
+        proposal["execution_plan"][0][key] = value
+    bound = tool.bind_ownership_capability(TOKEN)
+    try:
+        assert json.loads(invoke(request)) == ERROR
+    finally:
+        tool.clear_ownership_capability(bound)
+    assert not callback[0]
 
 
 @pytest.mark.parametrize("payload", [
@@ -439,9 +543,323 @@ def test_delegated_child_has_neither_definitions_nor_callback_authority(requeste
     assert not observed
 
 
+@pytest.mark.parametrize("operation", ["propose", "revise"])
+def test_transformations_real_definitions_and_dispatch(operation, callback):
+    from model_tools import get_tool_definitions, handle_function_call
+
+    request = copy.deepcopy(CONTRACT["transformation_case"]["requests"][0 if operation == "propose" else 1])
+    # An unseen business field remains data; no semantic field allowlist.
+    proposal = request["arguments"]["proposal"]
+    transform = proposal["transformations"][0]
+    value = proposal["execution_plan"][0]["fields"].pop(transform["field"])
+    transform["field"] = "newAgentChosenField"
+    proposal["execution_plan"][0]["fields"][transform["field"]] = value
+    bound = tool.bind_ownership_capability(TOKEN)
+    try:
+        definitions = get_tool_definitions(enabled_toolsets=["atlas_ownership"], quiet_mode=True)
+        schema = next(d["function"]["parameters"] for d in definitions
+                      if d["function"]["name"] == "atlas_ownership_proposal")
+        entry = schema["properties"]["proposal"]["properties"]["transformations"]["items"]
+        assert entry["additionalProperties"] is False
+        assert entry["properties"]["source_inputs"]["items"]["additionalProperties"] is False
+        assert set(entry["required"]) == set(transform)
+        assert json.loads(handle_function_call("atlas_ownership_proposal", {
+            "operation": operation, **request["arguments"]})) == success(operation)
+    finally:
+        tool.clear_ownership_capability(bound)
+    assert json.loads(callback[0][0].content) == request
+
+
+def invalid_transformation_request(location, value):
+    request = copy.deepcopy(CONTRACT["transformation_case"]["requests"][0])
+    proposal = request["arguments"]["proposal"]
+    item = proposal["transformations"][0]
+    if location == "transformations":
+        proposal["transformations"] = value
+    elif location == "missing":
+        del item[value]
+    elif location == "extra":
+        item[value] = "forged"
+    elif location == "input_extra":
+        item["source_inputs"][0][value] = "forged"
+    elif location == "path":
+        item["source_inputs"][0]["path"] = value
+    elif location == "duplicate":
+        duplicate = copy.deepcopy(item)
+        duplicate["id"] = value
+        proposal["transformations"].append(duplicate)
+    else:
+        item[location] = value
+        # Keep an exact action match: refusal must not rely on mismatch alone.
+        if location == "proposed_value":
+            proposal["execution_plan"][0]["fields"][item["field"]] = value
+        if location == "field":
+            proposal["execution_plan"][0]["fields"][value] = item["proposed_value"]
+    return request
+
+
+INVALID_TRANSFORMATIONS = [
+    ("transformations", {}), ("transformations", [None]),
+    ("missing", "rationale"), ("missing", "guidance_revision"), ("missing", "catalog_revision"),
+    ("extra", "unknown"), ("extra", "target_id"), ("extra", "owner_id"),
+    ("input_extra", "value"), ("input_extra", "work_id"), ("input_extra", "callback_url"),
+    ("path", ""), ("path", "name"), ("path", "/bad~2escape"), ("path", "/bad~"),
+    ("source_inputs", []), ("source_inputs", [{"source_ref": "saved:1", "path": "/name"}] * 11),
+    ("source_ref", "foreign"), ("association_index", True), ("association_index", 1),
+    ("action_id", "unknown"), ("table", "API_User"), ("table", "API_ContactDetail"),
+    ("field", "target_id"), ("field", "id"), ("field", "id__contact"),
+    ("field", "owner_id"), ("field", "a.b"), ("field", "a" * 102),
+    ("proposed_value", ""), ("proposed_value", "   "), ("proposed_value", "x" * 2001),
+    ("proposed_value", TOKEN),
+    ("depends_on", []), ("depends_on", ["name", "name"]), ("depends_on", ["missing"]),
+    ("depends_on", ["x" * 161]), ("uncertainty", ["x"] * 11),
+    ("uncertainty", ["x" * 2001]), ("duplicate", "different-id"), ("duplicate", "contact-category"),
+] + [("proposed_value", "visible" + char) for char in (
+    "\x00", "\n", "\x7f", "\u0085", "\u202e", "\u200b", "\u200d", "\ufeff", "\ud800",
+    "\u034f", "\u115f", "\u1160", "\u17b4", "\u17b5", "\u3164", "\uffa0",
+    "\ufe00", "\ufe0f", "\U000e0100", "\U000e01ef")]
+
+
+@pytest.mark.parametrize("location,value", INVALID_TRANSFORMATIONS)
+def test_invalid_transformations_real_dispatch_refuses_before_callback(location, value, callback):
+    from model_tools import handle_function_call
+
+    request = invalid_transformation_request(location, value)
+    bound = tool.bind_ownership_capability(TOKEN)
+    try:
+        assert json.loads(handle_function_call("atlas_ownership_proposal", {
+            "operation": "propose", **request["arguments"]})) == ERROR
+    finally:
+        tool.clear_ownership_capability(bound)
+    assert not callback[0]
+
+
+@pytest.mark.parametrize("mutation", ["value_mismatch", "field_reuse", "dependency_source",
+                                      "dependency_association", "duplicate_action", "duplicate_change"])
+def test_transformation_relationships_refused_without_authority(mutation, callback):
+    request = copy.deepcopy(CONTRACT["transformation_case"]["requests"][0])
+    proposal = request["arguments"]["proposal"]
+    item = proposal["transformations"][0]
+    if mutation == "value_mismatch":
+        proposal["execution_plan"][0]["fields"][item["field"]] = "different"
+    elif mutation == "field_reuse":
+        item["field"] = "organizationName"  # Value elsewhere grants no field reuse.
+    elif mutation == "dependency_source":
+        proposal["changes"][0]["source_ref"] = "other"
+    elif mutation == "dependency_association":
+        proposal["changes"][0]["association_index"] = 1
+    elif mutation == "duplicate_action":
+        proposal["execution_plan"].append(copy.deepcopy(proposal["execution_plan"][0]))
+    else:
+        proposal["changes"].append(copy.deepcopy(proposal["changes"][0]))
+    bound = tool.bind_ownership_capability(TOKEN)
+    try:
+        assert json.loads(invoke(request)) == ERROR
+    finally:
+        tool.clear_ownership_capability(bound)
+    assert not callback[0]
+
+
+@pytest.mark.parametrize("value", ["é" * 2000, "😀" * 2000, '<script>alert("proposal")</script>'])
+def test_transformation_value_codepoint_bound_and_text_preserved(value, callback):
+    request = copy.deepcopy(CONTRACT["transformation_case"]["requests"][0])
+    proposal = request["arguments"]["proposal"]
+    item = proposal["transformations"][0]
+    item["proposed_value"] = value
+    proposal["execution_plan"][0]["fields"][item["field"]] = value
+    # Selectors only: escaped JSON Pointer keys remain literal for Atlas to resolve.
+    item["source_inputs"][0]["path"] = "/a~1b/~0name"
+    bound = tool.bind_ownership_capability(TOKEN)
+    try:
+        assert json.loads(invoke(request)) == success("propose")
+    finally:
+        tool.clear_ownership_capability(bound)
+    assert json.loads(callback[0][0].content) == request
+
+
+def test_transformation_count_and_envelope_byte_caps(callback):
+    request = copy.deepcopy(CONTRACT["transformation_case"]["requests"][0])
+    proposal = request["arguments"]["proposal"]
+    original = proposal["transformations"][0]
+    proposal["transformations"] = []
+    for i in range(100):
+        item = copy.deepcopy(original)
+        item.update(id=f"transform{i}", field=f"field{i}", proposed_value="😀" * 2000)
+        proposal["execution_plan"][0]["fields"][item["field"]] = item["proposed_value"]
+        proposal["transformations"].append(item)
+    # Keep maps within bounds while exceeding the enclosing byte cap.
+    proposal["execution_plan"][0]["fields"].pop(original["field"])
+    proposal["execution_plan"][0]["fields"].pop("organizationName")
+    bound = tool.bind_ownership_capability(TOKEN)
+    try:
+        assert tool._matches({"operation": "propose", **request["arguments"]}, tool._PROPOSAL_TOOL_SCHEMA)
+        assert json.loads(invoke(request)) == ERROR
+        proposal["transformations"].append(copy.deepcopy(original))
+        assert json.loads(invoke(request)) == ERROR
+    finally:
+        tool.clear_ownership_capability(bound)
+    assert not callback[0]
+
+
+@pytest.mark.parametrize("operation", ["propose", "revise"])
+def test_generic_real_definitions_and_dispatch_preserve_raw_and_held_candidate(operation, callback):
+    from model_tools import get_tool_definitions, handle_function_call
+
+    case = CONTRACT["generic_case"]
+    request = copy.deepcopy(case["requests"][0 if operation == "propose" else 1])
+    proposal = request["arguments"]["proposal"]
+    phone, uncertain = proposal["changes"][-2:]
+    assert phone["proposed_value"] == case["source_values"]["generic"]["phone"]
+    assert uncertain["proposed_value"] is None and uncertain["uncertainty"]
+    assert case["source_values"]["generic"]["phone_uncertain"].endswith("ext ?")
+    bound = tool.bind_ownership_capability(TOKEN)
+    try:
+        definitions = get_tool_definitions(enabled_toolsets=["atlas_ownership"], quiet_mode=True)
+        schema = next(d["function"]["parameters"] for d in definitions
+                      if d["function"]["name"] == "atlas_ownership_proposal")
+        variants = schema["properties"]["proposal"]["properties"]["changes"]["items"]["anyOf"]
+        generic = next(v for v in variants if v["properties"]["kind"]["enum"] == ["generic"])
+        legacy = next(v for v in variants if "name" in v["properties"]["kind"]["enum"])
+        assert generic["additionalProperties"] is False
+        assert set(generic["required"]) == set(phone)
+        assert "source_path" not in legacy["properties"]
+        assert json.loads(handle_function_call("atlas_ownership_proposal", {
+            "operation": operation, **request["arguments"]})) == success(operation)
+    finally:
+        tool.clear_ownership_capability(bound)
+    assert json.loads(callback[0][0].content) == request
+    assert not tool.ownership_capability_available()
+
+
+def invalid_generic_request(location, value):
+    request = copy.deepcopy(CONTRACT["generic_case"]["requests"][0])
+    proposal = request["arguments"]["proposal"]
+    item = proposal["changes"][-2]
+    if location == "extra":
+        item[value] = "untrusted"
+    elif location == "missing":
+        del item[value]
+    elif location == "legacy_path":
+        proposal["changes"][0]["source_path"] = value
+    elif location == "selector_path":
+        proposal["transformations"][0]["source_inputs"][0]["path"] = value
+    elif location == "selector_source":
+        proposal["transformations"][0]["source_inputs"][0]["source_ref"] = value
+    elif location == "transform_depends_on":
+        proposal["transformations"][0]["depends_on"] = value
+    elif location == "duplicate_target":
+        proposal["changes"][-1]["source_path"] = item["source_path"]
+    else:
+        item[location] = value
+    return request
+
+
+INVALID_GENERIC = [
+    ("extra", key) for key in ("work_id", "session_id", "turn_id", "principal", "user_id",
+                              "owner_id", "token", "callback_url", "database", "source_input", "value")
+] + [
+    ("missing", "source_path"), ("missing", "proposed_value"),
+    ("missing", "possible_cleaned_value"), ("missing", "rationale"),
+    ("source_ref", "foreign"), ("association_index", True), ("association_index", 1),
+    ("id", "name"), ("duplicate_target", None),
+    ("kind", "phone"), ("kind", "name"), ("kind", "email"), ("kind", "address"),
+    ("legacy_path", "/generic/phone"),
+    ("possible_cleaned_value", "2025550100"),
+    ("proposed_value", ""), ("proposed_value", "   "), ("proposed_value", "x" * 2001),
+    ("proposed_value", TOKEN), ("proposed_value", {"value": "untrusted"}),
+    ("proposed_value", "phone\u202e"), ("proposed_value", "phone\u200b"),
+    ("depends_on", ["missing"]), ("depends_on", ["phone"]),
+    ("depends_on", ["uncertain-phone"]), ("depends_on", ["name", "name"]),
+    ("depends_on", ["name"] * 101),
+    ("uncertainty", ["x"] * 11), ("uncertainty", ["x" * 2001]),
+    ("rationale", "x" * 2001),
+    ("selector_path", "/generic/phone_uncertain"), ("selector_source", "foreign"),
+    ("transform_depends_on", ["name"]), ("transform_depends_on", ["uncertain-phone"]),
+] + [("source_path", path) for path in (
+    "", "/generic/", "generic/phone", "/phone", "/email", "/name", "/address/line1",
+    "/generic/bad~2", "/generic/bad~", "/generic/" + "x" * 232, TOKEN,
+)]
+
+
+@pytest.mark.parametrize("location,value", INVALID_GENERIC)
+def test_generic_invalid_shape_and_local_references_refuse_before_callback(location, value, callback):
+    from model_tools import handle_function_call
+
+    request = invalid_generic_request(location, value)
+    bound = tool.bind_ownership_capability(TOKEN)
+    try:
+        assert json.loads(handle_function_call("atlas_ownership_proposal", {
+            "operation": "propose", **request["arguments"]})) == ERROR
+    finally:
+        tool.clear_ownership_capability(bound)
+    assert not callback[0]
+
+
+@pytest.mark.parametrize("path", ["/generic/a~1b/c~0d", "/generic/" + "x" * 231])
+def test_generic_pointer_escaping_and_bound_forward_without_local_resolution(path, callback):
+    request = copy.deepcopy(CONTRACT["generic_case"]["requests"][0])
+    proposal = request["arguments"]["proposal"]
+    proposal["changes"][-2]["source_path"] = path
+    for item in proposal["transformations"]:
+        item["source_inputs"][0]["path"] = path
+    bound = tool.bind_ownership_capability(TOKEN)
+    try:
+        assert json.loads(invoke(request)) == success("propose")
+    finally:
+        tool.clear_ownership_capability(bound)
+    # Only Atlas can establish whether a syntactically valid path exists.
+    assert json.loads(callback[0][0].content) == request
+
+
+def test_generic_dependencies_cannot_rebind_to_other_source_or_association(callback):
+    request = copy.deepcopy(CONTRACT["generic_case"]["requests"][0])
+    proposal = request["arguments"]["proposal"]
+    bound = tool.bind_ownership_capability(TOKEN)
+    try:
+        for key, value in [("source_ref", "foreign"), ("association_index", 1)]:
+            prior = proposal["changes"][0]
+            original = prior[key]
+            prior[key] = value
+            assert json.loads(invoke(request)) == ERROR
+            prior[key] = original
+    finally:
+        tool.clear_ownership_capability(bound)
+    assert not callback[0]
+
+
+def test_generic_count_unicode_and_enclosing_byte_limits(callback):
+    request = copy.deepcopy(CONTRACT["generic_case"]["requests"][0])
+    proposal = request["arguments"]["proposal"]
+    original = proposal["changes"][-2]
+    proposal["changes"] = proposal["changes"][:3]
+    proposal.pop("transformations")
+    for i in range(97):
+        item = {**original, "id": f"generic{i}", "source_path": f"/generic/{i}"}
+        proposal["changes"].append(item)
+    bound = tool.bind_ownership_capability(TOKEN)
+    try:
+        assert json.loads(invoke(request)) == success("propose")
+        proposal["changes"].append({**original, "id": "overflow", "source_path": "/generic/overflow"})
+        assert json.loads(invoke(request)) == ERROR
+        proposal["changes"].pop()
+        for item in proposal["changes"][3:]:
+            item["proposed_value"] = "😀" * 2000
+        assert tool._matches({"operation": "propose", **request["arguments"]}, tool._PROPOSAL_TOOL_SCHEMA)
+        assert json.loads(invoke(request)) == ERROR
+    finally:
+        tool.clear_ownership_capability(bound)
+    assert len(callback[0]) == 1
+
+
 STREAM_CASES = [(index, {"status": 200, "body": success(request["operation"])})
-                for index, request in enumerate(CONTRACT["requests"])]
+                for index, request in enumerate(WIRE_REQUESTS)]
+STREAM_CASES += [(invalid_generic_request(location, value), {"local_refusal": True})
+                 for location, value in [("extra", "owner_id"), ("source_path", "/email"),
+                                         ("transform_depends_on", ["name"])]]
 STREAM_CASES += [(1, response) for response in CONTRACT["responses"]]
+STREAM_CASES += [(invalid_transformation_request(location, value), {"local_refusal": True})
+                 for location, value in [("extra", "target_id"), ("field", "id__contact"),
+                                         ("proposed_value", "bad\u202e"), ("duplicate", "duplicate")]]
 
 
 @pytest.mark.asyncio
@@ -456,13 +874,16 @@ async def test_scripted_provider_through_real_stream_agent_and_dispatch(
     from openai.types.chat import ChatCompletion
     from agent.model_metadata import MINIMUM_CONTEXT_LENGTH
 
-    wire_request = CONTRACT["requests"][request_index]
+    wire_request = request_index if isinstance(request_index, dict) else WIRE_REQUESTS[request_index]
     observed, response = callback
-    response[0] = lambda request: httpx.Response(reply["status"], json=reply["body"])
+    local_refusal = reply.get("local_refusal", False)
+    if not local_refusal:
+        response[0] = lambda request: httpx.Response(reply["status"], json=reply["body"])
     provider_calls = []
-    tool_name = "atlas_ownership" if request_index < 2 else "atlas_ownership_proposal"
+    read = wire_request["operation"] in {"evidence", "catalog"}
+    tool_name = "atlas_ownership" if read else "atlas_ownership_proposal"
     tool_args = ({"operation": wire_request["operation"], "arguments": wire_request["arguments"]}
-                 if request_index < 2 else {"operation": wire_request["operation"], **wire_request["arguments"]})
+                 if read else {"operation": wire_request["operation"], **wire_request["arguments"]})
 
     def complete(**kwargs):
         provider_calls.append(copy.deepcopy(kwargs))
@@ -512,14 +933,17 @@ async def test_scripted_provider_through_real_stream_agent_and_dispatch(
         assert resp.status == 200
         stream = await resp.text()
     assert "event: run.completed" in stream
-    assert len(observed) == 1
-    assert observed[0].headers["Authorization"] == "Bearer " + TOKEN
-    assert observed[0].content == json.dumps(wire_request, ensure_ascii=False, separators=(",", ":")).encode()
+    if local_refusal:
+        assert observed == []
+    else:
+        assert len(observed) == 1
+        assert observed[0].headers["Authorization"] == "Bearer " + TOKEN
+        assert observed[0].content == json.dumps(wire_request, ensure_ascii=False, separators=(",", ":")).encode()
     assert len(provider_calls) >= 2
     for call in provider_calls:
         assert {item["function"]["name"] for item in call["tools"]} == OWNERSHIP
     tool_results = [message["content"] for message in provider_calls[-1]["messages"] if message["role"] == "tool"]
-    expected = reply["body"] if reply["status"] == 200 else ERROR
+    expected = reply["body"] if not local_refusal and reply["status"] == 200 else ERROR
     assert any(json.loads(value) == expected for value in tool_results)
     assert TOKEN not in json.dumps(provider_calls) + stream + caplog.text
     assert not tool.ownership_capability_available()
