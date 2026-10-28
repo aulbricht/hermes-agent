@@ -1,6 +1,6 @@
 """One-turn ownership previews through Atlas's fixed, capability-bound callback.
 
-Schema source: acre-atlas 0427d925, ownership_work._proposal/_review_changes.
+Schema source: acre-atlas 72e6b0f6, ownership_work._proposal and ownership_execution.actions.
 Business references are untrusted; only Atlas can resolve them against bound work.
 """
 
@@ -58,6 +58,31 @@ _CHANGE_SCHEMA = _object({
     "uncertainty": _array(_text(), 10),
     "rationale": _text(),
 })
+# Only these two slots accept model-proposed field names. They are business
+# data, never trusted scope; Atlas checks source values, target scope and Approval.
+_AUTHORITY_KEYS = frozenset({
+    "id", "work_id", "session_id", "turn_id", "principal", "principal_id",
+    "user_id", "owner_id", "token", "capability", "atlas_ownership_capability",
+    "atlas_import_capability", "callback_url", "url", "database",
+})
+_FIELD_MAP_SCHEMA = {
+    "type": "object", "properties": {}, "required": [],
+    "additionalProperties": {"type": "string", "maxLength": 2000},
+    "maxProperties": 100,
+    "propertyNames": {"type": "string", "minLength": 1, "maxLength": 160,
+                      "not": {"enum": sorted(_AUTHORITY_KEYS)}},
+}
+_ACTION_SCHEMA = _object({
+    "id": _text(160),
+    "table": {"type": "string", "enum": ["API_Contact", "API_ContactDetail", "API_JOIN_propertyContact"]},
+    "action": {"type": "string", "enum": ["create", "update"]},
+    "fields": {**_FIELD_MAP_SCHEMA, "minProperties": 1},
+    "target_id": {"anyOf": [_text(160), {"type": "null"}]},
+    "duplicate_probe": _FIELD_MAP_SCHEMA,
+    "dependencies": _array(_object({"field": _FIELD_MAP_SCHEMA["propertyNames"],
+                                    "action_id": _text(160)}), 100),
+    "holds": _array(_text(), 0),
+})
 _PROPOSAL_SCHEMA = _object({
     "property_id": _text(160),
     "evidence_hash": _text(160),
@@ -70,6 +95,7 @@ _PROPOSAL_SCHEMA = _object({
     }), 100),
     "unresolved_questions": _array(_text(), 10),
     "changes": _array(_CHANGE_SCHEMA, 100),
+    "execution_plan": {**_array(_ACTION_SCHEMA, 100), "minItems": 1},
 }, ["property_id", "evidence_hash", "associations", "unresolved_questions"])
 _READ_SCHEMA = _object({
     "operation": {"type": "string", "enum": ["evidence", "catalog"]},
@@ -107,6 +133,8 @@ def _matches(value, schema):
     No coercion, unknown fields or model-supplied schema. Atlas additionally
     checks evidence, dependencies and state; this gate conveys no authority.
     """
+    if "not" in schema and value in schema["not"].get("enum", []):
+        return False
     if "anyOf" in schema:
         return any(_matches(value, branch) for branch in schema["anyOf"])
     kind = schema["type"]
@@ -116,11 +144,17 @@ def _matches(value, schema):
     if "enum" in schema and value not in schema["enum"]:
         return False
     if kind == "object":
-        return (not set(value) - set(schema["properties"])
+        properties = schema["properties"]
+        extra = schema["additionalProperties"]
+        return (schema.get("minProperties", 0) <= len(value) <= schema.get("maxProperties", len(value))
                 and set(schema["required"]).issubset(value)
-                and all(_matches(item, schema["properties"][key]) for key, item in value.items()))
+                and all((key in properties or isinstance(extra, dict))
+                        and ("propertyNames" not in schema or _matches(key, schema["propertyNames"]))
+                        and _matches(item, properties[key] if key in properties else extra)
+                        for key, item in value.items()))
     if kind == "array":
-        return len(value) <= schema["maxItems"] and all(_matches(item, schema["items"]) for item in value)
+        return (schema.get("minItems", 0) <= len(value) <= schema["maxItems"]
+                and all(_matches(item, schema["items"]) for item in value))
     if kind == "string":
         return (schema.get("minLength", 0) <= len(value) <= schema.get("maxLength", _MAX_REQUEST_BYTES)
                 and (not schema.get("minLength") or bool(value.strip()))
@@ -204,7 +238,7 @@ registry.register(
 )
 registry.register(
     name="atlas_ownership_proposal", toolset="atlas_ownership",
-    schema={"name": "atlas_ownership_proposal", "description": "Submit a held ownership proposal or immutable correction revision. Revise requires base_revision and correction_text; propose omits them. Business references must match bound evidence. Never approves or executes.",
+    schema={"name": "atlas_ownership_proposal", "description": "Submit a held ownership proposal or immutable correction revision. Revise requires base_revision and correction_text; propose omits them. Optional execution_plan proposes exact actions, field values, duplicate probes and earlier-action dependencies for separate review. Business references must match bound evidence; Atlas validates scope. Never approves or executes.",
             "parameters": _PROPOSAL_TOOL_SCHEMA},
     handler=_handle_atlas_ownership_proposal, max_result_size_chars=_MAX_RESPONSE_BYTES,
 )

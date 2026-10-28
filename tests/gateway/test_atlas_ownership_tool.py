@@ -89,7 +89,7 @@ def app_for(adapter):
 
 
 def test_fixture_identity():
-    assert hashlib.sha256(FIXTURE_BYTES).hexdigest() == "b9611becd2de2a8b655ffc608ff414519f92893575dcf83a0cd1183ff90543cf"
+    assert hashlib.sha256(FIXTURE_BYTES).hexdigest() == "ac9b1b5643b1bbf75e823fcae0b43b6e2ad70145343878ae6e05c8acb828b046"
 
 
 @pytest.mark.parametrize("quiet", [True, False])
@@ -165,7 +165,7 @@ def test_valid_fixture_references_reach_fixed_callback_unchanged(wire_request, c
 
 
 @pytest.mark.parametrize("field", ["work_id", "session_id", "turn_id", "principal", "user_id", "token", "callback_url", "database"])
-@pytest.mark.parametrize("location", ["top", "proposal", "association", "display", "change", "address"])
+@pytest.mark.parametrize("location", ["top", "proposal", "association", "display", "change", "address", "action", "dependency", "fields", "probe"])
 def test_authority_injection_refused_at_every_object(field, location, callback):
     observed, _ = callback
     request = copy.deepcopy(CONTRACT["requests"][2])
@@ -174,7 +174,11 @@ def test_authority_injection_refused_at_every_object(field, location, callback):
               "association": proposal["associations"][0],
               "display": proposal["associations"][0]["display_values"],
               "change": proposal["changes"][0],
-              "address": proposal["changes"][2]["proposed_value"]}[location]
+              "address": proposal["changes"][2]["proposed_value"],
+              "action": proposal["execution_plan"][0],
+              "dependency": proposal["execution_plan"][1]["dependencies"][0],
+              "fields": proposal["execution_plan"][0]["fields"],
+              "probe": proposal["execution_plan"][0]["duplicate_probe"]}[location]
     target[field] = "untrusted"
     bound = tool.bind_ownership_capability(TOKEN)
     try:
@@ -182,6 +186,94 @@ def test_authority_injection_refused_at_every_object(field, location, callback):
     finally:
         tool.clear_ownership_capability(bound)
     assert observed == []
+
+
+@pytest.mark.parametrize("operation", ["propose", "revise"])
+def test_execution_plan_schema_and_real_dispatch_preserve_agent_choices(operation, callback):
+    from model_tools import get_tool_definitions, handle_function_call
+
+    request = copy.deepcopy(CONTRACT["requests"][2 if operation == "propose" else 3])
+    # A previously unseen field name passes only inside the two bounded maps.
+    # Hermes transports agent choices; it does not maintain a field allowlist.
+    action = request["arguments"]["proposal"]["execution_plan"][0]
+    action["fields"]["agentChosenField"] = "Agent chosen value"
+    action["duplicate_probe"]["agentChosenField"] = "Agent chosen value"
+    bound = tool.bind_ownership_capability(TOKEN)
+    try:
+        definitions = get_tool_definitions(enabled_toolsets=["atlas_ownership"], quiet_mode=True)
+        parameters = next(d["function"]["parameters"] for d in definitions
+                          if d["function"]["name"] == "atlas_ownership_proposal")
+        args = {"operation": operation, **request["arguments"]}
+        assert tool._matches(args, parameters)
+        assert json.loads(handle_function_call("atlas_ownership_proposal", args)) == success(operation)
+    finally:
+        tool.clear_ownership_capability(bound)
+    observed, _ = callback
+    assert len(observed) == 1
+    assert json.loads(observed[0].content) == request
+    assert not tool.ownership_capability_available()
+
+
+@pytest.mark.parametrize("field", ["id", "owner_id", "principal_id", "capability",
+                                    "atlas_ownership_capability", "atlas_import_capability"])
+@pytest.mark.parametrize("location", ["fields", "duplicate_probe"])
+def test_execution_plan_field_maps_refuse_authority_keys(field, location, callback):
+    request = copy.deepcopy(CONTRACT["requests"][2])
+    request["arguments"]["proposal"]["execution_plan"][0][location][field] = "foreign"
+    bound = tool.bind_ownership_capability(TOKEN)
+    try:
+        assert json.loads(invoke(request)) == ERROR
+    finally:
+        tool.clear_ownership_capability(bound)
+    assert not callback[0]
+
+
+@pytest.mark.parametrize("operation", ["propose", "revise"])
+@pytest.mark.parametrize("with_plan", [False, True])
+def test_optional_plan_and_scoped_update_reference_forward_unchanged(operation, with_plan, callback):
+    request = copy.deepcopy(CONTRACT["requests"][2 if operation == "propose" else 3])
+    proposal = request["arguments"]["proposal"]
+    if with_plan:
+        # target_id is only an untrusted business reference, checked by Atlas.
+        proposal["execution_plan"][0].update(action="update", target_id="existing-contact")
+    else:
+        del proposal["execution_plan"]
+    bound = tool.bind_ownership_capability(TOKEN)
+    try:
+        assert json.loads(invoke(request)) == success(operation)
+    finally:
+        tool.clear_ownership_capability(bound)
+    assert json.loads(callback[0][0].content) == request
+
+
+@pytest.mark.parametrize("location,value", [
+    ("plan", []), ("plan", {}), ("plan", [None]),
+    ("plan", [{"operation": "execute"}]),
+    ("table", "API_User"), ("action", "delete"), ("target_id", True),
+    ("fields", {}), ("fields", {"nested": {"owner_id": "foreign"}}),
+    ("fields", {"numeric": 1}), ("fields", {"long": "x" * 2001}),
+    ("fields", {str(i): "v" for i in range(101)}),
+    ("fields", {"secret": TOKEN}), ("probe", {"secret": TOKEN}),
+    ("probe", {"nested": []}), ("dependency", {"field": "owner_id", "action_id": "contact"}),
+    ("dependency", {"field": "id_contact", "action_id": TOKEN}),
+    ("holds", ["unresolved"]),
+])
+def test_invalid_execution_plan_never_dispatches(location, value, callback):
+    request = copy.deepcopy(CONTRACT["requests"][2])
+    proposal = request["arguments"]["proposal"]
+    if location == "plan":
+        proposal["execution_plan"] = value
+    elif location == "dependency":
+        proposal["execution_plan"][1]["dependencies"] = [value]
+    else:
+        key = "duplicate_probe" if location == "probe" else location
+        proposal["execution_plan"][0][key] = value
+    bound = tool.bind_ownership_capability(TOKEN)
+    try:
+        assert json.loads(invoke(request)) == ERROR
+    finally:
+        tool.clear_ownership_capability(bound)
+    assert not callback[0]
 
 
 @pytest.mark.parametrize("payload", [

@@ -39,7 +39,7 @@
           "associations": [
             {
               "source_ref": "saved:1",
-              "contact_id": "c1",
+              "contact_id": null,
               "display_values": {
                 "display_name": "Company Alpha"
               },
@@ -97,6 +97,61 @@
               ],
               "uncertainty": [],
               "rationale": "Synthetic source retained for review."
+            }
+          ],
+          "execution_plan": [
+            {
+              "id": "contact",
+              "table": "API_Contact",
+              "action": "create",
+              "fields": {
+                "organizationName": "Example Holdings LLC"
+              },
+              "target_id": null,
+              "duplicate_probe": {
+                "organizationName": "Example Holdings LLC"
+              },
+              "dependencies": [],
+              "holds": []
+            },
+            {
+              "id": "address-detail",
+              "table": "API_ContactDetail",
+              "action": "create",
+              "fields": {
+                "entityType": "Address",
+                "addressStreet1": "123 Example Street",
+                "addressCity": "EXAMPLE CITY",
+                "addressState": "WA",
+                "addressZip": "00000"
+              },
+              "target_id": null,
+              "duplicate_probe": {},
+              "dependencies": [
+                {
+                  "field": "id_contact",
+                  "action_id": "contact"
+                }
+              ],
+              "holds": []
+            },
+            {
+              "id": "property-link",
+              "table": "API_JOIN_propertyContact",
+              "action": "create",
+              "fields": {
+                "id_property": "PRO-00000000-0000-0000-0000-000000000001",
+                "associationType_list": "Property Manager"
+              },
+              "target_id": null,
+              "duplicate_probe": {},
+              "dependencies": [
+                {
+                  "field": "id_contact",
+                  "action_id": "contact"
+                }
+              ],
+              "holds": []
             }
           ]
         }
@@ -115,7 +170,7 @@
           "associations": [
             {
               "source_ref": "saved:1",
-              "contact_id": "c1",
+              "contact_id": null,
               "display_values": {
                 "display_name": "Company Alpha"
               },
@@ -173,6 +228,61 @@
               ],
               "uncertainty": [],
               "rationale": "Synthetic source retained for review."
+            }
+          ],
+          "execution_plan": [
+            {
+              "id": "contact",
+              "table": "API_Contact",
+              "action": "create",
+              "fields": {
+                "organizationName": "Example Holdings LLC"
+              },
+              "target_id": null,
+              "duplicate_probe": {
+                "organizationName": "Example Holdings LLC"
+              },
+              "dependencies": [],
+              "holds": []
+            },
+            {
+              "id": "address-detail",
+              "table": "API_ContactDetail",
+              "action": "create",
+              "fields": {
+                "entityType": "Address",
+                "addressStreet1": "123 Example Street",
+                "addressCity": "EXAMPLE CITY",
+                "addressState": "WA",
+                "addressZip": "00000"
+              },
+              "target_id": null,
+              "duplicate_probe": {},
+              "dependencies": [
+                {
+                  "field": "id_contact",
+                  "action_id": "contact"
+                }
+              ],
+              "holds": []
+            },
+            {
+              "id": "property-link",
+              "table": "API_JOIN_propertyContact",
+              "action": "create",
+              "fields": {
+                "id_property": "PRO-00000000-0000-0000-0000-000000000001",
+                "associationType_list": "Property Manager"
+              },
+              "target_id": null,
+              "duplicate_probe": {},
+              "dependencies": [
+                {
+                  "field": "id_contact",
+                  "action_id": "contact"
+                }
+              ],
+              "holds": []
             }
           ]
         }
