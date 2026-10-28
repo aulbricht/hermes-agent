@@ -25,6 +25,7 @@ from tools.thread_context import propagate_context_to_thread
 
 FIXTURE_BYTES = (Path(__file__).parents[1] / "fixtures/ownership_tool_contract.v1.json").read_bytes()
 CONTRACT = json.loads(FIXTURE_BYTES)
+WIRE_REQUESTS = CONTRACT["requests"] + CONTRACT["execution_case"]["requests"]
 TOKEN = "atown_" + "a" * 32
 OTHER_TOKEN = "atown_" + "b" * 32
 ERROR = {"error": "Ownership operation unavailable"}
@@ -89,7 +90,7 @@ def app_for(adapter):
 
 
 def test_fixture_identity():
-    assert hashlib.sha256(FIXTURE_BYTES).hexdigest() == "ac9b1b5643b1bbf75e823fcae0b43b6e2ad70145343878ae6e05c8acb828b046"
+    assert hashlib.sha256(FIXTURE_BYTES).hexdigest() == "038aafcb8c7d27018b314a8628dc51765aad97f06dbd717ad89e72952837eaae"
 
 
 @pytest.mark.parametrize("quiet", [True, False])
@@ -148,7 +149,7 @@ def test_ownership_authority_restricts_real_configured_tool_assembly(adapter, sc
     assert not tool.ownership_capability_available()
 
 
-@pytest.mark.parametrize("wire_request", CONTRACT["requests"])
+@pytest.mark.parametrize("wire_request", WIRE_REQUESTS)
 def test_valid_fixture_references_reach_fixed_callback_unchanged(wire_request, callback, caplog):
     request = wire_request
     observed, _ = callback
@@ -204,7 +205,17 @@ def test_execution_plan_schema_and_real_dispatch_preserve_agent_choices(operatio
         parameters = next(d["function"]["parameters"] for d in definitions
                           if d["function"]["name"] == "atlas_ownership_proposal")
         args = {"operation": operation, **request["arguments"]}
-        assert tool._matches(args, parameters)
+        # Definitions are provider-sanitized (nullable unions become hints).
+        # Validate raw arguments against the handler's schema, and check the
+        # emitted schema still offers plans/maps and nullable business IDs.
+        assert tool._matches(args, tool._PROPOSAL_TOOL_SCHEMA)
+        emitted = parameters["properties"]["proposal"]["properties"]
+        action_schema = emitted["execution_plan"]["items"]
+        for slot in ("fields", "duplicate_probe"):
+            assert action_schema["properties"][slot]["additionalProperties"]["type"] == "string"
+            assert action_schema["properties"][slot]["properties"] == {}
+        assert emitted["associations"]["items"]["properties"]["contact_id"]["nullable"] is True
+        assert action_schema["properties"]["target_id"]["nullable"] is True
         assert json.loads(handle_function_call("atlas_ownership_proposal", args)) == success(operation)
     finally:
         tool.clear_ownership_capability(bound)
@@ -255,7 +266,7 @@ def test_optional_plan_and_scoped_update_reference_forward_unchanged(operation, 
     ("fields", {str(i): "v" for i in range(101)}),
     ("fields", {"secret": TOKEN}), ("probe", {"secret": TOKEN}),
     ("probe", {"nested": []}), ("dependency", {"field": "owner_id", "action_id": "contact"}),
-    ("dependency", {"field": "id_contact", "action_id": TOKEN}),
+    ("dependency", {"field": "id__contact", "action_id": TOKEN}),
     ("holds", ["unresolved"]),
 ])
 def test_invalid_execution_plan_never_dispatches(location, value, callback):
@@ -532,7 +543,7 @@ def test_delegated_child_has_neither_definitions_nor_callback_authority(requeste
 
 
 STREAM_CASES = [(index, {"status": 200, "body": success(request["operation"])})
-                for index, request in enumerate(CONTRACT["requests"])]
+                for index, request in enumerate(WIRE_REQUESTS)]
 STREAM_CASES += [(1, response) for response in CONTRACT["responses"]]
 
 
@@ -548,7 +559,7 @@ async def test_scripted_provider_through_real_stream_agent_and_dispatch(
     from openai.types.chat import ChatCompletion
     from agent.model_metadata import MINIMUM_CONTEXT_LENGTH
 
-    wire_request = CONTRACT["requests"][request_index]
+    wire_request = WIRE_REQUESTS[request_index]
     observed, response = callback
     response[0] = lambda request: httpx.Response(reply["status"], json=reply["body"])
     provider_calls = []

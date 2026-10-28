@@ -129,7 +129,7 @@
               "duplicate_probe": {},
               "dependencies": [
                 {
-                  "field": "id_contact",
+                  "field": "id__contact",
                   "action_id": "contact"
                 }
               ],
@@ -140,14 +140,14 @@
               "table": "API_JOIN_propertyContact",
               "action": "create",
               "fields": {
-                "id_property": "PRO-00000000-0000-0000-0000-000000000001",
+                "id__property": "PRO-00000000-0000-0000-0000-000000000001",
                 "associationType_list": "Property Manager"
               },
               "target_id": null,
               "duplicate_probe": {},
               "dependencies": [
                 {
-                  "field": "id_contact",
+                  "field": "id__contact",
                   "action_id": "contact"
                 }
               ],
@@ -260,7 +260,7 @@
               "duplicate_probe": {},
               "dependencies": [
                 {
-                  "field": "id_contact",
+                  "field": "id__contact",
                   "action_id": "contact"
                 }
               ],
@@ -271,14 +271,14 @@
               "table": "API_JOIN_propertyContact",
               "action": "create",
               "fields": {
-                "id_property": "PRO-00000000-0000-0000-0000-000000000001",
+                "id__property": "PRO-00000000-0000-0000-0000-000000000001",
                 "associationType_list": "Property Manager"
               },
               "target_id": null,
               "duplicate_probe": {},
               "dependencies": [
                 {
-                  "field": "id_contact",
+                  "field": "id__contact",
                   "action_id": "contact"
                 }
               ],
@@ -337,5 +337,311 @@
         "detail": "Invalid ownership request"
       }
     }
-  ]
+  ],
+  "execution_case": {
+    "source_values": {
+      "name": "EXAMPLE HOLDINGS LLC",
+      "address": {
+        "line1": "123 Example Street",
+        "city": "EXAMPLE CITY",
+        "state": "WA",
+        "postal_code": "00000"
+      },
+      "email": "person@example.com"
+    },
+    "requests": [
+      {
+        "protocol": "acre.ownership-tool.v1",
+        "operation": "propose",
+        "arguments": {
+          "expected_version": 1,
+          "proposal": {
+            "property_id": "PRO-00000000-0000-0000-0000-000000000001",
+            "evidence_hash": "EVIDENCE_HASH",
+            "associations": [
+              {
+                "source_ref": "saved:1",
+                "contact_id": null,
+                "display_values": {
+                  "display_name": "Example Holdings LLC"
+                },
+                "rationale": "Saved evidence supports this association.",
+                "role": "Property Manager"
+              }
+            ],
+            "unresolved_questions": [],
+            "changes": [
+              {
+                "id": "name",
+                "source_ref": "saved:1",
+                "association_index": 0,
+                "kind": "name",
+                "intent": "create",
+                "proposed_value": "Example Holdings LLC",
+                "possible_cleaned_value": null,
+                "depends_on": [],
+                "uncertainty": [],
+                "rationale": "Synthetic source retained for review."
+              },
+              {
+                "id": "email",
+                "source_ref": "saved:1",
+                "association_index": 0,
+                "kind": "email",
+                "intent": "create",
+                "proposed_value": "person@example.com",
+                "possible_cleaned_value": null,
+                "depends_on": [
+                  "name"
+                ],
+                "uncertainty": [],
+                "rationale": "Synthetic source retained for review."
+              },
+              {
+                "id": "address",
+                "source_ref": "saved:1",
+                "association_index": 0,
+                "kind": "address",
+                "intent": "create",
+                "proposed_value": {
+                  "entityType": "Address",
+                  "addressStreet1": "123 Example Street",
+                  "addressCity": "EXAMPLE CITY",
+                  "addressState": "WA",
+                  "addressZip": "00000"
+                },
+                "possible_cleaned_value": null,
+                "depends_on": [
+                  "name",
+                  "email"
+                ],
+                "uncertainty": [],
+                "rationale": "Synthetic source retained for review."
+              }
+            ],
+            "execution_plan": [
+              {
+                "id": "contact",
+                "table": "API_Contact",
+                "action": "create",
+                "fields": {
+                  "organizationName": "Example Holdings LLC"
+                },
+                "target_id": null,
+                "duplicate_probe": {
+                  "organizationName": "Example Holdings LLC"
+                },
+                "dependencies": [],
+                "holds": []
+              },
+              {
+                "id": "address-detail",
+                "table": "API_ContactDetail",
+                "action": "create",
+                "fields": {
+                  "entityType": "Address",
+                  "addressStreet1": "123 Example Street",
+                  "addressCity": "EXAMPLE CITY",
+                  "addressState": "WA",
+                  "addressZip": "00000"
+                },
+                "target_id": null,
+                "duplicate_probe": {},
+                "dependencies": [
+                  {
+                    "field": "id__contact",
+                    "action_id": "contact"
+                  }
+                ],
+                "holds": []
+              },
+              {
+                "id": "email-detail",
+                "table": "API_ContactDetail",
+                "action": "create",
+                "fields": {
+                  "entityType": "Email",
+                  "contactInfo_raw": "person@example.com"
+                },
+                "target_id": null,
+                "duplicate_probe": {},
+                "dependencies": [
+                  {
+                    "field": "id__contact",
+                    "action_id": "contact"
+                  }
+                ],
+                "holds": []
+              },
+              {
+                "id": "property-link",
+                "table": "API_JOIN_propertyContact",
+                "action": "create",
+                "fields": {
+                  "id__property": "PRO-00000000-0000-0000-0000-000000000001",
+                  "associationType_list": "Property Manager"
+                },
+                "target_id": null,
+                "duplicate_probe": {},
+                "dependencies": [
+                  {
+                    "field": "id__contact",
+                    "action_id": "contact"
+                  }
+                ],
+                "holds": []
+              }
+            ]
+          }
+        }
+      },
+      {
+        "protocol": "acre.ownership-tool.v1",
+        "operation": "revise",
+        "arguments": {
+          "expected_version": 2,
+          "base_revision": 1,
+          "correction_text": "Hold naming",
+          "proposal": {
+            "property_id": "PRO-00000000-0000-0000-0000-000000000001",
+            "evidence_hash": "EVIDENCE_HASH",
+            "associations": [
+              {
+                "source_ref": "saved:1",
+                "contact_id": null,
+                "display_values": {
+                  "display_name": "Example Holdings LLC"
+                },
+                "rationale": "Saved evidence supports this association.",
+                "role": "Property Manager"
+              }
+            ],
+            "unresolved_questions": [],
+            "changes": [
+              {
+                "id": "name",
+                "source_ref": "saved:1",
+                "association_index": 0,
+                "kind": "name",
+                "intent": "create",
+                "proposed_value": "Example Holdings LLC",
+                "possible_cleaned_value": null,
+                "depends_on": [],
+                "uncertainty": [],
+                "rationale": "Synthetic source retained for review."
+              },
+              {
+                "id": "email",
+                "source_ref": "saved:1",
+                "association_index": 0,
+                "kind": "email",
+                "intent": "create",
+                "proposed_value": "person@example.com",
+                "possible_cleaned_value": null,
+                "depends_on": [
+                  "name"
+                ],
+                "uncertainty": [],
+                "rationale": "Synthetic source retained for review."
+              },
+              {
+                "id": "address",
+                "source_ref": "saved:1",
+                "association_index": 0,
+                "kind": "address",
+                "intent": "create",
+                "proposed_value": {
+                  "entityType": "Address",
+                  "addressStreet1": "123 Example Street",
+                  "addressCity": "EXAMPLE CITY",
+                  "addressState": "WA",
+                  "addressZip": "00000"
+                },
+                "possible_cleaned_value": null,
+                "depends_on": [
+                  "name",
+                  "email"
+                ],
+                "uncertainty": [],
+                "rationale": "Synthetic source retained for review."
+              }
+            ],
+            "execution_plan": [
+              {
+                "id": "contact",
+                "table": "API_Contact",
+                "action": "create",
+                "fields": {
+                  "organizationName": "Example Holdings LLC"
+                },
+                "target_id": null,
+                "duplicate_probe": {
+                  "organizationName": "Example Holdings LLC"
+                },
+                "dependencies": [],
+                "holds": []
+              },
+              {
+                "id": "address-detail",
+                "table": "API_ContactDetail",
+                "action": "create",
+                "fields": {
+                  "entityType": "Address",
+                  "addressStreet1": "123 Example Street",
+                  "addressCity": "EXAMPLE CITY",
+                  "addressState": "WA",
+                  "addressZip": "00000"
+                },
+                "target_id": null,
+                "duplicate_probe": {},
+                "dependencies": [
+                  {
+                    "field": "id__contact",
+                    "action_id": "contact"
+                  }
+                ],
+                "holds": []
+              },
+              {
+                "id": "email-detail",
+                "table": "API_ContactDetail",
+                "action": "create",
+                "fields": {
+                  "entityType": "Email",
+                  "contactInfo_raw": "person@example.com"
+                },
+                "target_id": null,
+                "duplicate_probe": {},
+                "dependencies": [
+                  {
+                    "field": "id__contact",
+                    "action_id": "contact"
+                  }
+                ],
+                "holds": []
+              },
+              {
+                "id": "property-link",
+                "table": "API_JOIN_propertyContact",
+                "action": "create",
+                "fields": {
+                  "id__property": "PRO-00000000-0000-0000-0000-000000000001",
+                  "associationType_list": "Property Manager"
+                },
+                "target_id": null,
+                "duplicate_probe": {},
+                "dependencies": [
+                  {
+                    "field": "id__contact",
+                    "action_id": "contact"
+                  }
+                ],
+                "holds": []
+              }
+            ]
+          }
+        }
+      }
+    ]
+  }
 }
