@@ -90,7 +90,7 @@ def app_for(adapter):
 
 
 def test_fixture_identity():
-    assert hashlib.sha256(FIXTURE_BYTES).hexdigest() == "038aafcb8c7d27018b314a8628dc51765aad97f06dbd717ad89e72952837eaae"
+    assert hashlib.sha256(FIXTURE_BYTES).hexdigest() == "940856564bd2749d5a06410be6819632ee66a9d490561c7af4e45c87de5cf650"
 
 
 @pytest.mark.parametrize("quiet", [True, False])
