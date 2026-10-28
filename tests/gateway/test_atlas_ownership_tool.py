@@ -26,7 +26,7 @@ from tools.thread_context import propagate_context_to_thread
 FIXTURE_BYTES = (Path(__file__).parents[1] / "fixtures/ownership_tool_contract.v1.json").read_bytes()
 CONTRACT = json.loads(FIXTURE_BYTES)
 WIRE_REQUESTS = (CONTRACT["requests"] + CONTRACT["execution_case"]["requests"]
-                 + CONTRACT["transformation_case"]["requests"])
+                 + CONTRACT["transformation_case"]["requests"] + CONTRACT["generic_case"]["requests"])
 TOKEN = "atown_" + "a" * 32
 OTHER_TOKEN = "atown_" + "b" * 32
 ERROR = {"error": "Ownership operation unavailable"}
@@ -91,7 +91,7 @@ def app_for(adapter):
 
 
 def test_fixture_identity():
-    assert hashlib.sha256(FIXTURE_BYTES).hexdigest() == "65aca088e87fb5dd258ed9ea3767dad8ee1a221ffeb084ec4cae725408ac7533"
+    assert hashlib.sha256(FIXTURE_BYTES).hexdigest() == "df58c7504823e871f2be2bab50f8fa7244155e70bbe2a22d2869f99ad5da858f"
 
 
 @pytest.mark.parametrize("quiet", [True, False])
@@ -701,8 +701,161 @@ def test_transformation_count_and_envelope_byte_caps(callback):
     assert not callback[0]
 
 
+@pytest.mark.parametrize("operation", ["propose", "revise"])
+def test_generic_real_definitions_and_dispatch_preserve_raw_and_held_candidate(operation, callback):
+    from model_tools import get_tool_definitions, handle_function_call
+
+    case = CONTRACT["generic_case"]
+    request = copy.deepcopy(case["requests"][0 if operation == "propose" else 1])
+    proposal = request["arguments"]["proposal"]
+    phone, uncertain = proposal["changes"][-2:]
+    assert phone["proposed_value"] == case["source_values"]["generic"]["phone"]
+    assert uncertain["proposed_value"] is None and uncertain["uncertainty"]
+    assert case["source_values"]["generic"]["phone_uncertain"].endswith("ext ?")
+    bound = tool.bind_ownership_capability(TOKEN)
+    try:
+        definitions = get_tool_definitions(enabled_toolsets=["atlas_ownership"], quiet_mode=True)
+        schema = next(d["function"]["parameters"] for d in definitions
+                      if d["function"]["name"] == "atlas_ownership_proposal")
+        variants = schema["properties"]["proposal"]["properties"]["changes"]["items"]["anyOf"]
+        generic = next(v for v in variants if v["properties"]["kind"]["enum"] == ["generic"])
+        legacy = next(v for v in variants if "name" in v["properties"]["kind"]["enum"])
+        assert generic["additionalProperties"] is False
+        assert set(generic["required"]) == set(phone)
+        assert "source_path" not in legacy["properties"]
+        assert json.loads(handle_function_call("atlas_ownership_proposal", {
+            "operation": operation, **request["arguments"]})) == success(operation)
+    finally:
+        tool.clear_ownership_capability(bound)
+    assert json.loads(callback[0][0].content) == request
+    assert not tool.ownership_capability_available()
+
+
+def invalid_generic_request(location, value):
+    request = copy.deepcopy(CONTRACT["generic_case"]["requests"][0])
+    proposal = request["arguments"]["proposal"]
+    item = proposal["changes"][-2]
+    if location == "extra":
+        item[value] = "untrusted"
+    elif location == "missing":
+        del item[value]
+    elif location == "legacy_path":
+        proposal["changes"][0]["source_path"] = value
+    elif location == "selector_path":
+        proposal["transformations"][0]["source_inputs"][0]["path"] = value
+    elif location == "selector_source":
+        proposal["transformations"][0]["source_inputs"][0]["source_ref"] = value
+    elif location == "transform_depends_on":
+        proposal["transformations"][0]["depends_on"] = value
+    elif location == "duplicate_target":
+        proposal["changes"][-1]["source_path"] = item["source_path"]
+    else:
+        item[location] = value
+    return request
+
+
+INVALID_GENERIC = [
+    ("extra", key) for key in ("work_id", "session_id", "turn_id", "principal", "user_id",
+                              "owner_id", "token", "callback_url", "database", "source_input", "value")
+] + [
+    ("missing", "source_path"), ("missing", "proposed_value"),
+    ("missing", "possible_cleaned_value"), ("missing", "rationale"),
+    ("source_ref", "foreign"), ("association_index", True), ("association_index", 1),
+    ("id", "name"), ("duplicate_target", None),
+    ("kind", "phone"), ("kind", "name"), ("kind", "email"), ("kind", "address"),
+    ("legacy_path", "/generic/phone"),
+    ("possible_cleaned_value", "2025550100"),
+    ("proposed_value", ""), ("proposed_value", "   "), ("proposed_value", "x" * 2001),
+    ("proposed_value", TOKEN), ("proposed_value", {"value": "untrusted"}),
+    ("proposed_value", "phone\u202e"), ("proposed_value", "phone\u200b"),
+    ("depends_on", ["missing"]), ("depends_on", ["phone"]),
+    ("depends_on", ["uncertain-phone"]), ("depends_on", ["name", "name"]),
+    ("depends_on", ["name"] * 101),
+    ("uncertainty", ["x"] * 11), ("uncertainty", ["x" * 2001]),
+    ("rationale", "x" * 2001),
+    ("selector_path", "/generic/phone_uncertain"), ("selector_source", "foreign"),
+    ("transform_depends_on", ["name"]), ("transform_depends_on", ["uncertain-phone"]),
+] + [("source_path", path) for path in (
+    "", "/generic/", "generic/phone", "/phone", "/email", "/name", "/address/line1",
+    "/generic/bad~2", "/generic/bad~", "/generic/" + "x" * 232, TOKEN,
+)]
+
+
+@pytest.mark.parametrize("location,value", INVALID_GENERIC)
+def test_generic_invalid_shape_and_local_references_refuse_before_callback(location, value, callback):
+    from model_tools import handle_function_call
+
+    request = invalid_generic_request(location, value)
+    bound = tool.bind_ownership_capability(TOKEN)
+    try:
+        assert json.loads(handle_function_call("atlas_ownership_proposal", {
+            "operation": "propose", **request["arguments"]})) == ERROR
+    finally:
+        tool.clear_ownership_capability(bound)
+    assert not callback[0]
+
+
+@pytest.mark.parametrize("path", ["/generic/a~1b/c~0d", "/generic/" + "x" * 231])
+def test_generic_pointer_escaping_and_bound_forward_without_local_resolution(path, callback):
+    request = copy.deepcopy(CONTRACT["generic_case"]["requests"][0])
+    proposal = request["arguments"]["proposal"]
+    proposal["changes"][-2]["source_path"] = path
+    for item in proposal["transformations"]:
+        item["source_inputs"][0]["path"] = path
+    bound = tool.bind_ownership_capability(TOKEN)
+    try:
+        assert json.loads(invoke(request)) == success("propose")
+    finally:
+        tool.clear_ownership_capability(bound)
+    # Only Atlas can establish whether a syntactically valid path exists.
+    assert json.loads(callback[0][0].content) == request
+
+
+def test_generic_dependencies_cannot_rebind_to_other_source_or_association(callback):
+    request = copy.deepcopy(CONTRACT["generic_case"]["requests"][0])
+    proposal = request["arguments"]["proposal"]
+    bound = tool.bind_ownership_capability(TOKEN)
+    try:
+        for key, value in [("source_ref", "foreign"), ("association_index", 1)]:
+            prior = proposal["changes"][0]
+            original = prior[key]
+            prior[key] = value
+            assert json.loads(invoke(request)) == ERROR
+            prior[key] = original
+    finally:
+        tool.clear_ownership_capability(bound)
+    assert not callback[0]
+
+
+def test_generic_count_unicode_and_enclosing_byte_limits(callback):
+    request = copy.deepcopy(CONTRACT["generic_case"]["requests"][0])
+    proposal = request["arguments"]["proposal"]
+    original = proposal["changes"][-2]
+    proposal["changes"] = proposal["changes"][:3]
+    proposal.pop("transformations")
+    for i in range(97):
+        item = {**original, "id": f"generic{i}", "source_path": f"/generic/{i}"}
+        proposal["changes"].append(item)
+    bound = tool.bind_ownership_capability(TOKEN)
+    try:
+        assert json.loads(invoke(request)) == success("propose")
+        proposal["changes"].append({**original, "id": "overflow", "source_path": "/generic/overflow"})
+        assert json.loads(invoke(request)) == ERROR
+        proposal["changes"].pop()
+        for item in proposal["changes"][3:]:
+            item["proposed_value"] = "😀" * 2000
+        assert tool._matches({"operation": "propose", **request["arguments"]}, tool._PROPOSAL_TOOL_SCHEMA)
+        assert json.loads(invoke(request)) == ERROR
+    finally:
+        tool.clear_ownership_capability(bound)
+    assert len(callback[0]) == 1
+
+
 STREAM_CASES = [(index, {"status": 200, "body": success(request["operation"])})
                 for index, request in enumerate(WIRE_REQUESTS)]
+STREAM_CASES += [(invalid_generic_request(location, value), {"local_refusal": True})
+                 for location, value in [("extra", "owner_id"), ("source_path", "/email"),
+                                         ("transform_depends_on", ["name"])]]
 STREAM_CASES += [(1, response) for response in CONTRACT["responses"]]
 STREAM_CASES += [(invalid_transformation_request(location, value), {"local_refusal": True})
                  for location, value in [("extra", "target_id"), ("field", "id__contact"),

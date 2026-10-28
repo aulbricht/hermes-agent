@@ -47,7 +47,7 @@ _ADDRESS_SCHEMA = _object({
     **{key: _text(240) for key in (
         "addressStreet1", "addressStreet2", "addressCity", "addressState", "addressZip")},
 }, ["entityType"])
-_CHANGE_SCHEMA = _object({
+_LEGACY_CHANGE_SCHEMA = _object({
     "id": _text(160),
     "source_ref": _text(160),
     "association_index": {"type": "integer", "minimum": 0},
@@ -59,6 +59,17 @@ _CHANGE_SCHEMA = _object({
     "uncertainty": _array(_text(), 10),
     "rationale": _text(),
 })
+# Generic values remain selectors into Atlas-owned immutable observations.
+# The separate namespace cannot reclassify typed name/email/address evidence.
+_GENERIC_CHANGE_SCHEMA = _object({
+    **_LEGACY_CHANGE_SCHEMA["properties"],
+    "kind": {"type": "string", "enum": ["generic"]},
+    "source_path": {**_text(240), "pattern": r"/generic/(?:[^~]|~[01])+"},
+    "proposed_value": {"anyOf": [_text(2000), {"type": "null"}]},
+    "possible_cleaned_value": {"type": "null"},
+    "depends_on": {**_array(_text(160), 100), "uniqueItems": True},
+})
+_CHANGE_SCHEMA = {"anyOf": [_LEGACY_CHANGE_SCHEMA, _GENERIC_CHANGE_SCHEMA]}
 # Only these two slots accept model-proposed field names. They are business
 # data, never trusted scope; Atlas checks source values, target scope and Approval.
 _AUTHORITY_KEYS = frozenset({
@@ -198,6 +209,34 @@ def _transformation_value_safe(value):
                    or 0xE0100 <= ord(char) <= 0xE01EF for char in value)
 
 
+def _generic_changes_valid(proposal):
+    """Validate local references; only Atlas can resolve original source text."""
+    changes = proposal.get("changes", [])
+    if not any(change["kind"] == "generic" for change in changes):
+        return True
+    seen, targets = {}, set()
+    for change in changes:
+        if change["id"] in seen:
+            return False
+        if change["kind"] == "generic":
+            index = change["association_index"]
+            target = (index, change["source_path"])
+            if (index >= len(proposal["associations"])
+                    or proposal["associations"][index]["source_ref"] != change["source_ref"]
+                    or target in targets
+                    or (change["proposed_value"] is not None
+                        and not _transformation_value_safe(change["proposed_value"]))):
+                return False
+            for dependency in change["depends_on"]:
+                prior = seen.get(dependency)
+                if (prior is None or prior["source_ref"] != change["source_ref"]
+                        or prior["association_index"] != index):
+                    return False
+            targets.add(target)
+        seen[change["id"]] = change
+    return True
+
+
 def _transformations_valid(proposal):
     """Check local proposal relationships without interpreting source meaning.
 
@@ -233,6 +272,13 @@ def _transformations_valid(proposal):
             if (change is None or change["source_ref"] != item["source_ref"]
                     or change["association_index"] != index):
                 return False
+        for selector in item["source_inputs"]:
+            if selector["path"].startswith("/generic/"):
+                if (selector["source_ref"] != item["source_ref"]
+                        or not any(changes[dep]["kind"] == "generic"
+                                   and changes[dep]["source_path"] == selector["path"]
+                                   for dep in item["depends_on"])):
+                    return False
         seen_ids.add(item["id"])
         seen_targets.add(target)
     return True
@@ -295,6 +341,7 @@ def _handle_atlas_ownership(args: dict, **_kwargs) -> str:
 
 def _handle_atlas_ownership_proposal(args: dict, **_kwargs) -> str:
     if (not _matches(args, _PROPOSAL_TOOL_SCHEMA)
+            or not _generic_changes_valid(args["proposal"])
             or not _transformations_valid(args["proposal"])):
         return _UNAVAILABLE
     keys = {"operation", "expected_version", "proposal"}
@@ -313,7 +360,7 @@ registry.register(
 )
 registry.register(
     name="atlas_ownership_proposal", toolset="atlas_ownership",
-    schema={"name": "atlas_ownership_proposal", "description": "Submit a held ownership proposal or immutable correction revision. Revise requires base_revision and correction_text; propose omits them. Optional execution_plan proposes exact actions, field values, duplicate probes and earlier-action dependencies for separate review. Optional transformations retain source selectors, exact action/table/field/value, rationale and guidance/catalog revisions for review; they are model proposals, never observed evidence. Business references must match bound evidence; Atlas validates scope. Never approves or executes.",
+    schema={"name": "atlas_ownership_proposal", "description": "Submit a held ownership proposal or immutable correction revision. Revise requires base_revision and correction_text; propose omits them. Optional execution_plan proposes exact actions, field values, duplicate probes and earlier-action dependencies for separate review. Generic changes select original text through source_path within immutable observation.values.generic; proposed_value must equal the original or be null (held), possible_cleaned_value is null. Atlas resolves and verifies evidence. Every writable generic use requires an exact field-bound transformation with a matching source_path dependency. Optional transformations retain source selectors, exact action/table/field/value, rationale and guidance/catalog revisions for review; they are model proposals, never observed evidence. Business references must match bound evidence; Atlas validates scope. Never approves or executes.",
             "parameters": _PROPOSAL_TOOL_SCHEMA},
     handler=_handle_atlas_ownership_proposal, max_result_size_chars=_MAX_RESPONSE_BYTES,
 )
