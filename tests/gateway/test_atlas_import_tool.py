@@ -174,7 +174,7 @@ def test_proposal_tool_exposes_required_typed_payload_to_the_model():
     assert {frozenset(shape["properties"]) for shape in read["properties"]["arguments"]["anyOf"]} == {
         frozenset({"offset", "limit"}), frozenset({"logical_ids"}),
         frozenset({"property_query", "property_id", "tenant_names"})}
-    assert proposal["required"] == ["operation", "property_id", "proposal"]
+    assert proposal["required"] == ["operation", "property_id"]  # the handler still requires proposal for propose/revise
     assert proposal["properties"]["proposal"]["required"] == ["rows", "unmapped", "warnings"]
     assert proposal["properties"]["proposal"]["properties"]["rows"]["items"]["properties"]["fields"]["items"]["required"] == [
         "field", "value", "source_value", "source_evidence", "transformation"]
@@ -198,3 +198,27 @@ def test_import_tool_rejects_oversized_callback_response():
                     "error": "Import response exceeds limit"}
     finally:
         tool.clear_import_capability(bound)
+
+
+def test_change_set_is_forwarded_through_the_same_callback_and_capability():
+    seen = []
+    client = httpx.Client(transport=httpx.MockTransport(
+        lambda request: (seen.append(json.loads(request.content)), httpx.Response(200, json={"accepted": True}))[1]),
+        follow_redirects=False)
+    bound = tool.bind_import_capability("atimp_" + "f" * 32)
+    try:
+        with patch.object(tool.httpx, "Client", return_value=client):
+            result = json.loads(tool._handle_atlas_import_proposal({
+                "operation": "change_set", "property_id": "", "change_set": [{"id": "a"}]}))
+    finally:
+        tool.clear_import_capability(bound)
+    assert result == {"accepted": True}
+    assert seen == [{"operation": "change_set", "arguments": {"property_id": "", "change_set": [{"id": "a"}]}}]
+
+
+def test_change_set_and_propose_refuse_the_wrong_payload_before_callback():
+    for args in ({"operation": "change_set", "property_id": ""},
+                 {"operation": "change_set", "property_id": "", "change_set": {}},
+                 {"operation": "change_set", "property_id": "", "change_set": [], "proposal": {}},
+                 {"operation": "propose", "property_id": "PRO-" + "a" * 36}):
+        assert "error" in json.loads(tool._handle_atlas_import_proposal(args))

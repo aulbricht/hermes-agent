@@ -16,7 +16,7 @@ _READ_ARGUMENT_KEYS = {
     "catalog": {"logical_ids"},
     "lookup": {"property_query", "property_id", "tenant_names"},
 }
-_PROPOSAL_OPERATIONS = {"propose", "revise"}
+_PROPOSAL_OPERATIONS = {"propose", "revise", "change_set"}
 _MAX_REQUEST_BYTES = 128 * 1024
 _MAX_RESPONSE_BYTES = 32_768
 
@@ -186,6 +186,12 @@ def _handle_atlas_import(args: dict, **_kwargs) -> str:
 
 
 def _handle_atlas_import_proposal(args: dict, **_kwargs) -> str:
+    if isinstance(args, dict) and args.get("operation") == "change_set":
+        # Same callback and capability as propose/revise; Atlas validates the set.
+        if (not isinstance(args.get("property_id"), str) or not isinstance(args.get("change_set"), list)
+                or set(args) - {"operation", "property_id", "change_set"}):
+            return json.dumps({"error": "Invalid import proposal"})
+        return _forward_operation("change_set", {"property_id": args["property_id"], "change_set": args["change_set"]})
     if (not isinstance(args, dict) or args.get("operation") not in _PROPOSAL_OPERATIONS
             or not isinstance(args.get("property_id"), str)
             or not isinstance(args.get("proposal"), dict)
@@ -229,8 +235,10 @@ registry.register(
                 "property_id": {"type": "string", "description": "Exact verified PRO-... Property ID returned by atlas_import lookup."},
                 "proposal": _PROPOSAL_SCHEMA,
                 "expected_plan_hash": {"type": "string", "description": "Exact current plan hash; required for revise."},
+                "change_set": {"type": "array", "description": "operation=change_set only: ordered actions, each with id, table, action (create|update), target_id (null for create), citation, fields ({name: {value}}) and dependencies ([{field, action_id}]). property_id is empty for a new Property.",
+                               "items": {"type": "object"}},
             },
-            "required": ["operation", "property_id", "proposal"],
+            "required": ["operation", "property_id"],
             "additionalProperties": False,
         },
     },
