@@ -1634,12 +1634,10 @@ class APIServerAdapter(BasePlatformAdapter):
             gateway_session_key=gateway_session_key,
         )
         if ownership_luna:
-            # Atlas's retained profile says 100000, not Luna's actual window:
-            # https://developers.openai.com/api/docs/models/gpt-6-luna
-            # (1,050,000 tokens, checked 2026-10-31). Correct this instance via
-            # the existing context-engine interface; normal deploys preserve
-            # config.yaml, and changing the legacy installer would not reach it.
-            agent._config_context_length = 1050000
+            # Luna input price doubles above 272K tokens (`accounting.py` rates).
+            # Apply this ownership budget via the existing context engine;
+            # normal deploys preserve config.yaml rather than rerun the installer.
+            agent._config_context_length = 272000
             agent.context_compressor.update_model(
                 model=model, context_length=agent._config_context_length,
                 base_url=agent.base_url, api_key=agent.api_key,

@@ -152,8 +152,12 @@ class TestApiServerAdapterToolset:
             ownership = adapter._create_agent(atlas_ownership_authorized=True)
             compressor = ownership.context_compressor
             assert compressor.context_length == ownership._config_context_length
-            assert compressor.threshold_tokens == int((compressor.context_length - ownership.max_tokens) * 0.5)
-            # A heavy evidence turn must fit without an extra summarizing call.
+            # Keep every input below Luna's long-context price step, even when
+            # compaction is deferred; reserve the unchanged output allowance.
+            input_budget = compressor.context_length - ownership.max_tokens
+            assert 100000 < compressor.threshold_tokens < input_budget <= 272000
+            assert compressor.threshold_tokens == int(input_budget * 0.75)
+            # Synthetic heavy evidence case, not a measured live turn.
             compressor.last_prompt_tokens = 100000
             assert not compressor.should_compress()
             compressor.last_prompt_tokens = compressor.threshold_tokens
