@@ -1480,6 +1480,7 @@ class APIServerAdapter(BasePlatformAdapter):
         toolset_scope: Optional[List[str]] = None,
         atlas_import_authorized: bool = False,
         atlas_ownership_authorized: bool = False,
+        atlas_query_authorized: bool = False,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -1583,7 +1584,7 @@ class APIServerAdapter(BasePlatformAdapter):
             )
 
         user_config = _load_gateway_config()
-        enabled_toolsets = sorted(set(_get_platform_tools(user_config, "api_server")) - {"atlas_import", "atlas_ownership"})
+        enabled_toolsets = sorted(set(_get_platform_tools(user_config, "api_server")) - {"atlas_import", "atlas_ownership", "atlas_query"})
         if toolset_scope is not None:
             # Request scope can only remove configured tools. Keep it local to
             # this agent instance; the API server's default remains unchanged.
@@ -1595,10 +1596,16 @@ class APIServerAdapter(BasePlatformAdapter):
             # data. Enforce its boundary here even if caller scope is absent
             # or broad; configured outbound/persistent tools must not survive.
             enabled_toolsets = ["atlas_ownership"]
+        if atlas_query_authorized:
+            # Query turns see only the Atlas query tool, whatever scope was sent.
+            enabled_toolsets = ["atlas_query"]
 
         max_iterations = _current_max_iterations()
         if route and not session_override and route.get("max_iterations"):
             max_iterations = min(max_iterations, int(route["max_iterations"]))
+        if atlas_query_authorized:
+            # Atlas allows three model turns per Query operation.
+            max_iterations = min(max_iterations, 3)
 
         # Load fallback provider chain so the API server platform has the
         # same fallback behaviour as Telegram/Discord/Slack (fixes #4954).
@@ -2229,6 +2236,13 @@ class APIServerAdapter(BasePlatformAdapter):
                 or (atlas_import_capability is not None and atlas_ownership_capability is not None)):
             return web.json_response(_openai_error(
                 "Invalid ownership capability", code="invalid_ownership_capability"), status=400)
+        atlas_query_capability = body.get("atlas_query_capability")
+        if (atlas_query_capability is not None and (
+                not isinstance(atlas_query_capability, str) or not re.fullmatch(
+                    r"atqry_[A-Za-z0-9_-]{32,128}", atlas_query_capability)
+                or atlas_import_capability is not None or atlas_ownership_capability is not None)):
+            return web.json_response(_openai_error(
+                "Invalid query capability", code="invalid_query_capability"), status=400)
         if toolset_scope is not None:
             if (not isinstance(toolset_scope, list) or len(toolset_scope) > 32
                     or any(not isinstance(name, str) or not name or len(name) > 80
@@ -2239,7 +2253,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     code="invalid_toolset_scope"), status=400)
             from gateway.run import _load_gateway_config
             from hermes_cli.tools_config import _get_platform_tools
-            configured = set(_get_platform_tools(_load_gateway_config(), "api_server")) - {"atlas_import", "atlas_ownership"}
+            configured = set(_get_platform_tools(_load_gateway_config(), "api_server")) - {"atlas_import", "atlas_ownership", "atlas_query"}
             if not set(toolset_scope).issubset(configured):
                 return web.json_response(_openai_error(
                     "toolset_scope cannot enable unconfigured toolsets",
@@ -2317,6 +2331,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     toolset_scope=toolset_scope,
                     atlas_import_capability=atlas_import_capability,
                     atlas_ownership_capability=atlas_ownership_capability,
+                    atlas_query_capability=atlas_query_capability,
                 )
                 final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
                 effective_session_id = result.get("session_id", session_id) if isinstance(result, dict) else session_id
@@ -4413,6 +4428,7 @@ class APIServerAdapter(BasePlatformAdapter):
         toolset_scope: Optional[List[str]] = None,
         atlas_import_capability: Optional[str] = None,
         atlas_ownership_capability: Optional[str] = None,
+        atlas_query_capability: Optional[str] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -4443,6 +4459,8 @@ class APIServerAdapter(BasePlatformAdapter):
             from tools.atlas_ownership_tool import bind_ownership_capability, clear_ownership_capability
             import_token = bind_import_capability(atlas_import_capability or "")
             ownership_token = bind_ownership_capability(atlas_ownership_capability or "")
+            from tools.atlas_query_tool import bind_query_capability, clear_query_capability
+            query_token = bind_query_capability(atlas_query_capability or "")
             try:
                 agent = self._create_agent(
                     ephemeral_system_prompt=ephemeral_system_prompt,
@@ -4456,6 +4474,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     toolset_scope=toolset_scope,
                     atlas_import_authorized=bool(atlas_import_capability),
                     atlas_ownership_authorized=bool(atlas_ownership_capability),
+                    atlas_query_authorized=bool(atlas_query_capability),
                 )
                 if provider_user_hash:
                     overrides = dict(getattr(agent, "request_overrides", {}) or {})
@@ -4501,6 +4520,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     result["session_id"] = _eff_sid
                 return result, usage
             finally:
+                clear_query_capability(query_token)
                 clear_ownership_capability(ownership_token)
                 clear_import_capability(import_token)
                 clear_session_vars(tokens)
