@@ -52,6 +52,7 @@ DELEGATE_BLOCKED_TOOLS = frozenset(
         "cronjob",  # no scheduling more work in the parent's name
         "atlas_ownership",  # ownership authority is never delegated
         "atlas_ownership_proposal",
+        "atlas_query",  # query authority is never delegated
     ]
 )
 
