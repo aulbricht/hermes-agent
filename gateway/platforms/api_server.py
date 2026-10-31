@@ -104,11 +104,13 @@ DEFAULT_PORT = 8642
 MAX_STORED_RESPONSES = 100
 # Atlas Query turns: Allen's ruling (2026-10-31) allows four model turns per question
 # within Atlas's $0.25 cap. Each turn asks for at most 4,096 output tokens (reasoning
-# included); a truncation retry may raise one request to the loop's 32,768-token ceiling,
-# and every retry uses up one of the four turns. Worst case at the Luna price of $0.50 per
-# million output tokens (Atlas sol_budget.MODEL_PRICES): 4 x 32,768 x $0.50 / 1,000,000 =
-# $0.065536 of output. That leaves $0.184464 for input: at $0.10 per million input tokens,
-# about 1.8 million tokens over four turns, far beyond one turn's context. Atlas still
+# included). A truncation retry may raise one request to the loop's 32,768-token ceiling and
+# does NOT use up a turn: it repeats inside the same turn, at most four extra provider calls
+# per run, so a run can make up to eight calls. Atlas sees them in the receipt and settles the
+# run as limit_exceeded. Worst case at the Luna price of $0.50 per million output tokens
+# (Atlas sol_budget.MODEL_PRICES): 8 x 32,768 x $0.50 / 1,000,000 = $0.131072 of output. That
+# leaves $0.118928 for input: at $0.10 per million input tokens, about 1.2 million tokens over
+# eight calls, far beyond one turn's context. Atlas still
 # checks the receipt afterwards.
 ATLAS_QUERY_MAX_TURNS = 4
 ATLAS_QUERY_TURN_MAX_OUTPUT_TOKENS = 4096
