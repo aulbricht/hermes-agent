@@ -187,7 +187,8 @@ def test_atlas_query_turn_limit_is_four_calls_and_no_summary_call(agent, monkeyp
     assert len(sent) == 4  # exactly four provider calls, no fifth
     agent.client.chat.completions.create.assert_not_called()  # the summary call is never made
     agent._handle_max_iterations.assert_not_called()
-    assert result["final_response"] is None
+    # The reply is the fixed local notice, not a model-written summary.
+    assert "maximum tool-iteration limit" in result["final_response"]
     assert result["turn_exit_reason"] == "max_iterations_reached(4/4)"
     # The per-turn output cap reaches every request.
     assert all(4096 in [kw.get(k) for k in ("max_tokens", "max_completion_tokens", "max_output_tokens")] for kw in sent)
