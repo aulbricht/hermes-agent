@@ -30,6 +30,7 @@ from typing import Any, Dict, List, Optional
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.conversation_compression import conversation_history_after_compression
 from agent.display import KawaiiSpinner
+from agent.errors import ProviderRequestLimitReached
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.iteration_budget import IterationBudget
 from agent.turn_context import build_turn_context
@@ -633,6 +634,7 @@ def run_conversation(
 
     # Main conversation loop counters (pure locals consumed by the loop below).
     api_call_count = 0
+    agent._provider_requests_made = 0
     final_response = None
     interrupted = False
     failed = False
@@ -1366,6 +1368,15 @@ def run_conversation(
                 # Each provider request appends one usage row; clear the prior
                 # per-call admission metadata before this attempt.
                 agent._atlas_sol_last_call = None
+                # Hard bound at dispatch: retries, continuations and truncation
+                # re-asks all pass here, so no request leaves past the limit.
+                _request_limit = getattr(agent, "max_provider_requests", None)
+                if _request_limit is not None:
+                    if agent._provider_requests_made >= _request_limit:
+                        raise ProviderRequestLimitReached(
+                            f"{agent._provider_requests_made}/{_request_limit}"
+                        )
+                    agent._provider_requests_made += 1
                 response = run_llm_execution_middleware(
                     api_kwargs,
                     lambda next_api_kwargs: admitted_call(agent, next_api_kwargs, _perform_api_call),
@@ -2488,6 +2499,24 @@ def run_conversation(
                         pass
                 agent._touch_activity(f"API call #{api_call_count} completed")
                 break  # Success, exit retry loop
+
+            except ProviderRequestLimitReached as limit_error:
+                if thinking_spinner:
+                    thinking_spinner.stop("")
+                    thinking_spinner = None
+                agent._persist_session(messages, conversation_history)
+                return {
+                    "final_response": (
+                        "I stopped because the provider request limit for this "
+                        "question was reached before an answer was ready."
+                    ),
+                    "messages": messages,
+                    "api_calls": api_call_count,
+                    "completed": False,
+                    "partial": True,
+                    "turn_exit_reason": f"provider_request_limit_reached({limit_error})",
+                    "error": f"provider_request_limit_reached: {limit_error}",
+                }
 
             except InterruptedError:
                 if thinking_spinner:

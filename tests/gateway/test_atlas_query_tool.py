@@ -172,11 +172,13 @@ def test_create_agent_scopes_query_turns_to_the_query_tool_four_iterations_and_a
         assert agent.call_args.kwargs["max_iterations"] == 90
         assert agent.call_args.kwargs["max_tokens"] is None
         assert agent.return_value.no_iteration_summary is not True
+        assert agent.return_value.max_provider_requests != 4
         adapter._create_agent(atlas_query_authorized=True, toolset_scope=["web", "terminal"])
         assert agent.call_args.kwargs["enabled_toolsets"] == ["atlas_query"]
         assert agent.call_args.kwargs["max_iterations"] == 4
         assert agent.call_args.kwargs["max_tokens"] == 4096
         assert agent.return_value.no_iteration_summary is True
+        assert agent.return_value.max_provider_requests == 4
 
 
 @pytest.mark.asyncio
