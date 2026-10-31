@@ -79,7 +79,7 @@ def finalize_turn(
         _turn_exit_reason = f"max_iterations_reached({api_call_count}/{agent.max_iterations})"
         iteration_limit_fallback = True
         preserved_verification_fallback = True
-    elif final_response is None and budget_fallback_eligible and agent.no_iteration_summary is True:
+    elif final_response is None and budget_fallback_eligible and getattr(agent, "no_iteration_summary", False) is True:
         # Atlas Query turns end here with no answer rather than make another model
         # call, so their model-turn limit stays a hard bound.
         _turn_exit_reason = f"max_iterations_reached({api_call_count}/{agent.max_iterations})"

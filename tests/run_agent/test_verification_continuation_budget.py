@@ -146,19 +146,31 @@ def test_later_verified_response_supersedes_pending_report(agent, monkeypatch):
     agent._handle_max_iterations.assert_not_called()
 
 
+def _tool_call_response(n):
+    call = SimpleNamespace(
+        id=f"call_{n}",
+        type="function",
+        function=SimpleNamespace(name="web_search", arguments=f'{{"q": "lease {n}"}}'),
+    )
+    message = SimpleNamespace(content="", tool_calls=[call])
+    return SimpleNamespace(
+        choices=[SimpleNamespace(message=message, finish_reason="tool_calls")],
+        model="test/model",
+        usage=None,
+    )
+
+
 def test_atlas_query_turn_limit_is_four_calls_and_no_summary_call(agent, monkeypatch):
     agent.max_iterations = 4
     agent.iteration_budget.max_total = 4
     agent.max_tokens = 4096
     agent.no_iteration_summary = True
-    agent.valid_tool_names = ["web_search"]
-    agent._intent_ack_continuation = True
-    agent._looks_like_codex_intermediate_ack = MagicMock(return_value=True)
+    agent.valid_tool_names = {"web_search"}
     sent = []
 
     def model_call(api_kwargs):
         sent.append(api_kwargs)
-        return _response("I'll inspect the files now")
+        return _tool_call_response(len(sent))
 
     agent._interruptible_api_call = model_call
     agent.client.chat.completions.create = MagicMock()
@@ -166,10 +178,11 @@ def test_atlas_query_turn_limit_is_four_calls_and_no_summary_call(agent, monkeyp
     monkeypatch.setenv("HERMES_VERIFY_ON_STOP", "0")
 
     with (
+        patch("run_agent.handle_function_call", return_value="rows"),
         patch("hermes_cli.plugins.has_hook", return_value=False),
         patch("hermes_cli.plugins.invoke_hook", return_value=[]),
     ):
-        result = agent.run_conversation("inspect /tmp/project")
+        result = agent.run_conversation("which leases end next month?")
 
     assert len(sent) == 4  # exactly four provider calls, no fifth
     agent.client.chat.completions.create.assert_not_called()  # the summary call is never made

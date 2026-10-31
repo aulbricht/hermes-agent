@@ -1641,7 +1641,8 @@ class APIServerAdapter(BasePlatformAdapter):
             gateway_session_key=gateway_session_key,
         )
         # A Query turn that uses its last model turn ends without a summary call.
-        agent.no_iteration_summary = atlas_query_authorized
+        if atlas_query_authorized:
+            agent.no_iteration_summary = True
         return agent
 
     # ------------------------------------------------------------------
