@@ -41,6 +41,9 @@ def _routed_model(model: str, transport: str) -> str:
 def _pin_openrouter_provider(payload: dict[str, Any]) -> dict[str, Any]:
     """Pin OpenRouter Responses requests to OpenAI, with no provider fallback."""
     routed = dict(payload)
+    # The pinned OpenAI endpoint omits this routing parameter from its
+    # supported set, so require_parameters would reject tool-bearing requests.
+    routed.pop("parallel_tool_calls", None)
     extra = routed.get("extra_body")
     extra = dict(extra) if isinstance(extra, dict) else {}
     extra["provider"] = {
