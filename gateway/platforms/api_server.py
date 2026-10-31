@@ -102,6 +102,16 @@ def _hermes_version() -> str:
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8642
 MAX_STORED_RESPONSES = 100
+# Atlas Query turns: Allen's ruling (2026-10-31) allows four model turns per question
+# within Atlas's $0.25 cap. Each turn asks for at most 4,096 output tokens (reasoning
+# included); a truncation retry may raise one request to the loop's 32,768-token ceiling,
+# and every retry uses up one of the four turns. Worst case at the Luna price of $0.50 per
+# million output tokens (Atlas sol_budget.MODEL_PRICES): 4 x 32,768 x $0.50 / 1,000,000 =
+# $0.065536 of output. That leaves $0.184464 for input: at $0.10 per million input tokens,
+# about 1.8 million tokens over four turns, far beyond one turn's context. Atlas still
+# checks the receipt afterwards.
+ATLAS_QUERY_MAX_TURNS = 4
+ATLAS_QUERY_TURN_MAX_OUTPUT_TOKENS = 4096
 MAX_REQUEST_BYTES = 10_000_000  # 10 MB — accommodates long agent conversations with tool calls
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
@@ -1604,8 +1614,7 @@ class APIServerAdapter(BasePlatformAdapter):
         if route and not session_override and route.get("max_iterations"):
             max_iterations = min(max_iterations, int(route["max_iterations"]))
         if atlas_query_authorized:
-            # Atlas allows three model turns per Query operation.
-            max_iterations = min(max_iterations, 3)
+            max_iterations = min(max_iterations, ATLAS_QUERY_MAX_TURNS)
 
         # Load fallback provider chain so the API server platform has the
         # same fallback behaviour as Telegram/Discord/Slack (fixes #4954).
@@ -1615,6 +1624,7 @@ class APIServerAdapter(BasePlatformAdapter):
             model=model,
             **runtime_kwargs,
             max_iterations=max_iterations,
+            max_tokens=ATLAS_QUERY_TURN_MAX_OUTPUT_TOKENS if atlas_query_authorized else None,
             quiet_mode=True,
             verbose_logging=False,
             ephemeral_system_prompt=ephemeral_system_prompt or None,
@@ -1630,6 +1640,8 @@ class APIServerAdapter(BasePlatformAdapter):
             reasoning_config=reasoning_config,
             gateway_session_key=gateway_session_key,
         )
+        # A Query turn that uses its last model turn ends without a summary call.
+        agent.no_iteration_summary = atlas_query_authorized
         return agent
 
     # ------------------------------------------------------------------

@@ -144,3 +144,37 @@ def test_later_verified_response_supersedes_pending_report(agent, monkeypatch):
     assert result["turn_exit_reason"] == "text_response(finish_reason=stop)"
     assert result["completed"] is True
     agent._handle_max_iterations.assert_not_called()
+
+
+def test_atlas_query_turn_limit_is_four_calls_and_no_summary_call(agent, monkeypatch):
+    agent.max_iterations = 4
+    agent.iteration_budget.max_total = 4
+    agent.max_tokens = 4096
+    agent.no_iteration_summary = True
+    agent.valid_tool_names = ["web_search"]
+    agent._intent_ack_continuation = True
+    agent._looks_like_codex_intermediate_ack = MagicMock(return_value=True)
+    sent = []
+
+    def model_call(api_kwargs):
+        sent.append(api_kwargs)
+        return _response("I'll inspect the files now")
+
+    agent._interruptible_api_call = model_call
+    agent.client.chat.completions.create = MagicMock()
+    agent._handle_max_iterations = MagicMock(wraps=agent._handle_max_iterations)
+    monkeypatch.setenv("HERMES_VERIFY_ON_STOP", "0")
+
+    with (
+        patch("hermes_cli.plugins.has_hook", return_value=False),
+        patch("hermes_cli.plugins.invoke_hook", return_value=[]),
+    ):
+        result = agent.run_conversation("inspect /tmp/project")
+
+    assert len(sent) == 4  # exactly four provider calls, no fifth
+    agent.client.chat.completions.create.assert_not_called()  # the summary call is never made
+    agent._handle_max_iterations.assert_not_called()
+    assert result["final_response"] is None
+    assert result["turn_exit_reason"] == "max_iterations_reached(4/4)"
+    # The per-turn output cap reaches every request.
+    assert all(4096 in [kw.get(k) for k in ("max_tokens", "max_completion_tokens", "max_output_tokens")] for kw in sent)
