@@ -259,20 +259,6 @@ def test_preflight_codex_input_items_drops_short_id_for_github_responses():
     assert items[0]["content"] == [{"type": "output_text", "text": "pong"}]
 
 
-def test_preflight_codex_api_kwargs_preserves_user_request_override():
-    request_overrides = {"user": "atlas-" + "a" * 48}
-    kwargs = {
-        "model": "openai/gpt-6-luna",
-        "instructions": "You are Hermes.",
-        "input": [{"role": "user", "content": "ping"}],
-        **request_overrides,
-    }
-
-    normalized = _preflight_codex_api_kwargs(kwargs)
-
-    assert normalized["user"] == request_overrides["user"]
-
-
 def test_preflight_codex_api_kwargs_drops_oversized_message_id_end_to_end():
     kwargs = _preflight_codex_api_kwargs(
         {

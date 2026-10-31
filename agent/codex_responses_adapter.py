@@ -913,7 +913,7 @@ def _preflight_codex_api_kwargs(
         "model", "instructions", "input", "tools", "store",
         "reasoning", "include", "max_output_tokens", "temperature",
         "tool_choice", "parallel_tool_calls", "prompt_cache_key", "service_tier",
-        "extra_headers", "extra_body", "timeout", "user",
+        "extra_headers", "extra_body", "timeout",
     }
     normalized: Dict[str, Any] = {
         "model": model,
@@ -950,8 +950,8 @@ def _preflight_codex_api_kwargs(
     if isinstance(temperature, (int, float)):
         normalized["temperature"] = float(temperature)
 
-    # Pass through tool_choice, parallel_tool_calls, prompt_cache_key, user
-    for passthrough_key in ("tool_choice", "parallel_tool_calls", "prompt_cache_key", "user"):
+    # Pass through tool_choice, parallel_tool_calls, prompt_cache_key
+    for passthrough_key in ("tool_choice", "parallel_tool_calls", "prompt_cache_key"):
         val = api_kwargs.get(passthrough_key)
         if val is not None:
             normalized[passthrough_key] = val
