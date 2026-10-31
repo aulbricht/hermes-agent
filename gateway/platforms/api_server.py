@@ -4457,10 +4457,6 @@ class APIServerAdapter(BasePlatformAdapter):
                     atlas_import_authorized=bool(atlas_import_capability),
                     atlas_ownership_authorized=bool(atlas_ownership_capability),
                 )
-                if provider_user_hash:
-                    overrides = dict(getattr(agent, "request_overrides", {}) or {})
-                    overrides["user"] = provider_user_hash
-                    agent.request_overrides = overrides
                 if atlas_route_request_id:
                     agent._atlas_route_request_id = atlas_route_request_id
                 if agent_ref is not None:

@@ -913,7 +913,7 @@ def _preflight_codex_api_kwargs(
         "model", "instructions", "input", "tools", "store",
         "reasoning", "include", "max_output_tokens", "temperature",
         "tool_choice", "parallel_tool_calls", "prompt_cache_key", "service_tier",
-        "extra_headers", "extra_body", "timeout", "user",
+        "extra_headers", "extra_body", "timeout",
     }
     normalized: Dict[str, Any] = {
         "model": model,
