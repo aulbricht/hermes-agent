@@ -1590,12 +1590,14 @@ class APIServerAdapter(BasePlatformAdapter):
             enabled_toolsets = sorted(set(enabled_toolsets).intersection(toolset_scope))
         if atlas_import_authorized:
             enabled_toolsets.append("atlas_import")
+        ownership_luna = (atlas_ownership_authorized and model == "openai/gpt-6-luna"
+                          and runtime_kwargs.get("provider") == "openrouter")
         if atlas_ownership_authorized:
             # Ownership evidence is untrusted input and may contain personal
             # data. Enforce its boundary here even if caller scope is absent
             # or broad; configured outbound/persistent tools must not survive.
             enabled_toolsets = ["atlas_ownership"]
-            if model == "openai/gpt-6-luna" and runtime_kwargs.get("provider") == "openrouter":
+            if ownership_luna:
                 # Ownership must emit a proposal after reasoning: the shared
                 # 8192/xhigh profile exhausted its budget before the save call.
                 # Size for the existing 128 KiB proposal envelope (~32768 tokens
@@ -1631,6 +1633,19 @@ class APIServerAdapter(BasePlatformAdapter):
             reasoning_config=reasoning_config,
             gateway_session_key=gateway_session_key,
         )
+        if ownership_luna:
+            # Atlas's retained profile says 100000, not Luna's actual window:
+            # https://developers.openai.com/api/docs/models/gpt-6-luna
+            # (1,050,000 tokens, checked 2026-10-31). Correct this instance via
+            # the existing context-engine interface; normal deploys preserve
+            # config.yaml, and changing the legacy installer would not reach it.
+            agent._config_context_length = 1050000
+            agent.context_compressor.update_model(
+                model=model, context_length=agent._config_context_length,
+                base_url=agent.base_url, api_key=agent.api_key,
+                provider=agent.provider, api_mode=agent.api_mode,
+                max_tokens=agent.max_tokens,
+            )
         return agent
 
     # ------------------------------------------------------------------

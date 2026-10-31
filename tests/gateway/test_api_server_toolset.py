@@ -122,12 +122,25 @@ class TestApiServerAdapterToolset:
         from types import SimpleNamespace
 
         from agent.chat_completion_helpers import build_api_kwargs
+        from agent.context_compressor import ContextCompressor
         from agent.transports.codex import ResponsesApiTransport
         from gateway.config import PlatformConfig
         from gateway.platforms.api_server import APIServerAdapter
 
         adapter = APIServerAdapter(PlatformConfig())
         transport = ResponsesApiTransport()
+
+        def construct(**settings):
+            settings.setdefault("max_tokens", 8192)
+            # Real compressor with the retained Atlas profile's old window.
+            # No provider discovery or paid call is needed for an explicit window.
+            compressor = ContextCompressor(
+                model=settings["model"], config_context_length=100000,
+                max_tokens=settings["max_tokens"], quiet_mode=True,
+                base_url=settings["base_url"], provider=settings["provider"],
+            )
+            return SimpleNamespace(**settings, context_compressor=compressor)
+
         with patch("gateway.run._resolve_runtime_agent_kwargs", side_effect=lambda: {
                  "api_key": "test-key", "base_url": "https://openrouter.ai/api/v1",
                  "provider": "openrouter", "api_mode": "codex_responses"}), \
@@ -135,8 +148,16 @@ class TestApiServerAdapterToolset:
              patch("gateway.run._load_gateway_config", return_value={}), \
              patch("gateway.run.GatewayRunner._load_reasoning_config", return_value={"enabled": True, "effort": "xhigh"}), \
              patch("hermes_cli.tools_config._get_platform_tools", return_value={"web"}), \
-             patch("run_agent.AIAgent") as constructor:
-            adapter._create_agent(atlas_ownership_authorized=True)
+             patch("run_agent.AIAgent", side_effect=construct) as constructor:
+            ownership = adapter._create_agent(atlas_ownership_authorized=True)
+            compressor = ownership.context_compressor
+            assert compressor.context_length == ownership._config_context_length
+            assert compressor.threshold_tokens == int((compressor.context_length - ownership.max_tokens) * 0.5)
+            # A heavy evidence turn must fit without an extra summarizing call.
+            compressor.last_prompt_tokens = 100000
+            assert not compressor.should_compress()
+            compressor.last_prompt_tokens = compressor.threshold_tokens
+            assert compressor.should_compress()
             settings = constructor.call_args.kwargs
             assert settings["enabled_toolsets"] == ["atlas_ownership"]
             agent = SimpleNamespace(
@@ -153,19 +174,40 @@ class TestApiServerAdapterToolset:
             assert payload["max_output_tokens"] == 65536
             assert payload["reasoning"]["effort"] == "medium"
 
+            # The nightly caller selects the atlas-luna route, whose xhigh
+            # effort must not undo the authenticated ownership policy.
+            with patch("gateway.run._resolve_runtime_agent_kwargs_for_provider", return_value={
+                "api_key": "test-key", "base_url": "https://openrouter.ai/api/v1",
+                "provider": "openrouter", "api_mode": "codex_responses",
+            }):
+                routed = adapter._create_agent(atlas_ownership_authorized=True, route={
+                    "model": "openai/gpt-6-luna", "provider": "openrouter", "reasoning_effort": "xhigh",
+                })
+            assert routed.context_compressor.threshold_tokens == compressor.threshold_tokens
+            assert routed.reasoning_config["effort"] == "medium"
+
             # The authenticated ownership selector is required; neither an
             # ordinary turn nor the existing import path inherits the budget.
             for selectors in ({}, {"atlas_import_authorized": True}):
-                adapter._create_agent(**selectors)
+                ordinary = adapter._create_agent(**selectors)
                 settings = constructor.call_args.kwargs
                 assert "max_tokens" not in settings
                 assert settings["reasoning_config"]["effort"] == "xhigh"
+                assert ordinary.context_compressor.context_length == 100000
 
             # Another selected model keeps its own output/reasoning policy.
             with patch("gateway.run._resolve_gateway_model", return_value="openai/gpt-6.1-sol"):
                 adapter._create_agent(atlas_ownership_authorized=True)
                 assert "max_tokens" not in constructor.call_args.kwargs
                 assert constructor.call_args.kwargs["reasoning_config"]["effort"] == "xhigh"
+
+            with patch("gateway.run._resolve_runtime_agent_kwargs", return_value={
+                "api_key": "test-key", "base_url": "https://api.openai.com/v1",
+                "provider": "openai", "api_mode": "codex_responses",
+            }):
+                other_provider = adapter._create_agent(atlas_ownership_authorized=True)
+            assert other_provider.max_tokens == 8192
+            assert other_provider.context_compressor.context_length == 100000
 
     @patch("gateway.platforms.api_server.AIOHTTP_AVAILABLE", True)
     def test_create_agent_turn_scope_only_narrows_configured_tools(self):

@@ -3625,8 +3625,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return True
         import time as _time
         now = _time.monotonic()
-        last = self._telegram_lobby_reminder_ts.get(chat_id, 0.0)
-        if now - last < self._TELEGRAM_LOBBY_REMINDER_COOLDOWN_S:
+        last = self._telegram_lobby_reminder_ts.get(chat_id)
+        # No prior reminder is distinct from one sent at monotonic time zero.
+        # Otherwise a freshly booted host suppresses its first lobby reply.
+        if last is not None and now - last < self._TELEGRAM_LOBBY_REMINDER_COOLDOWN_S:
             return False
         self._telegram_lobby_reminder_ts[chat_id] = now
         return True
