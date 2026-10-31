@@ -162,8 +162,11 @@ def _make_runner(session_db=None):
 
 
 @pytest.mark.asyncio
-async def test_root_telegram_dm_prompt_is_system_lobby_when_topic_mode_enabled(monkeypatch):
+@pytest.mark.parametrize("uptime", [0.0, 10.0, 120.0])
+async def test_root_telegram_dm_prompt_is_system_lobby_when_topic_mode_enabled(monkeypatch, uptime):
     import gateway.run as gateway_run
+
+    monkeypatch.setattr("time.monotonic", lambda: uptime)
 
     runner = _make_runner()
     runner._telegram_topic_mode_enabled = lambda source: True
@@ -1074,11 +1077,15 @@ def test_general_topic_is_treated_as_root_lobby(tmp_path):
     assert runner._is_telegram_topic_lane(real_topic) is True
 
 
-def test_lobby_reminder_is_debounced_per_chat(tmp_path):
+@pytest.mark.parametrize("uptime", [0.0, 10.0, 120.0])
+def test_lobby_reminder_is_debounced_per_chat(tmp_path, monkeypatch, uptime):
     """Consecutive root-DM prompts should only surface one lobby reminder per cooldown."""
     db = SessionDB(db_path=tmp_path / "state.db")
     db.enable_telegram_topic_mode(chat_id="208214988", user_id="208214988")
     runner = _make_runner(session_db=db)
+
+    clock = [uptime]
+    monkeypatch.setattr("time.monotonic", lambda: clock[0])
 
     source = _make_source(thread_id=None)
     assert runner._should_send_telegram_lobby_reminder(source) is True
@@ -1092,6 +1099,8 @@ def test_lobby_reminder_is_debounced_per_chat(tmp_path):
     from dataclasses import replace
     other = replace(other, chat_id="999999999")
     assert runner._should_send_telegram_lobby_reminder(other) is True
+    clock[0] += runner._TELEGRAM_LOBBY_REMINDER_COOLDOWN_S
+    assert runner._should_send_telegram_lobby_reminder(source) is True
 
 
 def test_binding_survives_session_deletion_via_cascade(tmp_path):

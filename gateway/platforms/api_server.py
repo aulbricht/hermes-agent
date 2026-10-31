@@ -1590,11 +1590,21 @@ class APIServerAdapter(BasePlatformAdapter):
             enabled_toolsets = sorted(set(enabled_toolsets).intersection(toolset_scope))
         if atlas_import_authorized:
             enabled_toolsets.append("atlas_import")
+        ownership_luna = (atlas_ownership_authorized and model == "openai/gpt-6-luna"
+                          and runtime_kwargs.get("provider") == "openrouter")
         if atlas_ownership_authorized:
             # Ownership evidence is untrusted input and may contain personal
             # data. Enforce its boundary here even if caller scope is absent
             # or broad; configured outbound/persistent tools must not survive.
             enabled_toolsets = ["atlas_ownership"]
+            if ownership_luna:
+                # Ownership must emit a proposal after reasoning: the shared
+                # 8192/xhigh profile exhausted its budget before the save call.
+                # Size for the existing 128 KiB proposal envelope (~32768 tokens
+                # at 4 bytes/token), plus 32768 reasoning tokens. This is sizing
+                # headroom, not a tokenizer bound or a separate reasoning quota.
+                runtime_kwargs["max_tokens"] = 65536
+                reasoning_config = {"enabled": True, "effort": "medium"}
 
         max_iterations = _current_max_iterations()
         if route and not session_override and route.get("max_iterations"):
@@ -1623,6 +1633,17 @@ class APIServerAdapter(BasePlatformAdapter):
             reasoning_config=reasoning_config,
             gateway_session_key=gateway_session_key,
         )
+        if ownership_luna:
+            # Luna input price doubles above 272K tokens (`accounting.py` rates).
+            # Apply this ownership budget via the existing context engine;
+            # normal deploys preserve config.yaml rather than rerun the installer.
+            agent._config_context_length = 272000
+            agent.context_compressor.update_model(
+                model=model, context_length=agent._config_context_length,
+                base_url=agent.base_url, api_key=agent.api_key,
+                provider=agent.provider, api_mode=agent.api_mode,
+                max_tokens=agent.max_tokens,
+            )
         return agent
 
     # ------------------------------------------------------------------
