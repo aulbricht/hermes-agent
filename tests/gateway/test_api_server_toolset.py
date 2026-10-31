@@ -118,6 +118,56 @@ class TestApiServerPlatformConfig:
 
 class TestApiServerAdapterToolset:
     @patch("gateway.platforms.api_server.AIOHTTP_AVAILABLE", True)
+    def test_ownership_luna_budget_reaches_responses_request(self):
+        from types import SimpleNamespace
+
+        from agent.chat_completion_helpers import build_api_kwargs
+        from agent.transports.codex import ResponsesApiTransport
+        from gateway.config import PlatformConfig
+        from gateway.platforms.api_server import APIServerAdapter
+
+        adapter = APIServerAdapter(PlatformConfig())
+        transport = ResponsesApiTransport()
+        with patch("gateway.run._resolve_runtime_agent_kwargs", side_effect=lambda: {
+                 "api_key": "test-key", "base_url": "https://openrouter.ai/api/v1",
+                 "provider": "openrouter", "api_mode": "codex_responses"}), \
+             patch("gateway.run._resolve_gateway_model", return_value="openai/gpt-6-luna"), \
+             patch("gateway.run._load_gateway_config", return_value={}), \
+             patch("gateway.run.GatewayRunner._load_reasoning_config", return_value={"enabled": True, "effort": "xhigh"}), \
+             patch("hermes_cli.tools_config._get_platform_tools", return_value={"web"}), \
+             patch("run_agent.AIAgent") as constructor:
+            adapter._create_agent(atlas_ownership_authorized=True)
+            settings = constructor.call_args.kwargs
+            assert settings["enabled_toolsets"] == ["atlas_ownership"]
+            agent = SimpleNamespace(
+                **settings,
+                tools=[], request_overrides={},
+                _base_url_hostname="openrouter.ai", _base_url_lower="https://openrouter.ai/api/v1",
+                _get_transport=lambda: transport,
+                _prepare_messages_for_non_vision_model=lambda messages: messages,
+                _resolved_api_call_timeout=lambda: 600,
+            )
+            payload = transport.preflight_kwargs(build_api_kwargs(
+                agent, [{"role": "user", "content": "Save the ownership proposal."}]
+            ))
+            assert payload["max_output_tokens"] == 65536
+            assert payload["reasoning"]["effort"] == "medium"
+
+            # The authenticated ownership selector is required; neither an
+            # ordinary turn nor the existing import path inherits the budget.
+            for selectors in ({}, {"atlas_import_authorized": True}):
+                adapter._create_agent(**selectors)
+                settings = constructor.call_args.kwargs
+                assert "max_tokens" not in settings
+                assert settings["reasoning_config"]["effort"] == "xhigh"
+
+            # Another selected model keeps its own output/reasoning policy.
+            with patch("gateway.run._resolve_gateway_model", return_value="openai/gpt-6.1-sol"):
+                adapter._create_agent(atlas_ownership_authorized=True)
+                assert "max_tokens" not in constructor.call_args.kwargs
+                assert constructor.call_args.kwargs["reasoning_config"]["effort"] == "xhigh"
+
+    @patch("gateway.platforms.api_server.AIOHTTP_AVAILABLE", True)
     def test_create_agent_turn_scope_only_narrows_configured_tools(self):
         from gateway.platforms.api_server import APIServerAdapter
         from gateway.config import PlatformConfig

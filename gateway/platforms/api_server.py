@@ -1595,6 +1595,14 @@ class APIServerAdapter(BasePlatformAdapter):
             # data. Enforce its boundary here even if caller scope is absent
             # or broad; configured outbound/persistent tools must not survive.
             enabled_toolsets = ["atlas_ownership"]
+            if model == "openai/gpt-6-luna" and runtime_kwargs.get("provider") == "openrouter":
+                # Ownership must emit a proposal after reasoning: the shared
+                # 8192/xhigh profile exhausted its budget before the save call.
+                # Size for the existing 128 KiB proposal envelope (~32768 tokens
+                # at 4 bytes/token), plus 32768 reasoning tokens. This is sizing
+                # headroom, not a tokenizer bound or a separate reasoning quota.
+                runtime_kwargs["max_tokens"] = 65536
+                reasoning_config = {"enabled": True, "effort": "medium"}
 
         max_iterations = _current_max_iterations()
         if route and not session_override and route.get("max_iterations"):
