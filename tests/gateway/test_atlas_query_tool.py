@@ -165,7 +165,7 @@ def test_create_agent_scopes_query_turns_to_the_query_tool_and_three_iterations(
          patch("gateway.run._load_gateway_config", return_value={}), \
          patch("hermes_cli.tools_config._get_platform_tools",
                return_value={"web", "terminal", "atlas_import", "atlas_ownership", "atlas_query"}), \
-         patch("gateway.platforms.api_server._current_max_iterations", return_value=90), \
+         patch("gateway.run._current_max_iterations", return_value=90), \
          patch("run_agent.AIAgent") as agent:
         adapter._create_agent()
         assert sorted(agent.call_args.kwargs["enabled_toolsets"]) == ["terminal", "web"]
