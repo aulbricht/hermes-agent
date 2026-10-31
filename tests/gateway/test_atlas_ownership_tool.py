@@ -372,6 +372,40 @@ def test_fixed_error_for_bounded_failures(mode, callback, caplog):
     assert TOKEN not in result + caplog.text
 
 
+@pytest.mark.parametrize("operation,size,accepted", [
+    ("catalog", 48387, True),
+    ("catalog", 65536, True),
+    ("catalog", 65537, False),
+    ("evidence", 32768, True),
+    ("evidence", 32769, False),
+])
+def test_catalog_headroom_and_other_operation_bounds(operation, size, accepted, callback):
+    observed, response = callback
+    body = {**success(operation), "result": {"synthetic": ""}}
+    overhead = len(json.dumps(body, separators=(",", ":")).encode())
+    body["result"]["synthetic"] = "x" * (size - overhead)
+    raw = json.dumps(body, separators=(",", ":")).encode()
+    assert len(raw) == size
+
+    class Chunks(httpx.SyncByteStream):
+        def __iter__(self):
+            for start in range(0, len(raw), 4096):
+                yield raw[start:start + 4096]
+
+    response[0] = lambda request: httpx.Response(200, stream=Chunks(),
+                                               headers={"Content-Type": "application/json"})
+    bound = tool.bind_ownership_capability(TOKEN)
+    try:
+        result = tool._handle_atlas_ownership({"operation": operation, "arguments": {}})
+    finally:
+        tool.clear_ownership_capability(bound)
+    assert json.loads(result) == (body if accepted else ERROR)
+    if accepted:
+        # The agent must receive the whole accepted response, without truncation.
+        assert len(result) <= tool.registry.get_max_result_size("atlas_ownership")
+    assert len(observed) == 1
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("order", [(TOKEN, None, TOKEN), (None, TOKEN, None)])
 async def test_reused_executor_binds_resets_and_denies_effective_authority(adapter, callback, order):

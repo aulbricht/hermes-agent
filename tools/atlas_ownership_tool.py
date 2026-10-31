@@ -19,6 +19,9 @@ _CALLBACK = "http://127.0.0.1:8243/api/v1/internal/ownership-tool"
 _PROTOCOL = "acre.ownership-tool.v1"
 _MAX_REQUEST_BYTES = 131072
 _MAX_RESPONSE_BYTES = 32768
+# Atlas's real catalog envelope is ~48 KB. Match its existing 64 KB ceiling
+# with headroom; 32 KB was a generic transport bound, not a catalog constraint.
+_MAX_CATALOG_RESPONSE_BYTES = 65536
 _UNAVAILABLE = '{"error":"Ownership operation unavailable"}'
 _ERROR_CODES = frozenset({
     "OWNERSHIP_OPERATION_INVALID", "OWNERSHIP_TURN_REQUIRED", "OWNERSHIP_UNAVAILABLE",
@@ -302,6 +305,7 @@ def _forward_operation(operation, arguments):
     token = _capability.get()
     if not token:
         return _UNAVAILABLE
+    response_limit = _MAX_CATALOG_RESPONSE_BYTES if operation == "catalog" else _MAX_RESPONSE_BYTES
     try:
         encoded = json.dumps({"protocol": _PROTOCOL, "operation": operation, "arguments": arguments},
                              ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode("utf-8")
@@ -318,7 +322,7 @@ def _forward_operation(operation, arguments):
                 chunks, size = [], 0
                 for chunk in response.iter_bytes():
                     size += len(chunk)
-                    if size > _MAX_RESPONSE_BYTES:
+                    if size > response_limit:
                         return _UNAVAILABLE
                     chunks.append(chunk)
         raw = b"".join(chunks).decode("utf-8")
@@ -356,7 +360,7 @@ registry.register(
     name="atlas_ownership", toolset="atlas_ownership",
     schema={"name": "atlas_ownership", "description": "Read evidence or catalog guidance for the current authorized ownership work. Catalog takes empty arguments. No Approval or execution authority.",
             "parameters": _READ_SCHEMA},
-    handler=_handle_atlas_ownership, max_result_size_chars=_MAX_RESPONSE_BYTES,
+    handler=_handle_atlas_ownership, max_result_size_chars=_MAX_CATALOG_RESPONSE_BYTES,
 )
 registry.register(
     name="atlas_ownership_proposal", toolset="atlas_ownership",
