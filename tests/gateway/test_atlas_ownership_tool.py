@@ -49,11 +49,25 @@ def invoke(request):
 
 
 def assert_proposal_refusal(result):
-    # Rejection/zero-dispatch assertions stay intact; schema errors now identify
-    # a fixed field path, while semantic/transport failures remain opaque.
+    # Local refusals identify fixed paths/rules; transport failures stay opaque.
+    # Zero-dispatch assertions at every caller remain required.
     assert set(result) == {"error"}
-    assert result == ERROR or re.fullmatch(
+    schema_error = re.fullmatch(
         r"arguments(?:\.[a-z_]+(?:\[\])?)*: not accepted", result["error"])
+    path, _, rule = result["error"].partition(": ")
+    relationship_error = re.fullmatch(
+        r"(?:changes|transformations|execution_plan)\[(?:[0-9]+)?\]\.[a-z_]+", path
+    ) and rule in {
+        "must be unique", "out of range", "must match association",
+        "duplicate association target", "contains disallowed characters",
+        "must reference earlier change with same source_ref and association_index",
+        "duplicate action/table/field target", "key field not accepted",
+        "unknown execution_plan action", "must match execution_plan action",
+        "must equal execution_plan action field",
+        "must reference change with same source_ref and association_index",
+        "generic selector must match source_ref and source_path of dependency",
+    }
+    assert result == ERROR or schema_error or relationship_error
     assert TOKEN not in result["error"]
 
 
@@ -913,7 +927,8 @@ def test_generic_dependencies_cannot_rebind_to_other_source_or_association(callb
             prior = proposal["changes"][0]
             original = prior[key]
             prior[key] = value
-            assert json.loads(invoke(request)) == ERROR
+            assert json.loads(invoke(request)) == {"error":
+                "changes[3].depends_on: must reference earlier change with same source_ref and association_index"}
             prior[key] = original
     finally:
         tool.clear_ownership_capability(bound)
@@ -1076,3 +1091,106 @@ def test_invalid_rule_envelopes_remain_unavailable(error, callback):
         assert json.loads(invoke(CONTRACT['requests'][0])) == ERROR
     finally:
         tool.clear_ownership_capability(bound)
+
+
+@pytest.mark.parametrize("operation", ["propose", "revise"])
+@pytest.mark.parametrize("location,value,reason", [
+    ("id", "name", "changes[3].id: must be unique"),
+    ("association_index", 1, "changes[3].association_index: out of range"),
+    ("source_ref", "private-source", "changes[3].source_ref: must match association"),
+    ("duplicate_target", None, "changes[4].source_path: duplicate association target"),
+    ("proposed_value", "private-value\u200b", "changes[3].proposed_value: contains disallowed characters"),
+    ("depends_on", ["private-id"], "changes[3].depends_on: must reference earlier change with same source_ref and association_index"),
+    ("depends_on", ["uncertain-phone"], "changes[3].depends_on: must reference earlier change with same source_ref and association_index"),
+    ("selector_path", "/generic/private-path", "transformations[0].source_inputs: generic selector must match source_ref and source_path of dependency"),
+    ("selector_source", "private-source", "transformations[0].source_inputs: generic selector must match source_ref and source_path of dependency"),
+])
+def test_generic_rule_reasons_are_value_free_and_retryable(operation, location, value, reason, callback, caplog):
+    from model_tools import handle_function_call
+
+    request = invalid_generic_request(location, value)
+    if operation == "revise":
+        request["arguments"].update(base_revision=1, correction_text="Synthetic correction")
+    args = {"operation": operation, **request["arguments"]}
+    assert tool._matches(args, tool._PROPOSAL_TOOL_SCHEMA)
+    bound = tool.bind_ownership_capability(TOKEN)
+    try:
+        assert json.loads(handle_function_call("atlas_ownership_proposal", args)) == {"error": reason}
+        assert not callback[0]
+        args["proposal"] = copy.deepcopy(CONTRACT["generic_case"]["requests"][0]["arguments"]["proposal"])
+        assert json.loads(handle_function_call("atlas_ownership_proposal", args)) == success(operation)
+    finally:
+        tool.clear_ownership_capability(bound)
+    assert len(callback[0]) == 1
+    assert json.loads(callback[0][0].content) == {
+        "protocol": CONTRACT["protocol"], "operation": operation,
+        "arguments": {key: value for key, value in args.items() if key != "operation"}}
+    assert "private-" not in caplog.text and TOKEN not in caplog.text
+
+
+@pytest.mark.parametrize("operation", ["propose", "revise"])
+@pytest.mark.parametrize("mutation,reason", [
+    ("duplicate_action", "execution_plan[].id: must be unique"),
+    ("duplicate_change", "changes[].id: must be unique"),
+    ("duplicate_id", "transformations[1].id: must be unique"),
+    ("duplicate_target", "transformations[1].field: duplicate action/table/field target"),
+    ("unsafe_value", "transformations[0].proposed_value: contains disallowed characters"),
+    ("association_index", "transformations[0].association_index: out of range"),
+    ("source_ref", "transformations[0].source_ref: must match association"),
+    ("action_id", "transformations[0].action_id: unknown execution_plan action"),
+    ("table", "transformations[0].table: must match execution_plan action"),
+    ("value", "transformations[0].proposed_value: must equal execution_plan action field"),
+    ("field", "transformations[0].proposed_value: must equal execution_plan action field"),
+    ("dependency_unknown", "transformations[0].depends_on: must reference change with same source_ref and association_index"),
+    ("dependency_source", "transformations[0].depends_on: must reference change with same source_ref and association_index"),
+    ("dependency_association", "transformations[0].depends_on: must reference change with same source_ref and association_index"),
+])
+def test_transformation_rule_reasons_are_value_free_and_retryable(operation, mutation, reason, callback, caplog):
+    from model_tools import handle_function_call
+
+    request = copy.deepcopy(CONTRACT["transformation_case"]["requests"][0 if operation == "propose" else 1])
+    args = {"operation": operation, **request["arguments"]}
+    original = copy.deepcopy(args["proposal"])
+    proposal = args["proposal"]
+    item = proposal["transformations"][0]
+    if mutation in {"duplicate_action", "duplicate_change"}:
+        entries = proposal["execution_plan" if mutation == "duplicate_action" else "changes"]
+        entries.append(copy.deepcopy(entries[0]))
+    elif mutation in {"duplicate_id", "duplicate_target"}:
+        duplicate = copy.deepcopy(item)
+        if mutation == "duplicate_target":
+            duplicate["id"] = "private-id"
+        proposal["transformations"].insert(1, duplicate)
+    elif mutation.startswith("dependency_"):
+        if mutation == "dependency_unknown":
+            item["depends_on"] = ["private-id"]
+        else:
+            proposal["changes"][0]["source_ref" if mutation == "dependency_source" else "association_index"] = (
+                "private-source" if mutation == "dependency_source" else 1)
+    elif mutation == "unsafe_value":
+        item["proposed_value"] = "private-value\u200b"
+        proposal["execution_plan"][0]["fields"][item["field"]] = item["proposed_value"]
+    else:
+        item[{"value": "proposed_value"}.get(mutation, mutation)] = {
+            "association_index": 1, "source_ref": "private-source", "action_id": "private-action",
+            "table": "API_ContactDetail", "value": "private-value", "field": "privateField",
+        }[mutation]
+    assert tool._matches(args, tool._PROPOSAL_TOOL_SCHEMA)
+    bound = tool.bind_ownership_capability(TOKEN)
+    try:
+        assert json.loads(handle_function_call("atlas_ownership_proposal", args)) == {"error": reason}
+        assert not callback[0]
+        args["proposal"] = original
+        assert json.loads(handle_function_call("atlas_ownership_proposal", args)) == success(operation)
+    finally:
+        tool.clear_ownership_capability(bound)
+    assert len(callback[0]) == 1
+    assert "private-" not in caplog.text and TOKEN not in caplog.text
+
+
+def test_first_local_rule_wins_without_echoing_values(callback):
+    request = invalid_generic_request("association_index", 1)
+    request["arguments"]["proposal"]["changes"][3]["source_ref"] = "private-source"
+    request["arguments"]["proposal"]["transformations"][0]["action_id"] = "private-action"
+    assert json.loads(invoke(request)) == {"error": "changes[3].association_index: out of range"}
+    assert not callback[0]
