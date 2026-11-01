@@ -1044,3 +1044,35 @@ async def test_scripted_provider_through_real_stream_agent_and_dispatch(
         assert any(json.loads(value) == expected for value in tool_results)
     assert TOKEN not in json.dumps(provider_calls) + stream + caplog.text
     assert not tool.ownership_capability_available()
+
+
+def test_mismatch_rule_survives_and_same_turn_retry_forwards(callback):
+    request = copy.deepcopy(CONTRACT['transformation_case']['requests'][0])
+    refusal = {'protocol': CONTRACT['protocol'], 'ok': False, 'error': {
+        'code': 'OWNERSHIP_EVIDENCE_MISMATCH', 'rule': 'transformation_source_dependency'}}
+    callback[1][0] = lambda req: httpx.Response(200, json=refusal if len(callback[0]) == 1 else success('propose'))
+    bound = tool.bind_ownership_capability(TOKEN)
+    try:
+        assert json.loads(invoke(request)) == refusal
+        assert json.loads(invoke(request)) == success('propose')
+    finally:
+        tool.clear_ownership_capability(bound)
+    assert len(callback[0]) == 2
+    assert all(req.headers['Authorization'] == 'Bearer ' + TOKEN for req in callback[0])
+
+
+@pytest.mark.parametrize('error', [
+    {'code': 'OWNERSHIP_EVIDENCE_MISMATCH', 'rule': 'Private value!'},
+    {'code': 'OWNERSHIP_EVIDENCE_MISMATCH', 'rule': 'x' * 97},
+    {'code': 'OWNERSHIP_EVIDENCE_MISMATCH', 'rule': None},
+    {'code': 'OWNERSHIP_EVIDENCE_MISMATCH', 'rule': 'valid_rule', 'value': 'private'},
+    {'code': 'OWNERSHIP_UNAVAILABLE', 'rule': 'valid_rule'},
+])
+def test_invalid_rule_envelopes_remain_unavailable(error, callback):
+    callback[1][0] = lambda req: httpx.Response(200, json={
+        'protocol': CONTRACT['protocol'], 'ok': False, 'error': error})
+    bound = tool.bind_ownership_capability(TOKEN)
+    try:
+        assert json.loads(invoke(CONTRACT['requests'][0])) == ERROR
+    finally:
+        tool.clear_ownership_capability(bound)

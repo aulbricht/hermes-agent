@@ -317,7 +317,11 @@ def _response_valid(value, operation):
     if value.get("ok") is False:
         error = value.get("error")
         return (set(value) == {"protocol", "ok", "error"} and type(error) is dict
-                and set(error) == {"code"} and type(error["code"]) is str
+                and (set(error) == {"code"} or (set(error) == {"code", "rule"}
+                     and error.get("code") == "OWNERSHIP_EVIDENCE_MISMATCH"
+                     and type(error["rule"]) is str
+                     and re.fullmatch(r"[a-z][a-z0-9_]{0,95}", error["rule"]) is not None))
+                and type(error["code"]) is str
                 and error["code"] in _ERROR_CODES)
     return False
 
