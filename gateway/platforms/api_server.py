@@ -1605,11 +1605,21 @@ class APIServerAdapter(BasePlatformAdapter):
             enabled_toolsets = sorted(set(enabled_toolsets).intersection(toolset_scope))
         if atlas_import_authorized:
             enabled_toolsets.append("atlas_import")
+        ownership_luna = (atlas_ownership_authorized and model == "openai/gpt-6-luna"
+                          and runtime_kwargs.get("provider") == "openrouter")
         if atlas_ownership_authorized:
             # Ownership evidence is untrusted input and may contain personal
             # data. Enforce its boundary here even if caller scope is absent
             # or broad; configured outbound/persistent tools must not survive.
             enabled_toolsets = ["atlas_ownership"]
+            if ownership_luna:
+                # Ownership must emit a proposal after reasoning: the shared
+                # 8192/xhigh profile exhausted its budget before the save call.
+                # Size for the existing 128 KiB proposal envelope (~32768 tokens
+                # at 4 bytes/token), plus 32768 reasoning tokens. This is sizing
+                # headroom, not a tokenizer bound or a separate reasoning quota.
+                runtime_kwargs["max_tokens"] = 65536
+                reasoning_config = {"enabled": True, "effort": "medium"}
         if atlas_query_authorized:
             # Query turns see only the Atlas query tool, whatever scope was sent.
             enabled_toolsets = ["atlas_query"]
@@ -1648,6 +1658,17 @@ class APIServerAdapter(BasePlatformAdapter):
         if atlas_query_authorized:
             agent.no_iteration_summary = True
             agent.max_provider_requests = ATLAS_QUERY_MAX_TURNS
+        if ownership_luna:
+            # Luna input price doubles above 272K tokens (`accounting.py` rates).
+            # Apply this ownership budget via the existing context engine;
+            # normal deploys preserve config.yaml rather than rerun the installer.
+            agent._config_context_length = 272000
+            agent.context_compressor.update_model(
+                model=model, context_length=agent._config_context_length,
+                base_url=agent.base_url, api_key=agent.api_key,
+                provider=agent.provider, api_mode=agent.api_mode,
+                max_tokens=agent.max_tokens,
+            )
         return agent
 
     # ------------------------------------------------------------------
@@ -4494,10 +4515,6 @@ class APIServerAdapter(BasePlatformAdapter):
                     atlas_ownership_authorized=bool(atlas_ownership_capability),
                     atlas_query_authorized=bool(atlas_query_capability),
                 )
-                if provider_user_hash:
-                    overrides = dict(getattr(agent, "request_overrides", {}) or {})
-                    overrides["user"] = provider_user_hash
-                    agent.request_overrides = overrides
                 if atlas_route_request_id:
                     agent._atlas_route_request_id = atlas_route_request_id
                 if agent_ref is not None:

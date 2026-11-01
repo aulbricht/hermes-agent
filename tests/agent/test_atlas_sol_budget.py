@@ -4,6 +4,41 @@ from types import SimpleNamespace
 from agent import atlas_sol_budget as budget
 
 
+def test_openrouter_pinned_tool_payload_drops_parallel_calls_and_keeps_spend_bounds(monkeypatch):
+    from agent.transports.codex import ResponsesApiTransport
+
+    monkeypatch.setenv("ATLAS_MODEL_ROUTING_ENABLED", "true")
+    transport = ResponsesApiTransport()
+    payload = transport.preflight_kwargs(transport.build_kwargs(
+        budget.LUNA,
+        [{"role": "system", "content": "Use tools."}, {"role": "user", "content": "hello"}],
+        tools=[{"type": "function", "function": {
+            "name": "lookup", "description": "Look up a value.",
+            "parameters": {"type": "object", "properties": {}},
+        }}],
+        provider="openrouter", max_tokens=500,
+        reasoning_config={"enabled": True, "effort": "xhigh"},
+    ))
+    assert "parallel_tool_calls" in payload
+
+    monkeypatch.setenv("ATLAS_MODEL_ROUTING_TRANSPORT", "openrouter")
+    pinned = budget.admitted_call(SimpleNamespace(model=budget.LUNA), payload, lambda request: request)
+    assert "parallel_tool_calls" not in pinned
+    assert pinned["max_output_tokens"] == payload["max_output_tokens"] == 500
+    assert pinned["extra_body"]["provider"] == {
+        "order": ["openai"], "only": ["openai"],
+        "allow_fallbacks": False, "require_parameters": True,
+    }
+    expected = dict(payload)
+    expected.pop("parallel_tool_calls")
+    expected.update(model=f"openai/{budget.LUNA}", service_tier="auto", extra_body=pinned["extra_body"])
+    assert pinned == expected
+
+    monkeypatch.setenv("ATLAS_MODEL_ROUTING_TRANSPORT", "openai")
+    assert budget.admitted_call(SimpleNamespace(model=budget.LUNA), payload, lambda request: request) == payload
+    assert "parallel_tool_calls" in payload
+
+
 def test_sol_call_reserves_before_dispatch_and_settles_estimated_usage(monkeypatch):
     events = []
 
