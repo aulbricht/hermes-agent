@@ -1623,6 +1623,7 @@ class APIServerAdapter(BasePlatformAdapter):
         if atlas_query_authorized:
             # Query turns see only the Atlas query tool, whatever scope was sent.
             enabled_toolsets = ["atlas_query"]
+            runtime_kwargs["max_tokens"] = ATLAS_QUERY_TURN_MAX_OUTPUT_TOKENS
 
         max_iterations = _current_max_iterations()
         if route and not session_override and route.get("max_iterations"):
@@ -1634,11 +1635,12 @@ class APIServerAdapter(BasePlatformAdapter):
         # same fallback behaviour as Telegram/Discord/Slack (fixes #4954).
         fallback_model = GatewayRunner._load_fallback_model()
 
+        max_tokens = runtime_kwargs.pop("max_tokens", None)
         agent = AIAgent(
             model=model,
             **runtime_kwargs,
             max_iterations=max_iterations,
-            max_tokens=ATLAS_QUERY_TURN_MAX_OUTPUT_TOKENS if atlas_query_authorized else None,
+            max_tokens=max_tokens,
             quiet_mode=True,
             verbose_logging=False,
             ephemeral_system_prompt=ephemeral_system_prompt or None,
