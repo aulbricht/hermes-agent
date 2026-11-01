@@ -1635,12 +1635,10 @@ class APIServerAdapter(BasePlatformAdapter):
         # same fallback behaviour as Telegram/Discord/Slack (fixes #4954).
         fallback_model = GatewayRunner._load_fallback_model()
 
-        max_tokens = runtime_kwargs.pop("max_tokens", None)
         agent = AIAgent(
             model=model,
             **runtime_kwargs,
             max_iterations=max_iterations,
-            max_tokens=max_tokens,
             quiet_mode=True,
             verbose_logging=False,
             ephemeral_system_prompt=ephemeral_system_prompt or None,

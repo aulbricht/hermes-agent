@@ -170,7 +170,7 @@ def test_create_agent_scopes_query_turns_to_the_query_tool_four_iterations_and_a
         adapter._create_agent()
         assert sorted(agent.call_args.kwargs["enabled_toolsets"]) == ["terminal", "web"]
         assert agent.call_args.kwargs["max_iterations"] == 90
-        assert agent.call_args.kwargs["max_tokens"] is None
+        assert agent.call_args.kwargs.get("max_tokens") is None
         assert agent.return_value.no_iteration_summary is not True
         assert agent.return_value.max_provider_requests != 4
         adapter._create_agent(atlas_query_authorized=True, toolset_scope=["web", "terminal"])
