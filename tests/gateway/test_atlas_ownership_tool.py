@@ -4,6 +4,7 @@ import asyncio
 import copy
 import hashlib
 import json
+import re
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -45,6 +46,64 @@ def invoke(request):
     if request["operation"] in {"catalog", "evidence"}:
         return tool._handle_atlas_ownership({"operation": request["operation"], "arguments": request["arguments"]})
     return tool._handle_atlas_ownership_proposal({"operation": request["operation"], **request["arguments"]})
+
+
+def assert_proposal_refusal(result):
+    # Rejection/zero-dispatch assertions stay intact; schema errors now identify
+    # a fixed field path, while semantic/transport failures remain opaque.
+    assert set(result) == {"error"}
+    assert result == ERROR or re.fullmatch(
+        r"arguments(?:\.[a-z_]+(?:\[\])?)*: not accepted", result["error"])
+    assert TOKEN not in result["error"]
+
+
+@pytest.mark.parametrize("operation", ["propose", "revise"])
+@pytest.mark.parametrize("role", ["Legal owner", "x" * 240])
+def test_owner_role_with_execution_plan_and_transformations_forwards(operation, role, callback):
+    from model_tools import handle_function_call
+
+    request = copy.deepcopy(CONTRACT["transformation_case"]["requests"][0 if operation == "propose" else 1])
+    proposal = request["arguments"]["proposal"]
+    assert proposal["execution_plan"] and proposal["transformations"]
+    proposal["associations"][0]["role"] = role
+    bound = tool.bind_ownership_capability(TOKEN)
+    try:
+        assert json.loads(handle_function_call("atlas_ownership_proposal", {
+            "operation": operation, **request["arguments"]})) == success(operation)
+    finally:
+        tool.clear_ownership_capability(bound)
+    assert len(callback[0]) == 1
+    assert json.loads(callback[0][0].content) == request
+
+
+@pytest.mark.parametrize("role", ["", "   ", "private-value" * 21, None, True])
+def test_invalid_role_names_only_failed_field(role, callback):
+    request = copy.deepcopy(CONTRACT["transformation_case"]["requests"][0])
+    request["arguments"]["proposal"]["associations"][0]["role"] = role
+    assert json.loads(invoke(request)) == {
+        "error": "arguments.proposal.associations[].role: not accepted"}
+    assert not callback[0]
+
+
+@pytest.mark.parametrize("mutation,field", [
+    ("missing", "arguments.proposal.evidence_hash"),
+    ("extra", "arguments.proposal.associations[]"),
+    ("dynamic", "arguments.proposal.execution_plan[].fields"),
+    ("type", "arguments.expected_version"),
+])
+def test_schema_errors_do_not_echo_customer_values_or_dynamic_keys(mutation, field, callback):
+    request = copy.deepcopy(CONTRACT["transformation_case"]["requests"][0])
+    proposal = request["arguments"]["proposal"]
+    if mutation == "missing":
+        del proposal["evidence_hash"]
+    elif mutation == "extra":
+        proposal["associations"][0]["private-customer-key"] = "private-customer-value"
+    elif mutation == "dynamic":
+        proposal["execution_plan"][0]["fields"]["private-customer-key"] = True
+    else:
+        request["arguments"]["expected_version"] = "private-customer-value"
+    assert json.loads(invoke(request)) == {"error": field + ": not accepted"}
+    assert not callback[0]
 
 
 def success(operation="catalog"):
@@ -184,7 +243,7 @@ def test_authority_injection_refused_at_every_object(field, location, callback):
     target[field] = "untrusted"
     bound = tool.bind_ownership_capability(TOKEN)
     try:
-        assert json.loads(invoke(request)) == ERROR
+        assert_proposal_refusal(json.loads(invoke(request)))
     finally:
         tool.clear_ownership_capability(bound)
     assert observed == []
@@ -234,7 +293,7 @@ def test_execution_plan_field_maps_refuse_authority_keys(field, location, callba
     request["arguments"]["proposal"]["execution_plan"][0][location][field] = "foreign"
     bound = tool.bind_ownership_capability(TOKEN)
     try:
-        assert json.loads(invoke(request)) == ERROR
+        assert_proposal_refusal(json.loads(invoke(request)))
     finally:
         tool.clear_ownership_capability(bound)
     assert not callback[0]
@@ -282,7 +341,7 @@ def test_invalid_execution_plan_never_dispatches(location, value, callback):
         proposal["execution_plan"][0][key] = value
     bound = tool.bind_ownership_capability(TOKEN)
     try:
-        assert json.loads(invoke(request)) == ERROR
+        assert_proposal_refusal(json.loads(invoke(request)))
     finally:
         tool.clear_ownership_capability(bound)
     assert not callback[0]
@@ -314,10 +373,10 @@ def test_token_in_proposal_and_oversized_valid_shape_are_refused(callback):
     bound = tool.bind_ownership_capability(TOKEN)
     try:
         request["arguments"]["proposal"]["associations"][0]["rationale"] = TOKEN
-        assert json.loads(invoke(request)) == ERROR
+        assert_proposal_refusal(json.loads(invoke(request)))
         request["arguments"]["proposal"]["associations"][0]["rationale"] = "x" * 2000
         request["arguments"]["proposal"]["associations"] *= 100
-        assert json.loads(invoke(request)) == ERROR
+        assert_proposal_refusal(json.loads(invoke(request)))
     finally:
         tool.clear_ownership_capability(bound)
     assert not observed
@@ -661,8 +720,8 @@ def test_invalid_transformations_real_dispatch_refuses_before_callback(location,
     request = invalid_transformation_request(location, value)
     bound = tool.bind_ownership_capability(TOKEN)
     try:
-        assert json.loads(handle_function_call("atlas_ownership_proposal", {
-            "operation": "propose", **request["arguments"]})) == ERROR
+        assert_proposal_refusal(json.loads(handle_function_call("atlas_ownership_proposal", {
+            "operation": "propose", **request["arguments"]})))
     finally:
         tool.clear_ownership_capability(bound)
     assert not callback[0]
@@ -688,7 +747,7 @@ def test_transformation_relationships_refused_without_authority(mutation, callba
         proposal["changes"].append(copy.deepcopy(proposal["changes"][0]))
     bound = tool.bind_ownership_capability(TOKEN)
     try:
-        assert json.loads(invoke(request)) == ERROR
+        assert_proposal_refusal(json.loads(invoke(request)))
     finally:
         tool.clear_ownership_capability(bound)
     assert not callback[0]
@@ -727,9 +786,9 @@ def test_transformation_count_and_envelope_byte_caps(callback):
     bound = tool.bind_ownership_capability(TOKEN)
     try:
         assert tool._matches({"operation": "propose", **request["arguments"]}, tool._PROPOSAL_TOOL_SCHEMA)
-        assert json.loads(invoke(request)) == ERROR
+        assert_proposal_refusal(json.loads(invoke(request)))
         proposal["transformations"].append(copy.deepcopy(original))
-        assert json.loads(invoke(request)) == ERROR
+        assert_proposal_refusal(json.loads(invoke(request)))
     finally:
         tool.clear_ownership_capability(bound)
     assert not callback[0]
@@ -822,8 +881,8 @@ def test_generic_invalid_shape_and_local_references_refuse_before_callback(locat
     request = invalid_generic_request(location, value)
     bound = tool.bind_ownership_capability(TOKEN)
     try:
-        assert json.loads(handle_function_call("atlas_ownership_proposal", {
-            "operation": "propose", **request["arguments"]})) == ERROR
+        assert_proposal_refusal(json.loads(handle_function_call("atlas_ownership_proposal", {
+            "operation": "propose", **request["arguments"]})))
     finally:
         tool.clear_ownership_capability(bound)
     assert not callback[0]
@@ -874,12 +933,12 @@ def test_generic_count_unicode_and_enclosing_byte_limits(callback):
     try:
         assert json.loads(invoke(request)) == success("propose")
         proposal["changes"].append({**original, "id": "overflow", "source_path": "/generic/overflow"})
-        assert json.loads(invoke(request)) == ERROR
+        assert_proposal_refusal(json.loads(invoke(request)))
         proposal["changes"].pop()
         for item in proposal["changes"][3:]:
             item["proposed_value"] = "😀" * 2000
         assert tool._matches({"operation": "propose", **request["arguments"]}, tool._PROPOSAL_TOOL_SCHEMA)
-        assert json.loads(invoke(request)) == ERROR
+        assert_proposal_refusal(json.loads(invoke(request)))
     finally:
         tool.clear_ownership_capability(bound)
     assert len(callback[0]) == 1
@@ -978,6 +1037,10 @@ async def test_scripted_provider_through_real_stream_agent_and_dispatch(
         assert {item["function"]["name"] for item in call["tools"]} == OWNERSHIP
     tool_results = [message["content"] for message in provider_calls[-1]["messages"] if message["role"] == "tool"]
     expected = reply["body"] if not local_refusal and reply["status"] == 200 else ERROR
-    assert any(json.loads(value) == expected for value in tool_results)
+    if local_refusal:
+        assert len(tool_results) == 1
+        assert_proposal_refusal(json.loads(tool_results[0]))
+    else:
+        assert any(json.loads(value) == expected for value in tool_results)
     assert TOKEN not in json.dumps(provider_calls) + stream + caplog.text
     assert not tool.ownership_capability_available()
