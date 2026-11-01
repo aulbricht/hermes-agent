@@ -398,6 +398,14 @@ class AIAgent:
     for AI models that support function calling.
     """
 
+    # Set by the API server on Atlas Query turns: when the iteration limit is
+    # reached, end without the extra summary model call.
+    no_iteration_summary = False
+    # Set by the API server on Atlas Query turns: the most provider requests one
+    # run may dispatch, retries included. None means no limit.
+    max_provider_requests = None
+    _provider_requests_made = 0
+
     _TOOL_CALL_ARGUMENTS_CORRUPTION_MARKER = (
         "[hermes-agent: tool call arguments were corrupted in this session and "
         "have been dropped to keep the conversation alive. See issue #15236.]"

@@ -102,6 +102,20 @@ def _hermes_version() -> str:
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8642
 MAX_STORED_RESPONSES = 100
+# Atlas Query turns: Allen's ruling (2026-10-31) allows four model turns per question
+# within Atlas's $0.25 cap. The bound is on provider requests, enforced at dispatch:
+# the agent refuses to send a fifth request however it got there (a new turn, a
+# truncation retry, a continuation or a fallback), and compaction is a no-op for it, so
+# no auxiliary summary request is made. Each request asks for at most 4,096 output
+# tokens (reasoning included). A truncation retry may raise one request's limit to the
+# loop's 32,768-token ceiling. Worst case at the Luna price of $0.50 per million output
+# tokens (Atlas sol_budget.MODEL_PRICES): 4 x 32,768 x $0.50 / 1,000,000 = $0.065536 of
+# output, leaving $0.184464 for input: about 1.8 million tokens at $0.10 per million, far
+# beyond one request's context. SDK-level transport retries inside one request are not
+# counted here; Atlas still checks the receipt afterwards and settles an overrun as
+# limit_exceeded.
+ATLAS_QUERY_MAX_TURNS = 4
+ATLAS_QUERY_TURN_MAX_OUTPUT_TOKENS = 4096
 MAX_REQUEST_BYTES = 10_000_000  # 10 MB — accommodates long agent conversations with tool calls
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
@@ -1480,6 +1494,7 @@ class APIServerAdapter(BasePlatformAdapter):
         toolset_scope: Optional[List[str]] = None,
         atlas_import_authorized: bool = False,
         atlas_ownership_authorized: bool = False,
+        atlas_query_authorized: bool = False,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -1583,7 +1598,7 @@ class APIServerAdapter(BasePlatformAdapter):
             )
 
         user_config = _load_gateway_config()
-        enabled_toolsets = sorted(set(_get_platform_tools(user_config, "api_server")) - {"atlas_import", "atlas_ownership"})
+        enabled_toolsets = sorted(set(_get_platform_tools(user_config, "api_server")) - {"atlas_import", "atlas_ownership", "atlas_query"})
         if toolset_scope is not None:
             # Request scope can only remove configured tools. Keep it local to
             # this agent instance; the API server's default remains unchanged.
@@ -1605,10 +1620,16 @@ class APIServerAdapter(BasePlatformAdapter):
                 # headroom, not a tokenizer bound or a separate reasoning quota.
                 runtime_kwargs["max_tokens"] = 65536
                 reasoning_config = {"enabled": True, "effort": "medium"}
+        if atlas_query_authorized:
+            # Query turns see only the Atlas query tool, whatever scope was sent.
+            enabled_toolsets = ["atlas_query"]
+            runtime_kwargs["max_tokens"] = ATLAS_QUERY_TURN_MAX_OUTPUT_TOKENS
 
         max_iterations = _current_max_iterations()
         if route and not session_override and route.get("max_iterations"):
             max_iterations = min(max_iterations, int(route["max_iterations"]))
+        if atlas_query_authorized:
+            max_iterations = min(max_iterations, ATLAS_QUERY_MAX_TURNS)
 
         # Load fallback provider chain so the API server platform has the
         # same fallback behaviour as Telegram/Discord/Slack (fixes #4954).
@@ -1633,6 +1654,10 @@ class APIServerAdapter(BasePlatformAdapter):
             reasoning_config=reasoning_config,
             gateway_session_key=gateway_session_key,
         )
+        # A Query turn that uses its last model turn ends without a summary call.
+        if atlas_query_authorized:
+            agent.no_iteration_summary = True
+            agent.max_provider_requests = ATLAS_QUERY_MAX_TURNS
         if ownership_luna:
             # Luna input price doubles above 272K tokens (`accounting.py` rates).
             # Apply this ownership budget via the existing context engine;
@@ -2250,6 +2275,13 @@ class APIServerAdapter(BasePlatformAdapter):
                 or (atlas_import_capability is not None and atlas_ownership_capability is not None)):
             return web.json_response(_openai_error(
                 "Invalid ownership capability", code="invalid_ownership_capability"), status=400)
+        atlas_query_capability = body.get("atlas_query_capability")
+        if (atlas_query_capability is not None and (
+                not isinstance(atlas_query_capability, str) or not re.fullmatch(
+                    r"atqry_[A-Za-z0-9_-]{32,128}", atlas_query_capability)
+                or atlas_import_capability is not None or atlas_ownership_capability is not None)):
+            return web.json_response(_openai_error(
+                "Invalid query capability", code="invalid_query_capability"), status=400)
         if toolset_scope is not None:
             if (not isinstance(toolset_scope, list) or len(toolset_scope) > 32
                     or any(not isinstance(name, str) or not name or len(name) > 80
@@ -2260,7 +2292,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     code="invalid_toolset_scope"), status=400)
             from gateway.run import _load_gateway_config
             from hermes_cli.tools_config import _get_platform_tools
-            configured = set(_get_platform_tools(_load_gateway_config(), "api_server")) - {"atlas_import", "atlas_ownership"}
+            configured = set(_get_platform_tools(_load_gateway_config(), "api_server")) - {"atlas_import", "atlas_ownership", "atlas_query"}
             if not set(toolset_scope).issubset(configured):
                 return web.json_response(_openai_error(
                     "toolset_scope cannot enable unconfigured toolsets",
@@ -2338,6 +2370,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     toolset_scope=toolset_scope,
                     atlas_import_capability=atlas_import_capability,
                     atlas_ownership_capability=atlas_ownership_capability,
+                    atlas_query_capability=atlas_query_capability,
                 )
                 final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
                 effective_session_id = result.get("session_id", session_id) if isinstance(result, dict) else session_id
@@ -4434,6 +4467,7 @@ class APIServerAdapter(BasePlatformAdapter):
         toolset_scope: Optional[List[str]] = None,
         atlas_import_capability: Optional[str] = None,
         atlas_ownership_capability: Optional[str] = None,
+        atlas_query_capability: Optional[str] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -4464,6 +4498,8 @@ class APIServerAdapter(BasePlatformAdapter):
             from tools.atlas_ownership_tool import bind_ownership_capability, clear_ownership_capability
             import_token = bind_import_capability(atlas_import_capability or "")
             ownership_token = bind_ownership_capability(atlas_ownership_capability or "")
+            from tools.atlas_query_tool import bind_query_capability, clear_query_capability
+            query_token = bind_query_capability(atlas_query_capability or "")
             try:
                 agent = self._create_agent(
                     ephemeral_system_prompt=ephemeral_system_prompt,
@@ -4477,6 +4513,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     toolset_scope=toolset_scope,
                     atlas_import_authorized=bool(atlas_import_capability),
                     atlas_ownership_authorized=bool(atlas_ownership_capability),
+                    atlas_query_authorized=bool(atlas_query_capability),
                 )
                 if atlas_route_request_id:
                     agent._atlas_route_request_id = atlas_route_request_id
@@ -4518,6 +4555,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     result["session_id"] = _eff_sid
                 return result, usage
             finally:
+                clear_query_capability(query_token)
                 clear_ownership_capability(ownership_token)
                 clear_import_capability(import_token)
                 clear_session_vars(tokens)

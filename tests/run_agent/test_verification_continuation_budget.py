@@ -144,3 +144,98 @@ def test_later_verified_response_supersedes_pending_report(agent, monkeypatch):
     assert result["turn_exit_reason"] == "text_response(finish_reason=stop)"
     assert result["completed"] is True
     agent._handle_max_iterations.assert_not_called()
+
+
+def _tool_call_response(n):
+    call = SimpleNamespace(
+        id=f"call_{n}",
+        type="function",
+        function=SimpleNamespace(name="web_search", arguments=f'{{"q": "lease {n}"}}'),
+    )
+    message = SimpleNamespace(content="", tool_calls=[call])
+    return SimpleNamespace(
+        choices=[SimpleNamespace(message=message, finish_reason="tool_calls")],
+        model="test/model",
+        usage=None,
+    )
+
+
+def test_atlas_query_turn_limit_is_four_calls_and_no_summary_call(agent, monkeypatch):
+    agent.max_iterations = 4
+    agent.iteration_budget.max_total = 4
+    agent.max_tokens = 4096
+    agent.no_iteration_summary = True
+    agent.valid_tool_names = {"web_search"}
+    sent = []
+
+    def model_call(api_kwargs):
+        sent.append(api_kwargs)
+        return _tool_call_response(len(sent))
+
+    agent._interruptible_api_call = model_call
+    agent.client.chat.completions.create = MagicMock()
+    agent._handle_max_iterations = MagicMock(wraps=agent._handle_max_iterations)
+    monkeypatch.setenv("HERMES_VERIFY_ON_STOP", "0")
+
+    with (
+        patch("run_agent.handle_function_call", return_value="rows"),
+        patch("hermes_cli.plugins.has_hook", return_value=False),
+        patch("hermes_cli.plugins.invoke_hook", return_value=[]),
+    ):
+        result = agent.run_conversation("which leases end next month?")
+
+    assert len(sent) == 4  # exactly four provider calls, no fifth
+    agent.client.chat.completions.create.assert_not_called()  # the summary call is never made
+    agent._handle_max_iterations.assert_not_called()
+    # The reply is the fixed local notice, not a model-written summary.
+    assert "maximum tool-iteration limit" in result["final_response"]
+    assert result["turn_exit_reason"] == "max_iterations_reached(4/4)"
+    # The per-turn output cap reaches every request.
+    assert all(4096 in [kw.get(k) for k in ("max_tokens", "max_completion_tokens", "max_output_tokens")] for kw in sent)
+
+
+def test_atlas_query_truncated_tool_reply_at_the_boundary_sends_no_fifth_request(agent, monkeypatch):
+    # Three successful rounds, then a length-truncated tool reply: the loop's
+    # truncation retry would be request five. The dispatch guard refuses it.
+    agent.max_iterations = 4
+    agent.iteration_budget.max_total = 4
+    agent.max_tokens = 4096
+    agent.no_iteration_summary = True
+    agent.max_provider_requests = 4
+    agent.valid_tool_names = {"web_search"}
+    sent = []
+
+    def model_call(api_kwargs):
+        sent.append(api_kwargs)
+        response = _tool_call_response(len(sent))
+        if len(sent) >= 4:
+            response.choices[0].finish_reason = "length"
+        return response
+
+    agent._interruptible_api_call = model_call
+    agent.client.chat.completions.create = MagicMock()
+    monkeypatch.setenv("HERMES_VERIFY_ON_STOP", "0")
+
+    with (
+        patch("run_agent.handle_function_call", return_value="rows"),
+        patch("hermes_cli.plugins.has_hook", return_value=False),
+        patch("hermes_cli.plugins.invoke_hook", return_value=[]),
+    ):
+        result = agent.run_conversation("which leases end next month?")
+
+    assert len(sent) == 4  # the retry at the boundary was never dispatched
+    agent.client.chat.completions.create.assert_not_called()
+    assert result["completed"] is False
+    assert result["turn_exit_reason"] == "provider_request_limit_reached(4/4)"
+
+
+def test_request_limited_agent_does_not_compress(agent):
+    agent.max_provider_requests = 4
+    agent._cached_system_prompt = "system"
+    messages = [{"role": "user", "content": "q"}]
+    agent.context_compressor.compress = MagicMock()
+
+    from agent.conversation_compression import compress_context
+
+    assert compress_context(agent, messages, "system", force=True) == (messages, "system")
+    agent.context_compressor.compress.assert_not_called()
