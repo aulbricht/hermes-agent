@@ -128,7 +128,7 @@ _PROPOSAL_SCHEMA = _object({
         "contact_id": {"anyOf": [_text(160), {"type": "null"}]},
         "display_values": _object({"display_name": _text(240)}),
         "rationale": _text(),
-        "role": {"type": "string", "enum": ["Property Manager"]},
+        "role": _text(240),
     }), 100),
     "unresolved_questions": _array(_text(), 10),
     "changes": _array(_CHANGE_SCHEMA, 100),
@@ -202,6 +202,27 @@ def _matches(value, schema):
     if kind == "integer":
         return schema.get("minimum", value) <= value <= schema.get("maximum", value)
     return True
+
+
+def _failed_schema_field(value, schema, field="arguments"):
+    """Locate a rejected schema field without echoing business keys or values.
+
+    Called only after _matches fails. Dynamic field-map keys and union values
+    are reported at their enclosing schema-defined field.
+    """
+    if schema.get("type") == "object" and type(value) is dict:
+        properties = schema["properties"]
+        for key in schema["required"]:
+            if key not in value:
+                return field + "." + key
+        for key, child_schema in properties.items():
+            if key in value and not _matches(value[key], child_schema):
+                return _failed_schema_field(value[key], child_schema, field + "." + key)
+    elif schema.get("type") == "array" and type(value) is list:
+        for item in value:
+            if not _matches(item, schema["items"]):
+                return _failed_schema_field(item, schema["items"], field + "[]")
+    return field
 
 
 def _transformation_value_safe(value):
@@ -344,8 +365,10 @@ def _handle_atlas_ownership(args: dict, **_kwargs) -> str:
 
 
 def _handle_atlas_ownership_proposal(args: dict, **_kwargs) -> str:
-    if (not _matches(args, _PROPOSAL_TOOL_SCHEMA)
-            or not _generic_changes_valid(args["proposal"])
+    if not _matches(args, _PROPOSAL_TOOL_SCHEMA):
+        field = _failed_schema_field(args, _PROPOSAL_TOOL_SCHEMA)
+        return json.dumps({"error": field + ": not accepted"})
+    if (not _generic_changes_valid(args["proposal"])
             or not _transformations_valid(args["proposal"])):
         return _UNAVAILABLE
     keys = {"operation", "expected_version", "proposal"}
