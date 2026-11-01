@@ -233,79 +233,97 @@ def _transformation_value_safe(value):
                    or 0xE0100 <= ord(char) <= 0xE01EF for char in value)
 
 
-def _generic_changes_valid(proposal):
-    """Validate local references; only Atlas can resolve original source text."""
+def _generic_changes_error(proposal):
+    """Return the first fixed, value-free reason; Atlas resolves source text."""
     changes = proposal.get("changes", [])
     if not any(change["kind"] == "generic" for change in changes):
-        return True
+        return None
     seen, targets = {}, set()
-    for change in changes:
+    for position, change in enumerate(changes):
+        path = f"changes[{position}]"
         if change["id"] in seen:
-            return False
+            return path + ".id: must be unique"
         if change["kind"] == "generic":
             index = change["association_index"]
             target = (index, change["source_path"])
-            if (index >= len(proposal["associations"])
-                    or proposal["associations"][index]["source_ref"] != change["source_ref"]
-                    or target in targets
-                    or (change["proposed_value"] is not None
-                        and not _transformation_value_safe(change["proposed_value"]))):
-                return False
+            if index >= len(proposal["associations"]):
+                return path + ".association_index: out of range"
+            if proposal["associations"][index]["source_ref"] != change["source_ref"]:
+                return path + ".source_ref: must match association"
+            if target in targets:
+                return path + ".source_path: duplicate association target"
+            if (change["proposed_value"] is not None
+                    and not _transformation_value_safe(change["proposed_value"])):
+                return path + ".proposed_value: contains disallowed characters"
             for dependency in change["depends_on"]:
                 prior = seen.get(dependency)
                 if (prior is None or prior["source_ref"] != change["source_ref"]
                         or prior["association_index"] != index):
-                    return False
+                    return path + ".depends_on: must reference earlier change with same source_ref and association_index"
             targets.add(target)
         seen[change["id"]] = change
-    return True
+    return None
 
 
-def _transformations_valid(proposal):
-    """Check local proposal relationships without interpreting source meaning.
+def _transformations_error(proposal):
+    """Return the first local relationship failure without business data.
 
     Atlas alone verifies source pointer resolution/provenance, guidance/catalog
     revisions, writable non-key metadata and held ancestors before Approval.
     """
     transformations = proposal.get("transformations", [])
     if not transformations:
-        return True
+        return None
     actions = proposal.get("execution_plan", [])
     changes = proposal.get("changes", [])
     action_ids = [a["id"] for a in actions]
     change_ids = [c["id"] for c in changes]
-    if len(set(action_ids)) != len(action_ids) or len(set(change_ids)) != len(change_ids):
-        return False
+    if len(set(action_ids)) != len(action_ids):
+        return "execution_plan[].id: must be unique"
+    if len(set(change_ids)) != len(change_ids):
+        return "changes[].id: must be unique"
     actions = {a["id"]: a for a in actions}
     changes = {c["id"]: c for c in changes}
     seen_ids, seen_targets = set(), set()
-    for item in transformations:
+    for position, item in enumerate(transformations):
+        path = f"transformations[{position}]"
         field = item["field"]
         target = (item["action_id"], item["table"], field)
         action = actions.get(item["action_id"])
         index = item["association_index"]
-        if (item["id"] in seen_ids or target in seen_targets
-                or field.startswith("id__") or not _transformation_value_safe(item["proposed_value"])
-                or index >= len(proposal["associations"])
-                or proposal["associations"][index]["source_ref"] != item["source_ref"]
-                or action is None or action["table"] != item["table"]
-                or action["fields"].get(field) != item["proposed_value"]):
-            return False
+        if item["id"] in seen_ids:
+            return path + ".id: must be unique"
+        if target in seen_targets:
+            return path + ".field: duplicate action/table/field target"
+        if field.startswith("id__"):
+            return path + ".field: key field not accepted"
+        if not _transformation_value_safe(item["proposed_value"]):
+            return path + ".proposed_value: contains disallowed characters"
+        if index >= len(proposal["associations"]):
+            return path + ".association_index: out of range"
+        if proposal["associations"][index]["source_ref"] != item["source_ref"]:
+            return path + ".source_ref: must match association"
+        if action is None:
+            return path + ".action_id: unknown execution_plan action"
+        if action["table"] != item["table"]:
+            return path + ".table: must match execution_plan action"
+        if action["fields"].get(field) != item["proposed_value"]:
+            return path + ".proposed_value: must equal execution_plan action field"
         for dependency in item["depends_on"]:
             change = changes.get(dependency)
             if (change is None or change["source_ref"] != item["source_ref"]
                     or change["association_index"] != index):
-                return False
+                return path + ".depends_on: must reference change with same source_ref and association_index"
         for selector in item["source_inputs"]:
             if selector["path"].startswith("/generic/"):
                 if (selector["source_ref"] != item["source_ref"]
                         or not any(changes[dep]["kind"] == "generic"
                                    and changes[dep]["source_path"] == selector["path"]
                                    for dep in item["depends_on"])):
-                    return False
+                    return path + ".source_inputs: generic selector must match source_ref and source_path of dependency"
         seen_ids.add(item["id"])
         seen_targets.add(target)
-    return True
+    return None
 
 
 def _response_valid(value, operation):
@@ -372,9 +390,10 @@ def _handle_atlas_ownership_proposal(args: dict, **_kwargs) -> str:
     if not _matches(args, _PROPOSAL_TOOL_SCHEMA):
         field = _failed_schema_field(args, _PROPOSAL_TOOL_SCHEMA)
         return json.dumps({"error": field + ": not accepted"})
-    if (not _generic_changes_valid(args["proposal"])
-            or not _transformations_valid(args["proposal"])):
-        return _UNAVAILABLE
+    reason = (_generic_changes_error(args["proposal"])
+              or _transformations_error(args["proposal"]))
+    if reason:
+        return json.dumps({"error": reason})
     keys = {"operation", "expected_version", "proposal"}
     if args["operation"] == "revise":
         keys |= {"base_revision", "correction_text"}
