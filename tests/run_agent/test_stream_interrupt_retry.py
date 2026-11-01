@@ -160,3 +160,34 @@ class TestStreamInterruptBeforeRetry:
         result = agent._interruptible_streaming_api_call({})
         assert result is not None
         assert attempts[0] == 3
+
+
+class TestRequestLimitedAgentDoesNotRetryStream:
+    """A request-limited agent counts provider requests at dispatch, so the
+    streaming worker must not send retries below that counter."""
+
+    @pytest.mark.filterwarnings(
+        "ignore::pytest.PytestUnhandledThreadExceptionWarning"
+    )
+    @patch("run_agent.AIAgent._create_request_openai_client")
+    @patch("run_agent.AIAgent._close_request_openai_client")
+    def test_dropped_stream_is_not_retried(self, mock_close, mock_create):
+        import httpx
+
+        attempt_count = [0]
+
+        def always_drop(*args, **kwargs):
+            attempt_count[0] += 1
+            raise httpx.ConnectError("connection dropped")
+
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.side_effect = always_drop
+        mock_create.return_value = mock_client
+
+        agent = _make_agent()
+        agent.max_provider_requests = 4
+
+        with pytest.raises(Exception):
+            agent._interruptible_streaming_api_call({})
+
+        assert attempt_count[0] == 1

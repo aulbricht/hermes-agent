@@ -2732,6 +2732,12 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         import httpx as _httpx
 
         _max_stream_retries = env_int("HERMES_STREAM_RETRIES", 2)
+        # A request-limited agent (Atlas Query turns) counts provider requests
+        # once, at dispatch in conversation_loop. A stream retry here would
+        # send a request below that counter, so a dropped stream is not
+        # retried; it surfaces to the outer loop, whose retry is counted.
+        if getattr(agent, "max_provider_requests", None) is not None:
+            _max_stream_retries = 0
 
         try:
             for _stream_attempt in range(_max_stream_retries + 1):
