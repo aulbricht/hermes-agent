@@ -448,8 +448,8 @@ def test_fixed_error_for_bounded_failures(mode, callback, caplog):
     ("catalog", 48387, True),
     ("catalog", 65536, True),
     ("catalog", 65537, False),
-    ("evidence", 32768, True),
-    ("evidence", 32769, False),
+    ("evidence", 65536, True),
+    ("evidence", 65537, False),
 ])
 def test_catalog_headroom_and_other_operation_bounds(operation, size, accepted, callback):
     observed, response = callback
