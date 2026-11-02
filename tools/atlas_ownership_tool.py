@@ -1,6 +1,6 @@
 """One-turn ownership previews through Atlas's fixed, capability-bound callback.
 
-Schema source: acre-atlas 72e6b0f6, ownership_work._proposal and ownership_execution.actions.
+Schema source: Atlas PR 281, ownership_planner and ownership_work._proposal.
 Business references are untrusted; only Atlas can resolve them against bound work.
 """
 
@@ -98,7 +98,13 @@ _ACTION_SCHEMA = _object({
                                     "action_id": _text(160)}), 100),
     "holds": _array(_text(), 0),
 })
-# Reconciled with Atlas semantic-transformations / SNO-424, 2026-10-28.
+_RECORD_TARGET_SCHEMA = _object({
+    "ref": _text(160),
+    "association_index": {"type": "integer", "minimum": 0},
+    "table": _ACTION_SCHEMA["properties"]["table"],
+    "existing_id": {"anyOf": [_text(160), {"type": "null"}]},
+})
+# Reconciled with Atlas's semantic plan compiler / SNO-1261.
 # These selectors and business fields never confer authority. Atlas resolves
 # immutable evidence, metadata, target scope, holds and overwrite decisions.
 _TRANSFORMATION_SCHEMA = _object({
@@ -109,8 +115,8 @@ _TRANSFORMATION_SCHEMA = _object({
         "source_ref": _text(240),
         "path": {**_text(240), "pattern": r"^(?:/(?:[^~]|~[01])*)+$"},
     }), 10), "minItems": 1},
-    "action_id": _text(160),
-    "table": _ACTION_SCHEMA["properties"]["table"],
+    "record_ref": _text(160),
+    "table": {"type": "string", "enum": ["API_Contact", "API_ContactDetail"]},
     "field": {**_text(101), "pattern": r"^(?!id__)[A-Za-z][A-Za-z0-9_]{0,100}$",
               "not": {"enum": sorted(_AUTHORITY_KEYS | {"target_id"})}},
     "proposed_value": {**_text(2000), "description": "Model-proposed text, never observed evidence. Controls, format characters, surrogates, invisible fillers and variation selectors are refused unchanged."},
@@ -132,7 +138,7 @@ _PROPOSAL_SCHEMA = _object({
     }), 100),
     "unresolved_questions": _array(_text(), 10),
     "changes": _array(_CHANGE_SCHEMA, 100),
-    "execution_plan": {**_array(_ACTION_SCHEMA, 100), "minItems": 1},
+    "record_targets": _array(_RECORD_TARGET_SCHEMA, 100),
     "transformations": _array(_TRANSFORMATION_SCHEMA, 100),
 }, ["property_id", "evidence_hash", "associations", "unresolved_questions"])
 _READ_SCHEMA = _object({
@@ -268,33 +274,27 @@ def _generic_changes_error(proposal):
 def _transformations_error(proposal):
     """Return the first local relationship failure without business data.
 
-    Atlas alone verifies source pointer resolution/provenance, guidance/catalog
+    Atlas alone verifies record target resolution, source provenance, guidance/catalog
     revisions, writable non-key metadata and held ancestors before Approval.
     """
     transformations = proposal.get("transformations", [])
     if not transformations:
         return None
-    actions = proposal.get("execution_plan", [])
     changes = proposal.get("changes", [])
-    action_ids = [a["id"] for a in actions]
     change_ids = [c["id"] for c in changes]
-    if len(set(action_ids)) != len(action_ids):
-        return "execution_plan[].id: must be unique"
     if len(set(change_ids)) != len(change_ids):
         return "changes[].id: must be unique"
-    actions = {a["id"]: a for a in actions}
     changes = {c["id"]: c for c in changes}
     seen_ids, seen_targets = set(), set()
     for position, item in enumerate(transformations):
         path = f"transformations[{position}]"
         field = item["field"]
-        target = (item["action_id"], item["table"], field)
-        action = actions.get(item["action_id"])
+        target = (item["record_ref"], item["table"], field)
         index = item["association_index"]
         if item["id"] in seen_ids:
             return path + ".id: must be unique"
         if target in seen_targets:
-            return path + ".field: duplicate action/table/field target"
+            return path + ".field: duplicate record/table/field target"
         if field.startswith("id__"):
             return path + ".field: key field not accepted"
         if not _transformation_value_safe(item["proposed_value"]):
@@ -303,12 +303,6 @@ def _transformations_error(proposal):
             return path + ".association_index: out of range"
         if proposal["associations"][index]["source_ref"] != item["source_ref"]:
             return path + ".source_ref: must match association"
-        if action is None:
-            return path + ".action_id: unknown execution_plan action"
-        if action["table"] != item["table"]:
-            return path + ".table: must match execution_plan action"
-        if action["fields"].get(field) != item["proposed_value"]:
-            return path + ".proposed_value: must equal execution_plan action field"
         for dependency in item["depends_on"]:
             change = changes.get(dependency)
             if (change is None or change["source_ref"] != item["source_ref"]
@@ -410,7 +404,7 @@ registry.register(
 )
 registry.register(
     name="atlas_ownership_proposal", toolset="atlas_ownership",
-    schema={"name": "atlas_ownership_proposal", "description": "Submit a held ownership proposal or immutable correction revision. Revise requires base_revision and correction_text; propose omits them. Optional execution_plan proposes exact actions, field values, duplicate probes and earlier-action dependencies for separate review. Generic changes select original text through source_path within immutable observation.values.generic; proposed_value must equal the original or be null (held), possible_cleaned_value is null. Atlas resolves and verifies evidence. Every writable generic use requires an exact field-bound transformation with a matching source_path dependency. Optional transformations retain source selectors, exact action/table/field/value, rationale and guidance/catalog revisions for review; they are model proposals, never observed evidence. Business references must match bound evidence; Atlas validates scope. Never approves or executes.",
+    schema={"name": "atlas_ownership_proposal", "description": "Submit a held ownership proposal or immutable correction revision. Revise requires base_revision and correction_text; propose omits them. Use record_targets (ref, association_index, table, existing_id) and per-field transformations with record_ref. Atlas compiles the plan. Contact names need nameFirst plus nameLast, or organizationName. Each ContactDetail needs entityType plus contactInfo_raw (email/phone) or addressStreet1 (address). existing_id is null for new records; an existing Contact must match association.contact_id. Create new records only; transformations on existing records and detail or join targets with existing_id are refused in this slice. Generic changes select original text through source_path within immutable observation.values.generic; proposed_value must equal the original or be null (held), possible_cleaned_value is null. Atlas resolves and verifies evidence. Every writable generic use requires an exact field-bound transformation with a matching source_path dependency. Optional transformations retain source selectors, exact record/table/field/value, rationale and guidance/catalog revisions for review; they are model proposals, never observed evidence. Business references must match bound evidence; Atlas validates scope. Never approves or executes.",
             "parameters": _PROPOSAL_TOOL_SCHEMA},
     handler=_handle_atlas_ownership_proposal, max_result_size_chars=_MAX_RESPONSE_BYTES,
 )

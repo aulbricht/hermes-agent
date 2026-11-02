@@ -737,87 +737,6 @@
                 "rationale": "Synthetic source retained for review."
               }
             ],
-            "execution_plan": [
-              {
-                "id": "contact",
-                "table": "API_Contact",
-                "action": "create",
-                "fields": {
-                  "organizationName": "Example Holdings LLC",
-                  "entityType": "organization"
-                },
-                "target_id": null,
-                "duplicate_probe": {
-                  "organizationName": "Example Holdings LLC"
-                },
-                "dependencies": [],
-                "holds": []
-              },
-              {
-                "id": "address-detail",
-                "table": "API_ContactDetail",
-                "action": "create",
-                "fields": {
-                  "entityType": "Address",
-                  "addressStreet1": "123 Example Street",
-                  "addressCity": "EXAMPLE CITY",
-                  "addressState": "WA",
-                  "addressZip": "00000",
-                  "entityDesignation": "Mailing"
-                },
-                "target_id": null,
-                "duplicate_probe": {
-                  "addressStreet1": "123 Example Street"
-                },
-                "dependencies": [
-                  {
-                    "field": "id__contact",
-                    "action_id": "contact"
-                  }
-                ],
-                "holds": []
-              },
-              {
-                "id": "email-detail",
-                "table": "API_ContactDetail",
-                "action": "create",
-                "fields": {
-                  "entityType": "Email",
-                  "contactInfo_raw": "person@example.com"
-                },
-                "target_id": null,
-                "duplicate_probe": {
-                  "entityType": "Email"
-                },
-                "dependencies": [
-                  {
-                    "field": "id__contact",
-                    "action_id": "contact"
-                  }
-                ],
-                "holds": []
-              },
-              {
-                "id": "property-link",
-                "table": "API_JOIN_propertyContact",
-                "action": "create",
-                "fields": {
-                  "id__property": "PRO-00000000-0000-0000-0000-000000000001",
-                  "associationType_list": "Property Manager"
-                },
-                "target_id": null,
-                "duplicate_probe": {
-                  "id__property": "PRO-00000000-0000-0000-0000-000000000001"
-                },
-                "dependencies": [
-                  {
-                    "field": "id__contact",
-                    "action_id": "contact"
-                  }
-                ],
-                "holds": []
-              }
-            ],
             "transformations": [
               {
                 "id": "contact-category",
@@ -829,7 +748,6 @@
                     "path": "/name"
                   }
                 ],
-                "action_id": "contact",
                 "table": "API_Contact",
                 "field": "entityType",
                 "proposed_value": "organization",
@@ -839,7 +757,8 @@
                 "uncertainty": [],
                 "depends_on": [
                   "name"
-                ]
+                ],
+                "record_ref": "contact"
               },
               {
                 "id": "address-designation",
@@ -851,17 +770,213 @@
                     "path": "/address"
                   }
                 ],
-                "action_id": "address-detail",
                 "table": "API_ContactDetail",
                 "field": "entityDesignation",
-                "proposed_value": "Mailing",
+                "proposed_value": "Other",
                 "rationale": "Model-proposed from the referenced original inputs; exact field choice requires separate review.",
                 "guidance_revision": "ownership-proposal-guidance-v2",
                 "catalog_revision": "acre-semantic-2026-10-27.1",
                 "uncertainty": [],
                 "depends_on": [
                   "address"
-                ]
+                ],
+                "record_ref": "address-detail"
+              },
+              {
+                "id": "contact-organizationName",
+                "source_ref": "saved:1",
+                "association_index": 0,
+                "source_inputs": [
+                  {
+                    "source_ref": "saved:1",
+                    "path": "/name"
+                  }
+                ],
+                "table": "API_Contact",
+                "field": "organizationName",
+                "proposed_value": "Example Holdings LLC",
+                "rationale": "Model-proposed from the referenced original inputs; exact field choice requires separate review.",
+                "guidance_revision": "ownership-proposal-guidance-v2",
+                "catalog_revision": "acre-semantic-2026-10-27.1",
+                "uncertainty": [],
+                "depends_on": [
+                  "name"
+                ],
+                "record_ref": "contact"
+              },
+              {
+                "id": "address-detail-entityType",
+                "source_ref": "saved:1",
+                "association_index": 0,
+                "source_inputs": [
+                  {
+                    "source_ref": "saved:1",
+                    "path": "/address"
+                  }
+                ],
+                "table": "API_ContactDetail",
+                "field": "entityType",
+                "proposed_value": "Address",
+                "rationale": "Model-proposed from the referenced original inputs; exact field choice requires separate review.",
+                "guidance_revision": "ownership-proposal-guidance-v2",
+                "catalog_revision": "acre-semantic-2026-10-27.1",
+                "uncertainty": [],
+                "depends_on": [
+                  "address"
+                ],
+                "record_ref": "address-detail"
+              },
+              {
+                "id": "address-detail-addressStreet1",
+                "source_ref": "saved:1",
+                "association_index": 0,
+                "source_inputs": [
+                  {
+                    "source_ref": "saved:1",
+                    "path": "/address"
+                  }
+                ],
+                "table": "API_ContactDetail",
+                "field": "addressStreet1",
+                "proposed_value": "123 Example Street",
+                "rationale": "Model-proposed from the referenced original inputs; exact field choice requires separate review.",
+                "guidance_revision": "ownership-proposal-guidance-v2",
+                "catalog_revision": "acre-semantic-2026-10-27.1",
+                "uncertainty": [],
+                "depends_on": [
+                  "address"
+                ],
+                "record_ref": "address-detail"
+              },
+              {
+                "id": "address-detail-addressCity",
+                "source_ref": "saved:1",
+                "association_index": 0,
+                "source_inputs": [
+                  {
+                    "source_ref": "saved:1",
+                    "path": "/address"
+                  }
+                ],
+                "table": "API_ContactDetail",
+                "field": "addressCity",
+                "proposed_value": "EXAMPLE CITY",
+                "rationale": "Model-proposed from the referenced original inputs; exact field choice requires separate review.",
+                "guidance_revision": "ownership-proposal-guidance-v2",
+                "catalog_revision": "acre-semantic-2026-10-27.1",
+                "uncertainty": [],
+                "depends_on": [
+                  "address"
+                ],
+                "record_ref": "address-detail"
+              },
+              {
+                "id": "address-detail-addressState",
+                "source_ref": "saved:1",
+                "association_index": 0,
+                "source_inputs": [
+                  {
+                    "source_ref": "saved:1",
+                    "path": "/address"
+                  }
+                ],
+                "table": "API_ContactDetail",
+                "field": "addressState",
+                "proposed_value": "WA",
+                "rationale": "Model-proposed from the referenced original inputs; exact field choice requires separate review.",
+                "guidance_revision": "ownership-proposal-guidance-v2",
+                "catalog_revision": "acre-semantic-2026-10-27.1",
+                "uncertainty": [],
+                "depends_on": [
+                  "address"
+                ],
+                "record_ref": "address-detail"
+              },
+              {
+                "id": "address-detail-addressZip",
+                "source_ref": "saved:1",
+                "association_index": 0,
+                "source_inputs": [
+                  {
+                    "source_ref": "saved:1",
+                    "path": "/address"
+                  }
+                ],
+                "table": "API_ContactDetail",
+                "field": "addressZip",
+                "proposed_value": "00000",
+                "rationale": "Model-proposed from the referenced original inputs; exact field choice requires separate review.",
+                "guidance_revision": "ownership-proposal-guidance-v2",
+                "catalog_revision": "acre-semantic-2026-10-27.1",
+                "uncertainty": [],
+                "depends_on": [
+                  "address"
+                ],
+                "record_ref": "address-detail"
+              },
+              {
+                "id": "email-detail-entityType",
+                "source_ref": "saved:1",
+                "association_index": 0,
+                "source_inputs": [
+                  {
+                    "source_ref": "saved:1",
+                    "path": "/email"
+                  }
+                ],
+                "table": "API_ContactDetail",
+                "field": "entityType",
+                "proposed_value": "Email",
+                "rationale": "Model-proposed from the referenced original inputs; exact field choice requires separate review.",
+                "guidance_revision": "ownership-proposal-guidance-v2",
+                "catalog_revision": "acre-semantic-2026-10-27.1",
+                "uncertainty": [],
+                "depends_on": [
+                  "email"
+                ],
+                "record_ref": "email-detail"
+              },
+              {
+                "id": "email-detail-contactInfo_raw",
+                "source_ref": "saved:1",
+                "association_index": 0,
+                "source_inputs": [
+                  {
+                    "source_ref": "saved:1",
+                    "path": "/email"
+                  }
+                ],
+                "table": "API_ContactDetail",
+                "field": "contactInfo_raw",
+                "proposed_value": "person@example.com",
+                "rationale": "Model-proposed from the referenced original inputs; exact field choice requires separate review.",
+                "guidance_revision": "ownership-proposal-guidance-v2",
+                "catalog_revision": "acre-semantic-2026-10-27.1",
+                "uncertainty": [],
+                "depends_on": [
+                  "email"
+                ],
+                "record_ref": "email-detail"
+              }
+            ],
+            "record_targets": [
+              {
+                "ref": "contact",
+                "association_index": 0,
+                "table": "API_Contact",
+                "existing_id": null
+              },
+              {
+                "ref": "address-detail",
+                "association_index": 0,
+                "table": "API_ContactDetail",
+                "existing_id": null
+              },
+              {
+                "ref": "email-detail",
+                "association_index": 0,
+                "table": "API_ContactDetail",
+                "existing_id": null
               }
             ]
           }
@@ -938,87 +1053,6 @@
                 "rationale": "Synthetic source retained for review."
               }
             ],
-            "execution_plan": [
-              {
-                "id": "contact",
-                "table": "API_Contact",
-                "action": "create",
-                "fields": {
-                  "organizationName": "Example Holdings LLC",
-                  "entityType": "organization"
-                },
-                "target_id": null,
-                "duplicate_probe": {
-                  "organizationName": "Example Holdings LLC"
-                },
-                "dependencies": [],
-                "holds": []
-              },
-              {
-                "id": "address-detail",
-                "table": "API_ContactDetail",
-                "action": "create",
-                "fields": {
-                  "entityType": "Address",
-                  "addressStreet1": "123 Example Street",
-                  "addressCity": "EXAMPLE CITY",
-                  "addressState": "WA",
-                  "addressZip": "00000",
-                  "entityDesignation": "Mailing"
-                },
-                "target_id": null,
-                "duplicate_probe": {
-                  "addressStreet1": "123 Example Street"
-                },
-                "dependencies": [
-                  {
-                    "field": "id__contact",
-                    "action_id": "contact"
-                  }
-                ],
-                "holds": []
-              },
-              {
-                "id": "email-detail",
-                "table": "API_ContactDetail",
-                "action": "create",
-                "fields": {
-                  "entityType": "Email",
-                  "contactInfo_raw": "person@example.com"
-                },
-                "target_id": null,
-                "duplicate_probe": {
-                  "entityType": "Email"
-                },
-                "dependencies": [
-                  {
-                    "field": "id__contact",
-                    "action_id": "contact"
-                  }
-                ],
-                "holds": []
-              },
-              {
-                "id": "property-link",
-                "table": "API_JOIN_propertyContact",
-                "action": "create",
-                "fields": {
-                  "id__property": "PRO-00000000-0000-0000-0000-000000000001",
-                  "associationType_list": "Property Manager"
-                },
-                "target_id": null,
-                "duplicate_probe": {
-                  "id__property": "PRO-00000000-0000-0000-0000-000000000001"
-                },
-                "dependencies": [
-                  {
-                    "field": "id__contact",
-                    "action_id": "contact"
-                  }
-                ],
-                "holds": []
-              }
-            ],
             "transformations": [
               {
                 "id": "contact-category",
@@ -1030,7 +1064,6 @@
                     "path": "/name"
                   }
                 ],
-                "action_id": "contact",
                 "table": "API_Contact",
                 "field": "entityType",
                 "proposed_value": "organization",
@@ -1040,7 +1073,8 @@
                 "uncertainty": [],
                 "depends_on": [
                   "name"
-                ]
+                ],
+                "record_ref": "contact"
               },
               {
                 "id": "address-designation",
@@ -1052,17 +1086,213 @@
                     "path": "/address"
                   }
                 ],
-                "action_id": "address-detail",
                 "table": "API_ContactDetail",
                 "field": "entityDesignation",
-                "proposed_value": "Mailing",
+                "proposed_value": "Other",
                 "rationale": "Model-proposed from the referenced original inputs; exact field choice requires separate review.",
                 "guidance_revision": "ownership-proposal-guidance-v2",
                 "catalog_revision": "acre-semantic-2026-10-27.1",
                 "uncertainty": [],
                 "depends_on": [
                   "address"
-                ]
+                ],
+                "record_ref": "address-detail"
+              },
+              {
+                "id": "contact-organizationName",
+                "source_ref": "saved:1",
+                "association_index": 0,
+                "source_inputs": [
+                  {
+                    "source_ref": "saved:1",
+                    "path": "/name"
+                  }
+                ],
+                "table": "API_Contact",
+                "field": "organizationName",
+                "proposed_value": "Example Holdings LLC",
+                "rationale": "Model-proposed from the referenced original inputs; exact field choice requires separate review.",
+                "guidance_revision": "ownership-proposal-guidance-v2",
+                "catalog_revision": "acre-semantic-2026-10-27.1",
+                "uncertainty": [],
+                "depends_on": [
+                  "name"
+                ],
+                "record_ref": "contact"
+              },
+              {
+                "id": "address-detail-entityType",
+                "source_ref": "saved:1",
+                "association_index": 0,
+                "source_inputs": [
+                  {
+                    "source_ref": "saved:1",
+                    "path": "/address"
+                  }
+                ],
+                "table": "API_ContactDetail",
+                "field": "entityType",
+                "proposed_value": "Address",
+                "rationale": "Model-proposed from the referenced original inputs; exact field choice requires separate review.",
+                "guidance_revision": "ownership-proposal-guidance-v2",
+                "catalog_revision": "acre-semantic-2026-10-27.1",
+                "uncertainty": [],
+                "depends_on": [
+                  "address"
+                ],
+                "record_ref": "address-detail"
+              },
+              {
+                "id": "address-detail-addressStreet1",
+                "source_ref": "saved:1",
+                "association_index": 0,
+                "source_inputs": [
+                  {
+                    "source_ref": "saved:1",
+                    "path": "/address"
+                  }
+                ],
+                "table": "API_ContactDetail",
+                "field": "addressStreet1",
+                "proposed_value": "123 Example Street",
+                "rationale": "Model-proposed from the referenced original inputs; exact field choice requires separate review.",
+                "guidance_revision": "ownership-proposal-guidance-v2",
+                "catalog_revision": "acre-semantic-2026-10-27.1",
+                "uncertainty": [],
+                "depends_on": [
+                  "address"
+                ],
+                "record_ref": "address-detail"
+              },
+              {
+                "id": "address-detail-addressCity",
+                "source_ref": "saved:1",
+                "association_index": 0,
+                "source_inputs": [
+                  {
+                    "source_ref": "saved:1",
+                    "path": "/address"
+                  }
+                ],
+                "table": "API_ContactDetail",
+                "field": "addressCity",
+                "proposed_value": "EXAMPLE CITY",
+                "rationale": "Model-proposed from the referenced original inputs; exact field choice requires separate review.",
+                "guidance_revision": "ownership-proposal-guidance-v2",
+                "catalog_revision": "acre-semantic-2026-10-27.1",
+                "uncertainty": [],
+                "depends_on": [
+                  "address"
+                ],
+                "record_ref": "address-detail"
+              },
+              {
+                "id": "address-detail-addressState",
+                "source_ref": "saved:1",
+                "association_index": 0,
+                "source_inputs": [
+                  {
+                    "source_ref": "saved:1",
+                    "path": "/address"
+                  }
+                ],
+                "table": "API_ContactDetail",
+                "field": "addressState",
+                "proposed_value": "WA",
+                "rationale": "Model-proposed from the referenced original inputs; exact field choice requires separate review.",
+                "guidance_revision": "ownership-proposal-guidance-v2",
+                "catalog_revision": "acre-semantic-2026-10-27.1",
+                "uncertainty": [],
+                "depends_on": [
+                  "address"
+                ],
+                "record_ref": "address-detail"
+              },
+              {
+                "id": "address-detail-addressZip",
+                "source_ref": "saved:1",
+                "association_index": 0,
+                "source_inputs": [
+                  {
+                    "source_ref": "saved:1",
+                    "path": "/address"
+                  }
+                ],
+                "table": "API_ContactDetail",
+                "field": "addressZip",
+                "proposed_value": "00000",
+                "rationale": "Model-proposed from the referenced original inputs; exact field choice requires separate review.",
+                "guidance_revision": "ownership-proposal-guidance-v2",
+                "catalog_revision": "acre-semantic-2026-10-27.1",
+                "uncertainty": [],
+                "depends_on": [
+                  "address"
+                ],
+                "record_ref": "address-detail"
+              },
+              {
+                "id": "email-detail-entityType",
+                "source_ref": "saved:1",
+                "association_index": 0,
+                "source_inputs": [
+                  {
+                    "source_ref": "saved:1",
+                    "path": "/email"
+                  }
+                ],
+                "table": "API_ContactDetail",
+                "field": "entityType",
+                "proposed_value": "Email",
+                "rationale": "Model-proposed from the referenced original inputs; exact field choice requires separate review.",
+                "guidance_revision": "ownership-proposal-guidance-v2",
+                "catalog_revision": "acre-semantic-2026-10-27.1",
+                "uncertainty": [],
+                "depends_on": [
+                  "email"
+                ],
+                "record_ref": "email-detail"
+              },
+              {
+                "id": "email-detail-contactInfo_raw",
+                "source_ref": "saved:1",
+                "association_index": 0,
+                "source_inputs": [
+                  {
+                    "source_ref": "saved:1",
+                    "path": "/email"
+                  }
+                ],
+                "table": "API_ContactDetail",
+                "field": "contactInfo_raw",
+                "proposed_value": "person@example.com",
+                "rationale": "Model-proposed from the referenced original inputs; exact field choice requires separate review.",
+                "guidance_revision": "ownership-proposal-guidance-v2",
+                "catalog_revision": "acre-semantic-2026-10-27.1",
+                "uncertainty": [],
+                "depends_on": [
+                  "email"
+                ],
+                "record_ref": "email-detail"
+              }
+            ],
+            "record_targets": [
+              {
+                "ref": "contact",
+                "association_index": 0,
+                "table": "API_Contact",
+                "existing_id": null
+              },
+              {
+                "ref": "address-detail",
+                "association_index": 0,
+                "table": "API_ContactDetail",
+                "existing_id": null
+              },
+              {
+                "ref": "email-detail",
+                "association_index": 0,
+                "table": "API_ContactDetail",
+                "existing_id": null
               }
             ]
           }
@@ -1187,105 +1417,6 @@
                 "rationale": "Review original immutable source text; no phone normalization."
               }
             ],
-            "execution_plan": [
-              {
-                "id": "contact",
-                "table": "API_Contact",
-                "action": "create",
-                "fields": {
-                  "organizationName": "Example Holdings LLC"
-                },
-                "target_id": null,
-                "duplicate_probe": {
-                  "organizationName": "Example Holdings LLC"
-                },
-                "dependencies": [],
-                "holds": []
-              },
-              {
-                "id": "address-detail",
-                "table": "API_ContactDetail",
-                "action": "create",
-                "fields": {
-                  "entityType": "Address",
-                  "addressStreet1": "123 Example Street",
-                  "addressCity": "EXAMPLE CITY",
-                  "addressState": "WA",
-                  "addressZip": "00000"
-                },
-                "target_id": null,
-                "duplicate_probe": {
-                  "addressStreet1": "123 Example Street"
-                },
-                "dependencies": [
-                  {
-                    "field": "id__contact",
-                    "action_id": "contact"
-                  }
-                ],
-                "holds": []
-              },
-              {
-                "id": "email-detail",
-                "table": "API_ContactDetail",
-                "action": "create",
-                "fields": {
-                  "entityType": "Email",
-                  "contactInfo_raw": "person@example.com"
-                },
-                "target_id": null,
-                "duplicate_probe": {
-                  "entityType": "Email"
-                },
-                "dependencies": [
-                  {
-                    "field": "id__contact",
-                    "action_id": "contact"
-                  }
-                ],
-                "holds": []
-              },
-              {
-                "id": "phone-detail",
-                "table": "API_ContactDetail",
-                "action": "create",
-                "fields": {
-                  "entityType": "Phone",
-                  "contactInfo_raw": "+1 (202) 555-0100"
-                },
-                "target_id": null,
-                "duplicate_probe": {
-                  "entityType": "Phone"
-                },
-                "dependencies": [
-                  {
-                    "field": "id__contact",
-                    "action_id": "contact"
-                  }
-                ],
-                "holds": []
-              },
-              {
-                "id": "property-link",
-                "table": "API_JOIN_propertyContact",
-                "action": "create",
-                "fields": {
-                  "id__property": "PRO-00000000-0000-0000-0000-000000000001",
-                  "associationType_list": "Property Manager"
-                },
-                "target_id": null,
-                "duplicate_probe": {
-                  "id__property": "PRO-00000000-0000-0000-0000-000000000001"
-                },
-                "dependencies": [
-                  {
-                    "field": "id__contact",
-                    "action_id": "contact"
-                  }
-                ],
-                "holds": []
-              }
-            ],
             "transformations": [
               {
                 "id": "phone-category",
@@ -1297,7 +1428,6 @@
                     "path": "/generic/phone"
                   }
                 ],
-                "action_id": "phone-detail",
                 "table": "API_ContactDetail",
                 "field": "entityType",
                 "proposed_value": "Phone",
@@ -1307,7 +1437,8 @@
                 "uncertainty": [],
                 "depends_on": [
                   "phone"
-                ]
+                ],
+                "record_ref": "phone-detail"
               },
               {
                 "id": "phone-raw",
@@ -1319,7 +1450,6 @@
                     "path": "/generic/phone"
                   }
                 ],
-                "action_id": "phone-detail",
                 "table": "API_ContactDetail",
                 "field": "contactInfo_raw",
                 "proposed_value": "+1 (202) 555-0100",
@@ -1329,7 +1459,210 @@
                 "uncertainty": [],
                 "depends_on": [
                   "phone"
-                ]
+                ],
+                "record_ref": "phone-detail"
+              },
+              {
+                "id": "contact-organizationName",
+                "source_ref": "saved:1",
+                "association_index": 0,
+                "source_inputs": [
+                  {
+                    "source_ref": "saved:1",
+                    "path": "/name"
+                  }
+                ],
+                "table": "API_Contact",
+                "field": "organizationName",
+                "proposed_value": "Example Holdings LLC",
+                "rationale": "Model-proposed from original phone evidence; exact target requires independent metadata and Approval.",
+                "guidance_revision": "ownership-proposal-guidance-v2",
+                "catalog_revision": "acre-semantic-2026-10-27.1",
+                "uncertainty": [],
+                "depends_on": [
+                  "name"
+                ],
+                "record_ref": "contact"
+              },
+              {
+                "id": "address-detail-entityType",
+                "source_ref": "saved:1",
+                "association_index": 0,
+                "source_inputs": [
+                  {
+                    "source_ref": "saved:1",
+                    "path": "/address"
+                  }
+                ],
+                "table": "API_ContactDetail",
+                "field": "entityType",
+                "proposed_value": "Address",
+                "rationale": "Model-proposed from original phone evidence; exact target requires independent metadata and Approval.",
+                "guidance_revision": "ownership-proposal-guidance-v2",
+                "catalog_revision": "acre-semantic-2026-10-27.1",
+                "uncertainty": [],
+                "depends_on": [
+                  "address"
+                ],
+                "record_ref": "address-detail"
+              },
+              {
+                "id": "address-detail-addressStreet1",
+                "source_ref": "saved:1",
+                "association_index": 0,
+                "source_inputs": [
+                  {
+                    "source_ref": "saved:1",
+                    "path": "/address"
+                  }
+                ],
+                "table": "API_ContactDetail",
+                "field": "addressStreet1",
+                "proposed_value": "123 Example Street",
+                "rationale": "Model-proposed from original phone evidence; exact target requires independent metadata and Approval.",
+                "guidance_revision": "ownership-proposal-guidance-v2",
+                "catalog_revision": "acre-semantic-2026-10-27.1",
+                "uncertainty": [],
+                "depends_on": [
+                  "address"
+                ],
+                "record_ref": "address-detail"
+              },
+              {
+                "id": "address-detail-addressCity",
+                "source_ref": "saved:1",
+                "association_index": 0,
+                "source_inputs": [
+                  {
+                    "source_ref": "saved:1",
+                    "path": "/address"
+                  }
+                ],
+                "table": "API_ContactDetail",
+                "field": "addressCity",
+                "proposed_value": "EXAMPLE CITY",
+                "rationale": "Model-proposed from original phone evidence; exact target requires independent metadata and Approval.",
+                "guidance_revision": "ownership-proposal-guidance-v2",
+                "catalog_revision": "acre-semantic-2026-10-27.1",
+                "uncertainty": [],
+                "depends_on": [
+                  "address"
+                ],
+                "record_ref": "address-detail"
+              },
+              {
+                "id": "address-detail-addressState",
+                "source_ref": "saved:1",
+                "association_index": 0,
+                "source_inputs": [
+                  {
+                    "source_ref": "saved:1",
+                    "path": "/address"
+                  }
+                ],
+                "table": "API_ContactDetail",
+                "field": "addressState",
+                "proposed_value": "WA",
+                "rationale": "Model-proposed from original phone evidence; exact target requires independent metadata and Approval.",
+                "guidance_revision": "ownership-proposal-guidance-v2",
+                "catalog_revision": "acre-semantic-2026-10-27.1",
+                "uncertainty": [],
+                "depends_on": [
+                  "address"
+                ],
+                "record_ref": "address-detail"
+              },
+              {
+                "id": "address-detail-addressZip",
+                "source_ref": "saved:1",
+                "association_index": 0,
+                "source_inputs": [
+                  {
+                    "source_ref": "saved:1",
+                    "path": "/address"
+                  }
+                ],
+                "table": "API_ContactDetail",
+                "field": "addressZip",
+                "proposed_value": "00000",
+                "rationale": "Model-proposed from original phone evidence; exact target requires independent metadata and Approval.",
+                "guidance_revision": "ownership-proposal-guidance-v2",
+                "catalog_revision": "acre-semantic-2026-10-27.1",
+                "uncertainty": [],
+                "depends_on": [
+                  "address"
+                ],
+                "record_ref": "address-detail"
+              },
+              {
+                "id": "email-detail-entityType",
+                "source_ref": "saved:1",
+                "association_index": 0,
+                "source_inputs": [
+                  {
+                    "source_ref": "saved:1",
+                    "path": "/email"
+                  }
+                ],
+                "table": "API_ContactDetail",
+                "field": "entityType",
+                "proposed_value": "Email",
+                "rationale": "Model-proposed from original phone evidence; exact target requires independent metadata and Approval.",
+                "guidance_revision": "ownership-proposal-guidance-v2",
+                "catalog_revision": "acre-semantic-2026-10-27.1",
+                "uncertainty": [],
+                "depends_on": [
+                  "email"
+                ],
+                "record_ref": "email-detail"
+              },
+              {
+                "id": "email-detail-contactInfo_raw",
+                "source_ref": "saved:1",
+                "association_index": 0,
+                "source_inputs": [
+                  {
+                    "source_ref": "saved:1",
+                    "path": "/email"
+                  }
+                ],
+                "table": "API_ContactDetail",
+                "field": "contactInfo_raw",
+                "proposed_value": "person@example.com",
+                "rationale": "Model-proposed from original phone evidence; exact target requires independent metadata and Approval.",
+                "guidance_revision": "ownership-proposal-guidance-v2",
+                "catalog_revision": "acre-semantic-2026-10-27.1",
+                "uncertainty": [],
+                "depends_on": [
+                  "email"
+                ],
+                "record_ref": "email-detail"
+              }
+            ],
+            "record_targets": [
+              {
+                "ref": "contact",
+                "association_index": 0,
+                "table": "API_Contact",
+                "existing_id": null
+              },
+              {
+                "ref": "address-detail",
+                "association_index": 0,
+                "table": "API_ContactDetail",
+                "existing_id": null
+              },
+              {
+                "ref": "email-detail",
+                "association_index": 0,
+                "table": "API_ContactDetail",
+                "existing_id": null
+              },
+              {
+                "ref": "phone-detail",
+                "association_index": 0,
+                "table": "API_ContactDetail",
+                "existing_id": null
               }
             ]
           }
@@ -1438,105 +1771,6 @@
                 "rationale": "Review original immutable source text; no phone normalization."
               }
             ],
-            "execution_plan": [
-              {
-                "id": "contact",
-                "table": "API_Contact",
-                "action": "create",
-                "fields": {
-                  "organizationName": "Example Holdings LLC"
-                },
-                "target_id": null,
-                "duplicate_probe": {
-                  "organizationName": "Example Holdings LLC"
-                },
-                "dependencies": [],
-                "holds": []
-              },
-              {
-                "id": "address-detail",
-                "table": "API_ContactDetail",
-                "action": "create",
-                "fields": {
-                  "entityType": "Address",
-                  "addressStreet1": "123 Example Street",
-                  "addressCity": "EXAMPLE CITY",
-                  "addressState": "WA",
-                  "addressZip": "00000"
-                },
-                "target_id": null,
-                "duplicate_probe": {
-                  "addressStreet1": "123 Example Street"
-                },
-                "dependencies": [
-                  {
-                    "field": "id__contact",
-                    "action_id": "contact"
-                  }
-                ],
-                "holds": []
-              },
-              {
-                "id": "email-detail",
-                "table": "API_ContactDetail",
-                "action": "create",
-                "fields": {
-                  "entityType": "Email",
-                  "contactInfo_raw": "person@example.com"
-                },
-                "target_id": null,
-                "duplicate_probe": {
-                  "entityType": "Email"
-                },
-                "dependencies": [
-                  {
-                    "field": "id__contact",
-                    "action_id": "contact"
-                  }
-                ],
-                "holds": []
-              },
-              {
-                "id": "phone-detail",
-                "table": "API_ContactDetail",
-                "action": "create",
-                "fields": {
-                  "entityType": "Phone",
-                  "contactInfo_raw": "+1 (202) 555-0100"
-                },
-                "target_id": null,
-                "duplicate_probe": {
-                  "entityType": "Phone"
-                },
-                "dependencies": [
-                  {
-                    "field": "id__contact",
-                    "action_id": "contact"
-                  }
-                ],
-                "holds": []
-              },
-              {
-                "id": "property-link",
-                "table": "API_JOIN_propertyContact",
-                "action": "create",
-                "fields": {
-                  "id__property": "PRO-00000000-0000-0000-0000-000000000001",
-                  "associationType_list": "Property Manager"
-                },
-                "target_id": null,
-                "duplicate_probe": {
-                  "id__property": "PRO-00000000-0000-0000-0000-000000000001"
-                },
-                "dependencies": [
-                  {
-                    "field": "id__contact",
-                    "action_id": "contact"
-                  }
-                ],
-                "holds": []
-              }
-            ],
             "transformations": [
               {
                 "id": "phone-category",
@@ -1548,7 +1782,6 @@
                     "path": "/generic/phone"
                   }
                 ],
-                "action_id": "phone-detail",
                 "table": "API_ContactDetail",
                 "field": "entityType",
                 "proposed_value": "Phone",
@@ -1558,7 +1791,8 @@
                 "uncertainty": [],
                 "depends_on": [
                   "phone"
-                ]
+                ],
+                "record_ref": "phone-detail"
               },
               {
                 "id": "phone-raw",
@@ -1570,7 +1804,6 @@
                     "path": "/generic/phone"
                   }
                 ],
-                "action_id": "phone-detail",
                 "table": "API_ContactDetail",
                 "field": "contactInfo_raw",
                 "proposed_value": "+1 (202) 555-0100",
@@ -1580,7 +1813,210 @@
                 "uncertainty": [],
                 "depends_on": [
                   "phone"
-                ]
+                ],
+                "record_ref": "phone-detail"
+              },
+              {
+                "id": "contact-organizationName",
+                "source_ref": "saved:1",
+                "association_index": 0,
+                "source_inputs": [
+                  {
+                    "source_ref": "saved:1",
+                    "path": "/name"
+                  }
+                ],
+                "table": "API_Contact",
+                "field": "organizationName",
+                "proposed_value": "Example Holdings LLC",
+                "rationale": "Model-proposed from original phone evidence; exact target requires independent metadata and Approval.",
+                "guidance_revision": "ownership-proposal-guidance-v2",
+                "catalog_revision": "acre-semantic-2026-10-27.1",
+                "uncertainty": [],
+                "depends_on": [
+                  "name"
+                ],
+                "record_ref": "contact"
+              },
+              {
+                "id": "address-detail-entityType",
+                "source_ref": "saved:1",
+                "association_index": 0,
+                "source_inputs": [
+                  {
+                    "source_ref": "saved:1",
+                    "path": "/address"
+                  }
+                ],
+                "table": "API_ContactDetail",
+                "field": "entityType",
+                "proposed_value": "Address",
+                "rationale": "Model-proposed from original phone evidence; exact target requires independent metadata and Approval.",
+                "guidance_revision": "ownership-proposal-guidance-v2",
+                "catalog_revision": "acre-semantic-2026-10-27.1",
+                "uncertainty": [],
+                "depends_on": [
+                  "address"
+                ],
+                "record_ref": "address-detail"
+              },
+              {
+                "id": "address-detail-addressStreet1",
+                "source_ref": "saved:1",
+                "association_index": 0,
+                "source_inputs": [
+                  {
+                    "source_ref": "saved:1",
+                    "path": "/address"
+                  }
+                ],
+                "table": "API_ContactDetail",
+                "field": "addressStreet1",
+                "proposed_value": "123 Example Street",
+                "rationale": "Model-proposed from original phone evidence; exact target requires independent metadata and Approval.",
+                "guidance_revision": "ownership-proposal-guidance-v2",
+                "catalog_revision": "acre-semantic-2026-10-27.1",
+                "uncertainty": [],
+                "depends_on": [
+                  "address"
+                ],
+                "record_ref": "address-detail"
+              },
+              {
+                "id": "address-detail-addressCity",
+                "source_ref": "saved:1",
+                "association_index": 0,
+                "source_inputs": [
+                  {
+                    "source_ref": "saved:1",
+                    "path": "/address"
+                  }
+                ],
+                "table": "API_ContactDetail",
+                "field": "addressCity",
+                "proposed_value": "EXAMPLE CITY",
+                "rationale": "Model-proposed from original phone evidence; exact target requires independent metadata and Approval.",
+                "guidance_revision": "ownership-proposal-guidance-v2",
+                "catalog_revision": "acre-semantic-2026-10-27.1",
+                "uncertainty": [],
+                "depends_on": [
+                  "address"
+                ],
+                "record_ref": "address-detail"
+              },
+              {
+                "id": "address-detail-addressState",
+                "source_ref": "saved:1",
+                "association_index": 0,
+                "source_inputs": [
+                  {
+                    "source_ref": "saved:1",
+                    "path": "/address"
+                  }
+                ],
+                "table": "API_ContactDetail",
+                "field": "addressState",
+                "proposed_value": "WA",
+                "rationale": "Model-proposed from original phone evidence; exact target requires independent metadata and Approval.",
+                "guidance_revision": "ownership-proposal-guidance-v2",
+                "catalog_revision": "acre-semantic-2026-10-27.1",
+                "uncertainty": [],
+                "depends_on": [
+                  "address"
+                ],
+                "record_ref": "address-detail"
+              },
+              {
+                "id": "address-detail-addressZip",
+                "source_ref": "saved:1",
+                "association_index": 0,
+                "source_inputs": [
+                  {
+                    "source_ref": "saved:1",
+                    "path": "/address"
+                  }
+                ],
+                "table": "API_ContactDetail",
+                "field": "addressZip",
+                "proposed_value": "00000",
+                "rationale": "Model-proposed from original phone evidence; exact target requires independent metadata and Approval.",
+                "guidance_revision": "ownership-proposal-guidance-v2",
+                "catalog_revision": "acre-semantic-2026-10-27.1",
+                "uncertainty": [],
+                "depends_on": [
+                  "address"
+                ],
+                "record_ref": "address-detail"
+              },
+              {
+                "id": "email-detail-entityType",
+                "source_ref": "saved:1",
+                "association_index": 0,
+                "source_inputs": [
+                  {
+                    "source_ref": "saved:1",
+                    "path": "/email"
+                  }
+                ],
+                "table": "API_ContactDetail",
+                "field": "entityType",
+                "proposed_value": "Email",
+                "rationale": "Model-proposed from original phone evidence; exact target requires independent metadata and Approval.",
+                "guidance_revision": "ownership-proposal-guidance-v2",
+                "catalog_revision": "acre-semantic-2026-10-27.1",
+                "uncertainty": [],
+                "depends_on": [
+                  "email"
+                ],
+                "record_ref": "email-detail"
+              },
+              {
+                "id": "email-detail-contactInfo_raw",
+                "source_ref": "saved:1",
+                "association_index": 0,
+                "source_inputs": [
+                  {
+                    "source_ref": "saved:1",
+                    "path": "/email"
+                  }
+                ],
+                "table": "API_ContactDetail",
+                "field": "contactInfo_raw",
+                "proposed_value": "person@example.com",
+                "rationale": "Model-proposed from original phone evidence; exact target requires independent metadata and Approval.",
+                "guidance_revision": "ownership-proposal-guidance-v2",
+                "catalog_revision": "acre-semantic-2026-10-27.1",
+                "uncertainty": [],
+                "depends_on": [
+                  "email"
+                ],
+                "record_ref": "email-detail"
+              }
+            ],
+            "record_targets": [
+              {
+                "ref": "contact",
+                "association_index": 0,
+                "table": "API_Contact",
+                "existing_id": null
+              },
+              {
+                "ref": "address-detail",
+                "association_index": 0,
+                "table": "API_ContactDetail",
+                "existing_id": null
+              },
+              {
+                "ref": "email-detail",
+                "association_index": 0,
+                "table": "API_ContactDetail",
+                "existing_id": null
+              },
+              {
+                "ref": "phone-detail",
+                "association_index": 0,
+                "table": "API_ContactDetail",
+                "existing_id": null
               }
             ]
           }
