@@ -61,9 +61,7 @@ def assert_proposal_refusal(result):
         "must be unique", "out of range", "must match association",
         "duplicate association target", "contains disallowed characters",
         "must reference earlier change with same source_ref and association_index",
-        "duplicate action/table/field target", "key field not accepted",
-        "unknown execution_plan action", "must match execution_plan action",
-        "must equal execution_plan action field",
+        "duplicate record/table/field target", "key field not accepted",
         "must reference change with same source_ref and association_index",
         "generic selector must match source_ref and source_path of dependency",
     }
@@ -73,12 +71,13 @@ def assert_proposal_refusal(result):
 
 @pytest.mark.parametrize("operation", ["propose", "revise"])
 @pytest.mark.parametrize("role", ["Legal owner", "x" * 240])
-def test_owner_role_with_execution_plan_and_transformations_forwards(operation, role, callback):
+def test_owner_role_with_record_targets_and_transformations_forwards(operation, role, callback):
     from model_tools import handle_function_call
 
     request = copy.deepcopy(CONTRACT["transformation_case"]["requests"][0 if operation == "propose" else 1])
     proposal = request["arguments"]["proposal"]
-    assert proposal["execution_plan"] and proposal["transformations"]
+    assert proposal["record_targets"] and proposal["transformations"]
+    assert "execution_plan" not in proposal
     proposal["associations"][0]["role"] = role
     bound = tool.bind_ownership_capability(TOKEN)
     try:
@@ -102,7 +101,7 @@ def test_invalid_role_names_only_failed_field(role, callback):
 @pytest.mark.parametrize("mutation,field", [
     ("missing", "arguments.proposal.evidence_hash"),
     ("extra", "arguments.proposal.associations[]"),
-    ("dynamic", "arguments.proposal.execution_plan[].fields"),
+    ("dynamic", "arguments.proposal.record_targets[]"),
     ("type", "arguments.expected_version"),
 ])
 def test_schema_errors_do_not_echo_customer_values_or_dynamic_keys(mutation, field, callback):
@@ -113,7 +112,7 @@ def test_schema_errors_do_not_echo_customer_values_or_dynamic_keys(mutation, fie
     elif mutation == "extra":
         proposal["associations"][0]["private-customer-key"] = "private-customer-value"
     elif mutation == "dynamic":
-        proposal["execution_plan"][0]["fields"]["private-customer-key"] = True
+        proposal["record_targets"][0]["private-customer-key"] = True
     else:
         request["arguments"]["expected_version"] = "private-customer-value"
     assert json.loads(invoke(request)) == {"error": field + ": not accepted"}
@@ -164,7 +163,7 @@ def app_for(adapter):
 
 
 def test_fixture_identity():
-    assert hashlib.sha256(FIXTURE_BYTES).hexdigest() == "df58c7504823e871f2be2bab50f8fa7244155e70bbe2a22d2869f99ad5da858f"
+    assert hashlib.sha256(FIXTURE_BYTES).hexdigest() == "865fae667152bda786ee79e46218026f41b4f6165fe8b774532344452d74458d"
 
 
 @pytest.mark.parametrize("quiet", [True, False])
@@ -658,9 +657,7 @@ def test_transformations_real_definitions_and_dispatch(operation, callback):
     # An unseen business field remains data; no semantic field allowlist.
     proposal = request["arguments"]["proposal"]
     transform = proposal["transformations"][0]
-    value = proposal["execution_plan"][0]["fields"].pop(transform["field"])
     transform["field"] = "newAgentChosenField"
-    proposal["execution_plan"][0]["fields"][transform["field"]] = value
     bound = tool.bind_ownership_capability(TOKEN)
     try:
         definitions = get_tool_definitions(enabled_toolsets=["atlas_ownership"], quiet_mode=True)
@@ -697,11 +694,6 @@ def invalid_transformation_request(location, value):
         proposal["transformations"].append(duplicate)
     else:
         item[location] = value
-        # Keep an exact action match: refusal must not rely on mismatch alone.
-        if location == "proposed_value":
-            proposal["execution_plan"][0]["fields"][item["field"]] = value
-        if location == "field":
-            proposal["execution_plan"][0]["fields"][value] = item["proposed_value"]
     return request
 
 
@@ -713,7 +705,7 @@ INVALID_TRANSFORMATIONS = [
     ("path", ""), ("path", "name"), ("path", "/bad~2escape"), ("path", "/bad~"),
     ("source_inputs", []), ("source_inputs", [{"source_ref": "saved:1", "path": "/name"}] * 11),
     ("source_ref", "foreign"), ("association_index", True), ("association_index", 1),
-    ("action_id", "unknown"), ("table", "API_User"), ("table", "API_ContactDetail"),
+    ("action_id", "unknown"), ("record_ref", ""), ("record_ref", TOKEN), ("table", "API_User"),
     ("field", "target_id"), ("field", "id"), ("field", "id__contact"),
     ("field", "owner_id"), ("field", "a.b"), ("field", "a" * 102),
     ("proposed_value", ""), ("proposed_value", "   "), ("proposed_value", "x" * 2001),
@@ -741,22 +733,15 @@ def test_invalid_transformations_real_dispatch_refuses_before_callback(location,
     assert not callback[0]
 
 
-@pytest.mark.parametrize("mutation", ["value_mismatch", "field_reuse", "dependency_source",
-                                      "dependency_association", "duplicate_action", "duplicate_change"])
+@pytest.mark.parametrize("mutation", ["dependency_source", "dependency_association", "duplicate_change"])
 def test_transformation_relationships_refused_without_authority(mutation, callback):
     request = copy.deepcopy(CONTRACT["transformation_case"]["requests"][0])
     proposal = request["arguments"]["proposal"]
     item = proposal["transformations"][0]
-    if mutation == "value_mismatch":
-        proposal["execution_plan"][0]["fields"][item["field"]] = "different"
-    elif mutation == "field_reuse":
-        item["field"] = "organizationName"  # Value elsewhere grants no field reuse.
-    elif mutation == "dependency_source":
+    if mutation == "dependency_source":
         proposal["changes"][0]["source_ref"] = "other"
     elif mutation == "dependency_association":
         proposal["changes"][0]["association_index"] = 1
-    elif mutation == "duplicate_action":
-        proposal["execution_plan"].append(copy.deepcopy(proposal["execution_plan"][0]))
     else:
         proposal["changes"].append(copy.deepcopy(proposal["changes"][0]))
     bound = tool.bind_ownership_capability(TOKEN)
@@ -773,7 +758,6 @@ def test_transformation_value_codepoint_bound_and_text_preserved(value, callback
     proposal = request["arguments"]["proposal"]
     item = proposal["transformations"][0]
     item["proposed_value"] = value
-    proposal["execution_plan"][0]["fields"][item["field"]] = value
     # Selectors only: escaped JSON Pointer keys remain literal for Atlas to resolve.
     item["source_inputs"][0]["path"] = "/a~1b/~0name"
     bound = tool.bind_ownership_capability(TOKEN)
@@ -792,11 +776,8 @@ def test_transformation_count_and_envelope_byte_caps(callback):
     for i in range(100):
         item = copy.deepcopy(original)
         item.update(id=f"transform{i}", field=f"field{i}", proposed_value="😀" * 2000)
-        proposal["execution_plan"][0]["fields"][item["field"]] = item["proposed_value"]
         proposal["transformations"].append(item)
-    # Keep maps within bounds while exceeding the enclosing byte cap.
-    proposal["execution_plan"][0]["fields"].pop(original["field"])
-    proposal["execution_plan"][0]["fields"].pop("organizationName")
+    # Exceed the enclosing byte cap while each transformation remains valid.
     bound = tool.bind_ownership_capability(TOKEN)
     try:
         assert tool._matches({"operation": "propose", **request["arguments"]}, tool._PROPOSAL_TOOL_SCHEMA)
@@ -908,7 +889,8 @@ def test_generic_pointer_escaping_and_bound_forward_without_local_resolution(pat
     proposal = request["arguments"]["proposal"]
     proposal["changes"][-2]["source_path"] = path
     for item in proposal["transformations"]:
-        item["source_inputs"][0]["path"] = path
+        if item["record_ref"] == "phone-detail":
+            item["source_inputs"][0]["path"] = path
     bound = tool.bind_ownership_capability(TOKEN)
     try:
         assert json.loads(invoke(request)) == success("propose")
@@ -1130,17 +1112,12 @@ def test_generic_rule_reasons_are_value_free_and_retryable(operation, location, 
 
 @pytest.mark.parametrize("operation", ["propose", "revise"])
 @pytest.mark.parametrize("mutation,reason", [
-    ("duplicate_action", "execution_plan[].id: must be unique"),
     ("duplicate_change", "changes[].id: must be unique"),
     ("duplicate_id", "transformations[1].id: must be unique"),
-    ("duplicate_target", "transformations[1].field: duplicate action/table/field target"),
+    ("duplicate_target", "transformations[1].field: duplicate record/table/field target"),
     ("unsafe_value", "transformations[0].proposed_value: contains disallowed characters"),
     ("association_index", "transformations[0].association_index: out of range"),
     ("source_ref", "transformations[0].source_ref: must match association"),
-    ("action_id", "transformations[0].action_id: unknown execution_plan action"),
-    ("table", "transformations[0].table: must match execution_plan action"),
-    ("value", "transformations[0].proposed_value: must equal execution_plan action field"),
-    ("field", "transformations[0].proposed_value: must equal execution_plan action field"),
     ("dependency_unknown", "transformations[0].depends_on: must reference change with same source_ref and association_index"),
     ("dependency_source", "transformations[0].depends_on: must reference change with same source_ref and association_index"),
     ("dependency_association", "transformations[0].depends_on: must reference change with same source_ref and association_index"),
@@ -1153,8 +1130,8 @@ def test_transformation_rule_reasons_are_value_free_and_retryable(operation, mut
     original = copy.deepcopy(args["proposal"])
     proposal = args["proposal"]
     item = proposal["transformations"][0]
-    if mutation in {"duplicate_action", "duplicate_change"}:
-        entries = proposal["execution_plan" if mutation == "duplicate_action" else "changes"]
+    if mutation == "duplicate_change":
+        entries = proposal["changes"]
         entries.append(copy.deepcopy(entries[0]))
     elif mutation in {"duplicate_id", "duplicate_target"}:
         duplicate = copy.deepcopy(item)
@@ -1169,10 +1146,9 @@ def test_transformation_rule_reasons_are_value_free_and_retryable(operation, mut
                 "private-source" if mutation == "dependency_source" else 1)
     elif mutation == "unsafe_value":
         item["proposed_value"] = "private-value\u200b"
-        proposal["execution_plan"][0]["fields"][item["field"]] = item["proposed_value"]
     else:
         item[{"value": "proposed_value"}.get(mutation, mutation)] = {
-            "association_index": 1, "source_ref": "private-source", "action_id": "private-action",
+            "association_index": 1, "source_ref": "private-source", "record_ref": "private-record",
             "table": "API_ContactDetail", "value": "private-value", "field": "privateField",
         }[mutation]
     assert tool._matches(args, tool._PROPOSAL_TOOL_SCHEMA)
@@ -1191,6 +1167,129 @@ def test_transformation_rule_reasons_are_value_free_and_retryable(operation, mut
 def test_first_local_rule_wins_without_echoing_values(callback):
     request = invalid_generic_request("association_index", 1)
     request["arguments"]["proposal"]["changes"][3]["source_ref"] = "private-source"
-    request["arguments"]["proposal"]["transformations"][0]["action_id"] = "private-action"
+    request["arguments"]["proposal"]["transformations"][0]["record_ref"] = "private-record"
     assert json.loads(invoke(request)) == {"error": "changes[3].association_index: out of range"}
     assert not callback[0]
+
+
+@pytest.mark.parametrize("operation", ["propose", "revise"])
+@pytest.mark.parametrize("existing_id", [None, "existing-contact"])
+@pytest.mark.parametrize("person", [False, True])
+def test_semantic_targets_real_dispatch_and_definitions(operation, existing_id, person, callback):
+    from model_tools import get_tool_definitions, handle_function_call
+
+    request = copy.deepcopy(CONTRACT["transformation_case"]["requests"][operation == "revise"])
+    proposal = request["arguments"]["proposal"]
+    proposal["associations"][0]["contact_id"] = existing_id
+    proposal["record_targets"][0]["existing_id"] = existing_id
+    if existing_id:
+        proposal["transformations"] = [t for t in proposal["transformations"] if t["record_ref"] != "contact"]
+    elif person:
+        template = copy.deepcopy(proposal["transformations"][0])
+        proposal["transformations"] = [t for t in proposal["transformations"] if t["record_ref"] != "contact"]
+        for field, value in (("nameFirst", "Example"), ("nameLast", "Person")):
+            proposal["transformations"].append({**template, "id": field, "field": field, "proposed_value": value})
+    assert "execution_plan" not in proposal
+    bound = tool.bind_ownership_capability(TOKEN)
+    try:
+        definitions = get_tool_definitions(enabled_toolsets=["atlas_ownership"], quiet_mode=True)
+        parameters = next(d["function"]["parameters"] for d in definitions
+                          if d["function"]["name"] == "atlas_ownership_proposal")
+        schema = parameters["properties"]["proposal"]
+        assert "execution_plan" not in schema["required"]
+        target = schema["properties"]["record_targets"]["items"]
+        assert target["additionalProperties"] is False
+        assert set(target["required"]) == {"ref", "association_index", "table", "existing_id"}
+        assert target["properties"]["existing_id"]["nullable"] is True
+        transform = schema["properties"]["transformations"]["items"]
+        assert "record_ref" in transform["required"]
+        assert "action_id" not in transform["properties"]
+        assert json.loads(handle_function_call("atlas_ownership_proposal", {
+            "operation": operation, **request["arguments"]})) == success(operation)
+    finally:
+        tool.clear_ownership_capability(bound)
+    assert len(callback[0]) == 1
+    assert json.loads(callback[0][0].content) == request
+
+
+@pytest.mark.parametrize("field,value", [
+    ("ref", ""), ("ref", "x" * 161), ("ref", TOKEN),
+    ("association_index", True), ("association_index", -1),
+    ("table", "API_User"), ("existing_id", True), ("existing_id", ""),
+    ("existing_id", TOKEN), ("existing_id", "x" * 161),
+    ("owner_id", "private-value"), ("fields", {"organizationName": "forged"}),
+    ("duplicate_probe", {}), ("dependencies", []), ("action_id", "forged"),
+])
+def test_record_target_invalid_shape_refuses_before_callback(field, value, callback):
+    request = copy.deepcopy(CONTRACT["transformation_case"]["requests"][0])
+    request["arguments"]["proposal"]["record_targets"][0][field] = value
+    bound = tool.bind_ownership_capability(TOKEN)
+    try:
+        assert_proposal_refusal(json.loads(invoke(request)))
+    finally:
+        tool.clear_ownership_capability(bound)
+    assert not callback[0]
+
+
+@pytest.mark.parametrize("field", ["ref", "association_index", "table", "existing_id"])
+def test_record_target_requires_every_slot(field, callback):
+    request = copy.deepcopy(CONTRACT["transformation_case"]["requests"][0])
+    del request["arguments"]["proposal"]["record_targets"][0][field]
+    assert json.loads(invoke(request)) == {"error": f"arguments.proposal.record_targets[].{field}: not accepted"}
+    assert not callback[0]
+
+
+@pytest.mark.parametrize("targets", [{}, [None], [dict(ref="c", association_index=0,
+                         table="API_Contact", existing_id=None)] * 101])
+def test_record_targets_container_bounds(targets, callback):
+    request = copy.deepcopy(CONTRACT["transformation_case"]["requests"][0])
+    request["arguments"]["proposal"]["record_targets"] = targets
+    assert_proposal_refusal(json.loads(invoke(request)))
+    assert not callback[0]
+
+
+@pytest.mark.parametrize("mutation", ["record_ref", "table", "field", "value", "no_targets"])
+def test_semantic_resolution_is_delegated_to_atlas(mutation, callback):
+    # Hermes checks the transport; Atlas resolves targets, catalog and exact
+    # values. None of these proposals needs a parallel model-written plan.
+    request = copy.deepcopy(CONTRACT["transformation_case"]["requests"][0])
+    proposal = request["arguments"]["proposal"]
+    if mutation == "no_targets":
+        proposal["record_targets"] = []
+    else:
+        proposal["transformations"][0][{"value": "proposed_value"}.get(mutation, mutation)] = {
+            "record_ref": "unknown", "table": "API_ContactDetail", "field": "newField", "value": "new value",
+        }[mutation]
+    refusal = {"protocol": CONTRACT["protocol"], "ok": False,
+               "error": {"code": "OWNERSHIP_EVIDENCE_MISMATCH", "rule": "transformation_record_target_match"}}
+    callback[1][0] = lambda req: httpx.Response(200, json=refusal)
+    bound = tool.bind_ownership_capability(TOKEN)
+    try:
+        assert json.loads(invoke(request)) == refusal
+    finally:
+        tool.clear_ownership_capability(bound)
+    assert json.loads(callback[0][0].content) == request
+
+
+@pytest.mark.parametrize("case", ["transformation_case", "generic_case"])
+def test_semantic_fixture_has_complete_field_groups_and_atlas_owned_joins(case):
+    for request in CONTRACT[case]["requests"]:
+        proposal = request["arguments"]["proposal"]
+        assert "execution_plan" not in proposal
+        targets = {t["ref"]: t for t in proposal["record_targets"]}
+        fields = {ref: {} for ref in targets}
+        for item in proposal["transformations"]:
+            target = targets[item["record_ref"]]
+            assert (item["table"], item["association_index"]) == (target["table"], target["association_index"])
+            assert item["field"] not in fields[item["record_ref"]]
+            fields[item["record_ref"]][item["field"]] = item["proposed_value"]
+        for ref, target in targets.items():
+            record = fields[ref]
+            if target["table"] == "API_Contact":
+                assert "organizationName" in record or {"nameFirst", "nameLast"} <= record.keys()
+            elif target["table"] == "API_ContactDetail":
+                assert "entityType" in record
+                assert ("addressStreet1" if record["entityType"] == "Address" else "contactInfo_raw") in record
+            else:
+                assert target["table"] == "API_JOIN_propertyContact" and not record
+                assert proposal["associations"][target["association_index"]]["role"]
