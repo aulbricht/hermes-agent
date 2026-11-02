@@ -977,12 +977,6 @@
                 "association_index": 0,
                 "table": "API_ContactDetail",
                 "existing_id": null
-              },
-              {
-                "ref": "property-link",
-                "association_index": 0,
-                "table": "API_JOIN_propertyContact",
-                "existing_id": null
               }
             ]
           }
@@ -1298,12 +1292,6 @@
                 "ref": "email-detail",
                 "association_index": 0,
                 "table": "API_ContactDetail",
-                "existing_id": null
-              },
-              {
-                "ref": "property-link",
-                "association_index": 0,
-                "table": "API_JOIN_propertyContact",
                 "existing_id": null
               }
             ]
@@ -1675,12 +1663,6 @@
                 "association_index": 0,
                 "table": "API_ContactDetail",
                 "existing_id": null
-              },
-              {
-                "ref": "property-link",
-                "association_index": 0,
-                "table": "API_JOIN_propertyContact",
-                "existing_id": null
               }
             ]
           }
@@ -2034,12 +2016,6 @@
                 "ref": "phone-detail",
                 "association_index": 0,
                 "table": "API_ContactDetail",
-                "existing_id": null
-              },
-              {
-                "ref": "property-link",
-                "association_index": 0,
-                "table": "API_JOIN_propertyContact",
                 "existing_id": null
               }
             ]

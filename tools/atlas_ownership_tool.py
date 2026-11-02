@@ -116,7 +116,7 @@ _TRANSFORMATION_SCHEMA = _object({
         "path": {**_text(240), "pattern": r"^(?:/(?:[^~]|~[01])*)+$"},
     }), 10), "minItems": 1},
     "record_ref": _text(160),
-    "table": _ACTION_SCHEMA["properties"]["table"],
+    "table": {"type": "string", "enum": ["API_Contact", "API_ContactDetail"]},
     "field": {**_text(101), "pattern": r"^(?!id__)[A-Za-z][A-Za-z0-9_]{0,100}$",
               "not": {"enum": sorted(_AUTHORITY_KEYS | {"target_id"})}},
     "proposed_value": {**_text(2000), "description": "Model-proposed text, never observed evidence. Controls, format characters, surrogates, invisible fillers and variation selectors are refused unchanged."},
@@ -139,8 +139,6 @@ _PROPOSAL_SCHEMA = _object({
     "unresolved_questions": _array(_text(), 10),
     "changes": _array(_CHANGE_SCHEMA, 100),
     "record_targets": _array(_RECORD_TARGET_SCHEMA, 100),
-    # Legacy proposals remain transportable; new proposals leave compilation to Atlas.
-    "execution_plan": {**_array(_ACTION_SCHEMA, 100), "minItems": 1},
     "transformations": _array(_TRANSFORMATION_SCHEMA, 100),
 }, ["property_id", "evidence_hash", "associations", "unresolved_questions"])
 _READ_SCHEMA = _object({
@@ -406,7 +404,7 @@ registry.register(
 )
 registry.register(
     name="atlas_ownership_proposal", toolset="atlas_ownership",
-    schema={"name": "atlas_ownership_proposal", "description": "Submit a held ownership proposal or immutable correction revision. Revise requires base_revision and correction_text; propose omits them. Use record_targets (ref, association_index, table, existing_id) and per-field transformations with record_ref. Atlas compiles the plan. Contact names need nameFirst plus nameLast, or organizationName. Each ContactDetail needs entityType plus contactInfo_raw (email/phone) or addressStreet1 (address). Include a join target; Atlas fills its fields from the association role. existing_id is null for new records; an existing Contact must match association.contact_id. Existing-record updates are held by Atlas. Generic changes select original text through source_path within immutable observation.values.generic; proposed_value must equal the original or be null (held), possible_cleaned_value is null. Atlas resolves and verifies evidence. Every writable generic use requires an exact field-bound transformation with a matching source_path dependency. Optional transformations retain source selectors, exact record/table/field/value, rationale and guidance/catalog revisions for review; they are model proposals, never observed evidence. Business references must match bound evidence; Atlas validates scope. Never approves or executes.",
+    schema={"name": "atlas_ownership_proposal", "description": "Submit a held ownership proposal or immutable correction revision. Revise requires base_revision and correction_text; propose omits them. Use record_targets (ref, association_index, table, existing_id) and per-field transformations with record_ref. Atlas compiles the plan. Contact names need nameFirst plus nameLast, or organizationName. Each ContactDetail needs entityType plus contactInfo_raw (email/phone) or addressStreet1 (address). existing_id is null for new records; an existing Contact must match association.contact_id. Create new records only; transformations on existing records and detail or join targets with existing_id are refused in this slice. Generic changes select original text through source_path within immutable observation.values.generic; proposed_value must equal the original or be null (held), possible_cleaned_value is null. Atlas resolves and verifies evidence. Every writable generic use requires an exact field-bound transformation with a matching source_path dependency. Optional transformations retain source selectors, exact record/table/field/value, rationale and guidance/catalog revisions for review; they are model proposals, never observed evidence. Business references must match bound evidence; Atlas validates scope. Never approves or executes.",
             "parameters": _PROPOSAL_TOOL_SCHEMA},
     handler=_handle_atlas_ownership_proposal, max_result_size_chars=_MAX_RESPONSE_BYTES,
 )

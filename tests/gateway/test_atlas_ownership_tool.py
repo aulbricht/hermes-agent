@@ -163,7 +163,7 @@ def app_for(adapter):
 
 
 def test_fixture_identity():
-    assert hashlib.sha256(FIXTURE_BYTES).hexdigest() == "865fae667152bda786ee79e46218026f41b4f6165fe8b774532344452d74458d"
+    assert hashlib.sha256(FIXTURE_BYTES).hexdigest() == "309630027ee99d0fc08a440667643a8fb844652e96acf6c040b9dc2f5bf30b8f"
 
 
 @pytest.mark.parametrize("quiet", [True, False])
@@ -228,7 +228,12 @@ def test_valid_fixture_references_reach_fixed_callback_unchanged(wire_request, c
     observed, _ = callback
     bound = tool.bind_ownership_capability(TOKEN)
     try:
-        assert json.loads(invoke(request)) == success(request["operation"])
+        result = json.loads(invoke(request))
+        if "execution_plan" in request["arguments"].get("proposal", {}):
+            assert_proposal_refusal(result)
+            assert not observed
+            return
+        assert result == success(request["operation"])
     finally:
         tool.clear_ownership_capability(bound)
     assert len(observed) == 1
@@ -267,34 +272,22 @@ def test_execution_plan_schema_and_real_dispatch_preserve_agent_choices(operatio
     from model_tools import get_tool_definitions, handle_function_call
 
     request = copy.deepcopy(CONTRACT["requests"][2 if operation == "propose" else 3])
-    # A previously unseen field name passes only inside the two bounded maps.
-    # Hermes transports agent choices; it does not maintain a field allowlist.
-    action = request["arguments"]["proposal"]["execution_plan"][0]
-    action["fields"]["agentChosenField"] = "Agent chosen value"
-    action["duplicate_probe"]["agentChosenField"] = "Agent chosen value"
     bound = tool.bind_ownership_capability(TOKEN)
     try:
         definitions = get_tool_definitions(enabled_toolsets=["atlas_ownership"], quiet_mode=True)
         parameters = next(d["function"]["parameters"] for d in definitions
                           if d["function"]["name"] == "atlas_ownership_proposal")
         args = {"operation": operation, **request["arguments"]}
-        # Definitions are provider-sanitized (nullable unions become hints).
-        # Validate raw arguments against the handler's schema, and check the
-        # emitted schema still offers plans/maps and nullable business IDs.
-        assert tool._matches(args, tool._PROPOSAL_TOOL_SCHEMA)
+        # Model-written plans are absent from definitions and refused even
+        # when a provider sends an old contract request anyway.
+        assert not tool._matches(args, tool._PROPOSAL_TOOL_SCHEMA)
         emitted = parameters["properties"]["proposal"]["properties"]
-        action_schema = emitted["execution_plan"]["items"]
-        for slot in ("fields", "duplicate_probe"):
-            assert action_schema["properties"][slot]["additionalProperties"]["type"] == "string"
-            assert action_schema["properties"][slot]["properties"] == {}
+        assert "execution_plan" not in emitted
         assert emitted["associations"]["items"]["properties"]["contact_id"]["nullable"] is True
-        assert action_schema["properties"]["target_id"]["nullable"] is True
-        assert json.loads(handle_function_call("atlas_ownership_proposal", args)) == success(operation)
+        assert_proposal_refusal(json.loads(handle_function_call("atlas_ownership_proposal", args)))
     finally:
         tool.clear_ownership_capability(bound)
-    observed, _ = callback
-    assert len(observed) == 1
-    assert json.loads(observed[0].content) == request
+    assert not callback[0]
     assert not tool.ownership_capability_available()
 
 
@@ -324,10 +317,17 @@ def test_optional_plan_and_scoped_update_reference_forward_unchanged(operation, 
         del proposal["execution_plan"]
     bound = tool.bind_ownership_capability(TOKEN)
     try:
-        assert json.loads(invoke(request)) == success(operation)
+        result = json.loads(invoke(request))
+        if with_plan:
+            assert_proposal_refusal(result)
+        else:
+            assert result == success(operation)
     finally:
         tool.clear_ownership_capability(bound)
-    assert json.loads(callback[0][0].content) == request
+    if with_plan:
+        assert not callback[0]
+    else:
+        assert json.loads(callback[0][0].content) == request
 
 
 @pytest.mark.parametrize("location,value", [
@@ -705,7 +705,7 @@ INVALID_TRANSFORMATIONS = [
     ("path", ""), ("path", "name"), ("path", "/bad~2escape"), ("path", "/bad~"),
     ("source_inputs", []), ("source_inputs", [{"source_ref": "saved:1", "path": "/name"}] * 11),
     ("source_ref", "foreign"), ("association_index", True), ("association_index", 1),
-    ("action_id", "unknown"), ("record_ref", ""), ("record_ref", TOKEN), ("table", "API_User"),
+    ("action_id", "unknown"), ("record_ref", ""), ("record_ref", TOKEN), ("table", "API_User"), ("table", "API_JOIN_propertyContact"),
     ("field", "target_id"), ("field", "id"), ("field", "id__contact"),
     ("field", "owner_id"), ("field", "a.b"), ("field", "a" * 102),
     ("proposed_value", ""), ("proposed_value", "   "), ("proposed_value", "x" * 2001),
@@ -941,7 +941,8 @@ def test_generic_count_unicode_and_enclosing_byte_limits(callback):
     assert len(callback[0]) == 1
 
 
-STREAM_CASES = [(index, {"status": 200, "body": success(request["operation"])})
+STREAM_CASES = [(index, {"local_refusal": True} if "execution_plan" in request["arguments"].get("proposal", {})
+                else {"status": 200, "body": success(request["operation"])})
                 for index, request in enumerate(WIRE_REQUESTS)]
 STREAM_CASES += [(invalid_generic_request(location, value), {"local_refusal": True})
                  for location, value in [("extra", "owner_id"), ("source_path", "/email"),
@@ -1196,7 +1197,7 @@ def test_semantic_targets_real_dispatch_and_definitions(operation, existing_id, 
         parameters = next(d["function"]["parameters"] for d in definitions
                           if d["function"]["name"] == "atlas_ownership_proposal")
         schema = parameters["properties"]["proposal"]
-        assert "execution_plan" not in schema["required"]
+        assert "execution_plan" not in schema["properties"]
         target = schema["properties"]["record_targets"]["items"]
         assert target["additionalProperties"] is False
         assert set(target["required"]) == {"ref", "association_index", "table", "existing_id"}
@@ -1272,10 +1273,11 @@ def test_semantic_resolution_is_delegated_to_atlas(mutation, callback):
 
 
 @pytest.mark.parametrize("case", ["transformation_case", "generic_case"])
-def test_semantic_fixture_has_complete_field_groups_and_atlas_owned_joins(case):
+def test_semantic_fixture_has_complete_field_groups_without_join_targets(case):
     for request in CONTRACT[case]["requests"]:
         proposal = request["arguments"]["proposal"]
         assert "execution_plan" not in proposal
+        assert all(t["table"] != "API_JOIN_propertyContact" for t in proposal["record_targets"])
         targets = {t["ref"]: t for t in proposal["record_targets"]}
         fields = {ref: {} for ref in targets}
         for item in proposal["transformations"]:
@@ -1290,6 +1292,26 @@ def test_semantic_fixture_has_complete_field_groups_and_atlas_owned_joins(case):
             elif target["table"] == "API_ContactDetail":
                 assert "entityType" in record
                 assert ("addressStreet1" if record["entityType"] == "Address" else "contactInfo_raw") in record
-            else:
-                assert target["table"] == "API_JOIN_propertyContact" and not record
-                assert proposal["associations"][target["association_index"]]["role"]
+
+
+@pytest.mark.parametrize("operation", ["propose", "revise"])
+def test_model_plan_with_record_targets_never_dispatches(operation, callback):
+    from model_tools import handle_function_call
+
+    request = copy.deepcopy(CONTRACT["transformation_case"]["requests"][operation == "revise"])
+    request["arguments"]["proposal"]["execution_plan"] = copy.deepcopy(
+        CONTRACT["requests"][2]["arguments"]["proposal"]["execution_plan"])
+    bound = tool.bind_ownership_capability(TOKEN)
+    try:
+        assert_proposal_refusal(json.loads(handle_function_call("atlas_ownership_proposal", {
+            "operation": operation, **request["arguments"]})))
+    finally:
+        tool.clear_ownership_capability(bound)
+    assert not callback[0]
+
+
+def test_all_fixture_proposals_omit_join_record_targets():
+    for request in WIRE_REQUESTS:
+        proposal = request["arguments"].get("proposal", {})
+        assert all(target["table"] != "API_JOIN_propertyContact"
+                   for target in proposal.get("record_targets", []))
