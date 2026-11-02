@@ -18,7 +18,9 @@ _capability: ContextVar[str] = ContextVar("atlas_ownership_capability", default=
 _CALLBACK = "http://127.0.0.1:8243/api/v1/internal/ownership-tool"
 _PROTOCOL = "acre.ownership-tool.v1"
 _MAX_REQUEST_BYTES = 131072
-_MAX_RESPONSE_BYTES = 32768
+# Match Atlas's 64 KB non-catalog response cap (acre-atlas PR 289) so evidence
+# over 32 KB is not cut on the Hermes side.
+_MAX_RESPONSE_BYTES = 65536
 # Atlas's real catalog envelope is ~48 KB. Match its existing 64 KB ceiling
 # with headroom; 32 KB was a generic transport bound, not a catalog constraint.
 _MAX_CATALOG_RESPONSE_BYTES = 65536
