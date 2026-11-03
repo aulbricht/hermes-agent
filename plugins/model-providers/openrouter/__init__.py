@@ -76,7 +76,7 @@ class OpenRouterProfile(ProviderProfile):
     def build_extra_body(
         self, *, session_id: str | None = None, **context: Any
     ) -> dict[str, Any]:
-        body: dict[str, Any] = {}
+        body: dict[str, Any] = {"usage": {"include": True}}
         if session_id:
             body["session_id"] = session_id
         prefs = context.get("provider_preferences")

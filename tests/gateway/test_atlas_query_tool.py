@@ -72,6 +72,17 @@ def test_no_capability_means_no_dispatch(monkeypatch):
     assert call("catalog") == UNAVAILABLE
 
 
+def test_missing_operation_can_be_repaired_without_implicit_dispatch(callback):
+    observed, _ = callback
+    args = {"arguments": {"reply": {"question": "How many properties do we have in Spokane Valley?"}}}
+    result = json.loads(tool._handle_atlas_query(args))
+    assert "missing operation" in result["error"]
+    assert '"operation":"validate"' in result["error"]
+    assert observed == []
+    assert json.loads(tool._handle_atlas_query({"operation": "validate", **args})) == {"status": "ready"}
+    assert len(observed) == 1
+
+
 @pytest.mark.parametrize("operation,arguments", [
     ("catalog", {}), ("catalog", {"entities": ["lease"]}),
     ("validate", {"reply": {"schema_version": 3, "status": "ready"}}), ("execute", {}),

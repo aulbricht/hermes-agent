@@ -81,6 +81,8 @@ def _arguments_valid(operation, arguments):
 
 def _handle_atlas_query(args: dict, **_kwargs) -> str:
     token = _capability.get()
+    if token and type(args) is dict and "operation" not in args:
+        return json.dumps({"error": 'missing operation: send {"operation":"validate","arguments":{"reply":...}}; use operation=catalog for lookup or operation=execute for the last validated plan'})
     if (not token or type(args) is not dict or set(args) != {"operation", "arguments"}
             or args["operation"] not in {"catalog", "validate", "execute"}
             or type(args["arguments"]) is not dict

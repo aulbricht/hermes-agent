@@ -1757,6 +1757,7 @@ def run_conversation(
                         "cache_write_tokens": truncated_usage.cache_write_tokens,
                         "reasoning_tokens": truncated_usage.reasoning_tokens,
                         "actual_cost_usd": actual_cost,
+                        "estimated_cost_usd": float(cost_result.amount_usd) if cost_result.amount_usd is not None else None,
                         "upstream_cost_usd": upstream_cost,
                         **_atlas_route_usage_fields(agent),
                     }
@@ -2380,6 +2381,7 @@ def run_conversation(
                         "cache_write_tokens": canonical_usage.cache_write_tokens,
                         "reasoning_tokens": canonical_usage.reasoning_tokens,
                         "actual_cost_usd": float(_actual_cost) if _actual_cost is not None else None,
+                        "estimated_cost_usd": float(cost_result.amount_usd) if cost_result.amount_usd is not None else None,
                         "upstream_cost_usd": float(_upstream_cost) if _upstream_cost is not None else None,
                         **_atlas_route_usage_fields(agent),
                         **(openai_usage_fields(response) if os.environ.get("ATLAS_MODEL_ROUTING_ENABLED") == "true" and agent.api_mode == "codex_responses" else {}),
