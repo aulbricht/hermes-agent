@@ -110,7 +110,7 @@ class TestOpenRouterProfile:
     def test_extra_body_no_prefs(self):
         p = get_provider_profile("openrouter")
         body = p.build_extra_body()
-        assert body == {}
+        assert body == {"usage": {"include": True}}
 
     def test_pareto_min_coding_score_emitted_for_pareto_model(self):
         """min_coding_score → plugins block when model is openrouter/pareto-code."""

@@ -108,6 +108,15 @@ class TestKimiProfileParity:
 
 
 class TestOpenRouterProfileParity:
+    def test_requests_usage_accounting_without_losing_preferences(self, transport):
+        kwargs = transport.build_kwargs(
+            model="test/model", messages=_msgs(), tools=None,
+            provider_profile=get_provider_profile("openrouter"),
+            provider_preferences={"allow": ["test"]},
+        )
+        assert kwargs["extra_body"]["usage"] == {"include": True}
+        assert kwargs["extra_body"]["provider"] == {"allow": ["test"]}
+
     def test_provider_preferences(self, transport):
         prefs = {"allow": ["anthropic"]}
         legacy = transport.build_kwargs(

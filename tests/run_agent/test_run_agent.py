@@ -7931,3 +7931,33 @@ class TestMemoryProviderTurnStart:
         # The extracted body uses ``agent.X`` rather than ``self.X``;
         # assert the extracted-form spelling directly.
         assert "on_turn_start(agent._user_turn_count" in src
+
+
+@pytest.mark.parametrize("actual", [None, 0.0, 0.0012])
+@pytest.mark.parametrize("finish", ["stop", "length"])
+def test_per_call_usage_preserves_provider_charge_cache_buckets_and_estimate(agent, actual, finish):
+    from decimal import Decimal
+    from agent.usage_pricing import CostResult
+
+    response = _mock_response(
+        content="Done." if finish == "stop" else None, finish_reason=finish,
+        usage={"prompt_tokens": 8400, "completion_tokens": 20, "total_tokens": 8420,
+               "prompt_tokens_details": SimpleNamespace(cached_tokens=8397), "cost": actual},
+    )
+    response.id = "gen-usage-fixture"
+    agent.client.chat.completions.create.return_value = response
+    agent.api_mode = "chat_completions"
+    with (
+        patch("agent.conversation_loop.estimate_usage_cost", return_value=CostResult(
+            amount_usd=Decimal("0.0015"), status="estimated", source="provider_models_api", label="fixture")),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        agent.run_conversation("Synthetic question")
+    call = agent.session_usage_calls[0]
+    assert call["actual_cost_usd"] == actual
+    assert call["estimated_cost_usd"] == 0.0015
+    assert call["input_tokens"] + call["cache_read_tokens"] + call["cache_write_tokens"] == 8400
+    assert call["cache_read_tokens"] == 8397
+    assert call["output_tokens"] == 20
