@@ -153,7 +153,7 @@ def test_transport_error_does_not_leak_authorization(callback, caplog):
     assert TOKEN not in caplog.text
 
 
-def test_create_agent_scopes_query_turns_to_the_query_tool_four_iterations_and_an_output_cap():
+def test_create_agent_scopes_query_turns_to_the_query_tool_eight_iterations_and_an_output_cap():
     pytest.importorskip("aiohttp")
     from gateway.config import PlatformConfig
     from gateway.platforms.api_server import APIServerAdapter
@@ -172,13 +172,13 @@ def test_create_agent_scopes_query_turns_to_the_query_tool_four_iterations_and_a
         assert agent.call_args.kwargs["max_iterations"] == 90
         assert agent.call_args.kwargs.get("max_tokens") is None
         assert agent.return_value.no_iteration_summary is not True
-        assert agent.return_value.max_provider_requests != 4
+        assert agent.return_value.max_provider_requests != 8
         adapter._create_agent(atlas_query_authorized=True, toolset_scope=["web", "terminal"])
         assert agent.call_args.kwargs["enabled_toolsets"] == ["atlas_query"]
-        assert agent.call_args.kwargs["max_iterations"] == 4
+        assert agent.call_args.kwargs["max_iterations"] == 8
         assert agent.call_args.kwargs["max_tokens"] == 4096
         assert agent.return_value.no_iteration_summary is True
-        assert agent.return_value.max_provider_requests == 4
+        assert agent.return_value.max_provider_requests == 8
 
 
 @pytest.mark.asyncio
