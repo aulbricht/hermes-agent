@@ -110,8 +110,10 @@ MAX_STORED_RESPONSES = 100
 # tokens (reasoning included). A truncation retry may raise one request's limit to the
 # loop's 32,768-token ceiling. Worst case at the Luna price of $0.50 per million output
 # tokens (Atlas sol_budget.MODEL_PRICES): 8 x 32,768 x $0.50 / 1,000,000 = $0.131072 of
-# output, leaving $0.118928 for input: about 1.2 million tokens at $0.10 per million, far
-# beyond one request's context. SDK-level transport retries inside one request are not
+# output, leaving $0.118928 for input: about 1.2 million tokens at $0.10 per million summed
+# over all eight requests. Input stays well below that only because Atlas bounds tool-result
+# growth (MAX_TOOL_CALLS and the 32,768-byte result cap in query_tool_capability.py); raising
+# either, or this turn count, needs this budget re-checked. SDK-level transport retries inside one request are not
 # counted here; Atlas still checks the receipt afterwards and settles an overrun as
 # limit_exceeded.
 ATLAS_QUERY_MAX_TURNS = 8

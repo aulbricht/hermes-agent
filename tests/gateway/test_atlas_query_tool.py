@@ -153,7 +153,7 @@ def test_transport_error_does_not_leak_authorization(callback, caplog):
     assert TOKEN not in caplog.text
 
 
-def test_create_agent_scopes_query_turns_to_the_query_tool_four_iterations_and_an_output_cap():
+def test_create_agent_scopes_query_turns_to_the_query_tool_eight_iterations_and_an_output_cap():
     pytest.importorskip("aiohttp")
     from gateway.config import PlatformConfig
     from gateway.platforms.api_server import APIServerAdapter
