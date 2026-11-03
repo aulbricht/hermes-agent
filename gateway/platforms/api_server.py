@@ -102,19 +102,19 @@ def _hermes_version() -> str:
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8642
 MAX_STORED_RESPONSES = 100
-# Atlas Query turns: Allen's ruling (2026-10-31) allows four model turns per question
+# Atlas Query turns: Allen's ruling (2026-11-03, raised from four) allows eight model turns per question
 # within Atlas's $0.25 cap. The bound is on provider requests, enforced at dispatch:
-# the agent refuses to send a fifth request however it got there (a new turn, a
+# the agent refuses to send a ninth request however it got there (a new turn, a
 # truncation retry, a continuation or a fallback), and compaction is a no-op for it, so
 # no auxiliary summary request is made. Each request asks for at most 4,096 output
 # tokens (reasoning included). A truncation retry may raise one request's limit to the
 # loop's 32,768-token ceiling. Worst case at the Luna price of $0.50 per million output
-# tokens (Atlas sol_budget.MODEL_PRICES): 4 x 32,768 x $0.50 / 1,000,000 = $0.065536 of
-# output, leaving $0.184464 for input: about 1.8 million tokens at $0.10 per million, far
+# tokens (Atlas sol_budget.MODEL_PRICES): 8 x 32,768 x $0.50 / 1,000,000 = $0.131072 of
+# output, leaving $0.118928 for input: about 1.2 million tokens at $0.10 per million, far
 # beyond one request's context. SDK-level transport retries inside one request are not
 # counted here; Atlas still checks the receipt afterwards and settles an overrun as
 # limit_exceeded.
-ATLAS_QUERY_MAX_TURNS = 4
+ATLAS_QUERY_MAX_TURNS = 8
 ATLAS_QUERY_TURN_MAX_OUTPUT_TOKENS = 4096
 MAX_REQUEST_BYTES = 10_000_000  # 10 MB — accommodates long agent conversations with tool calls
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
