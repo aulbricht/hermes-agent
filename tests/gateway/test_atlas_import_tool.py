@@ -185,6 +185,9 @@ def test_proposal_tool_exposes_required_typed_payload_to_the_model():
     shape = proposal["properties"]["change_set"]["description"]
     for needle in ("API_JOIN_tenantLease", "never a bare name", "optionally dependencies", "plain number"):
         assert needle in shape
+    # SNO-1648: the lease's tenantName is auto-entered by FileMaker; the Tenant update target is the read id.
+    for needle in ("never carries tenantName", "dependency on id__tenant", "(not record_id)", "names the field"):
+        assert needle in shape
     schema_text = json.dumps(definitions)
     for retired in ('"propose"', '"revise"', '"proposal"', "expected_plan_hash"):
         assert retired not in schema_text
