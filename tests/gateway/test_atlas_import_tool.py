@@ -193,6 +193,24 @@ def test_proposal_tool_refuses_retired_and_empty_operations_before_callback():
             "operation": operation, "property_id": "PRO-" + "a" * 36, "proposal": {}}))
 
 
+def test_formerly_valid_revise_with_hash_makes_no_callback():
+    seen = []
+    client = httpx.Client(transport=httpx.MockTransport(
+        lambda request: (seen.append(request), httpx.Response(200, json={"accepted": True}))[1]),
+        follow_redirects=False)
+    bound = tool.bind_import_capability("atimp_" + "9" * 32)
+    try:
+        with patch.object(tool.httpx, "Client", return_value=client):
+            result = json.loads(tool._handle_atlas_import_proposal({
+                "operation": "revise", "property_id": "PRO-" + "a" * 36,
+                "proposal": {"rows": [], "unmapped": [], "warnings": []},
+                "expected_plan_hash": "h" * 64}))
+    finally:
+        tool.clear_import_capability(bound)
+    assert result == {"error": "Invalid import proposal"}
+    assert seen == []
+
+
 def test_import_tool_rejects_oversized_callback_response():
     client = httpx.Client(transport=httpx.MockTransport(
         lambda _request: httpx.Response(200, content=b"x" * 32_769)),
