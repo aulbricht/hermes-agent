@@ -175,7 +175,7 @@ registry.register(
             "properties": {
                 "operation": {"type": "string", "enum": sorted(_PROPOSAL_OPERATIONS)},
                 "property_id": {"type": "string", "description": "Exact verified PRO-... Property ID returned by atlas_import lookup."},
-                "change_set": {"type": "array", "description": "Ordered actions, each with id, table, action (create|update), target_id (null for create), citation, fields ({name: {value}}) and dependencies ([{field, action_id}]). property_id is empty for a new Property.",
+                "change_set": {"type": "array", "description": "Ordered actions. Each action has exactly: id (unique string), table (the exact catalog name starting with API_, e.g. API_Property, API_Tenant, API_JOIN_tenantLease; never a bare name like Tenant or Lease), action (create|update), target_id (null for create, the verified record id for update), citation (one id from the evidence lines), fields ({field_name: {\"value\": ...}}; value is a string or a plain number, numbers sent as plain digits with no currency symbol or commas) and optionally dependencies ([{field, action_id}] naming an id__ field to fill from the id of an earlier action in this set; omit or send [] when there are none). property_id is empty for a new Property.",
                                "items": {"type": "object"}},
             },
             "required": ["operation", "property_id", "change_set"],

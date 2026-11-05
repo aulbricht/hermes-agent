@@ -181,6 +181,10 @@ def test_proposal_tool_exposes_required_typed_payload_to_the_model():
     atlas_operations = {"evidence", "catalog", "lookup", "change_set"}
     offered = set(read["properties"]["operation"]["enum"]) | set(proposal["properties"]["operation"]["enum"])
     assert offered == atlas_operations
+    # SNO-1643: the model must be told the exact shape Atlas validates.
+    shape = proposal["properties"]["change_set"]["description"]
+    for needle in ("API_JOIN_tenantLease", "never a bare name", "optionally dependencies", "plain number"):
+        assert needle in shape
     schema_text = json.dumps(definitions)
     for retired in ('"propose"', '"revise"', '"proposal"', "expected_plan_hash"):
         assert retired not in schema_text
