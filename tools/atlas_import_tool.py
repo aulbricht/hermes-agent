@@ -16,59 +16,9 @@ _READ_ARGUMENT_KEYS = {
     "catalog": {"logical_ids"},
     "lookup": {"property_query", "property_id", "tenant_names"},
 }
-_PROPOSAL_OPERATIONS = {"propose", "revise", "change_set"}
+_PROPOSAL_OPERATIONS = {"change_set"}
 _MAX_REQUEST_BYTES = 128 * 1024
 _MAX_RESPONSE_BYTES = 32_768
-
-# The provider builds function arguments from this schema. An unstructured
-# `arguments: {type: object}` caused proposal calls to arrive as `{}` in a
-# live import turn; the proposal now has its own required top-level fields.
-_PROPOSAL_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "rows": {"type": "array", "items": {
-            "type": "object",
-            "properties": {
-                "row_id": {"type": "string", "description": "Unique ID for this proposed source row."},
-                "source_label": {"type": "string", "description": "Exact named occupant label found in cited source evidence."},
-                "source_evidence": {"type": "array", "items": {"type": "string"},
-                                    "description": "Citation IDs returned by the evidence operation."},
-                "record_type": {"type": "string", "description": "Verified destination entity from the catalog."},
-                "action": {"type": "string", "enum": ["create", "update"]},
-                "record_id": {"type": "string", "description": "Verified existing record ID for an update."},
-                "match_resolution": {"type": "string", "description": "Verified match choice when needed."},
-                "fields": {"type": "array", "items": {
-                    "type": "object",
-                    "properties": {
-                        "field": {"type": "string", "description": "Verified physical field name from the catalog."},
-                        "value": {"type": "string", "description": "Proposed Acre value as text."},
-                        "source_value": {"type": "string", "description": "Exact value present in each cited source line."},
-                        "source_evidence": {"type": "array", "items": {"type": "string"}},
-                        "transformation": {"type": "string", "description": "Catalog-permitted conversion, such as copy or monthly_x_12."},
-                    },
-                    "required": ["field", "value", "source_value", "source_evidence", "transformation"],
-                    "additionalProperties": False,
-                }},
-            },
-            "required": ["row_id", "source_label", "source_evidence", "record_type", "action", "fields"],
-            "additionalProperties": False,
-        }},
-        "unmapped": {"type": "array", "items": {
-            "type": "object",
-            "properties": {
-                "label": {"type": "string"},
-                "value": {"type": "string"},
-                "evidence": {"type": "string", "description": "Citation ID for an excluded source fact."},
-                "reason": {"type": "string"},
-            },
-            "required": ["label", "value", "evidence"],
-            "additionalProperties": False,
-        }},
-        "warnings": {"type": "array", "items": {"type": "string"}},
-    },
-    "required": ["rows", "unmapped", "warnings"],
-    "additionalProperties": False,
-}
 
 _READ_ARGUMENTS_SCHEMA = {
     "type": "object",
@@ -186,20 +136,12 @@ def _handle_atlas_import(args: dict, **_kwargs) -> str:
 
 
 def _handle_atlas_import_proposal(args: dict, **_kwargs) -> str:
-    if isinstance(args, dict) and args.get("operation") == "change_set":
-        # Same callback and capability as propose/revise; Atlas validates the set.
-        if (not isinstance(args.get("property_id"), str) or not isinstance(args.get("change_set"), list)
-                or set(args) - {"operation", "property_id", "change_set"}):
-            return json.dumps({"error": "Invalid import proposal"})
-        return _forward_operation("change_set", {"property_id": args["property_id"], "change_set": args["change_set"]})
-    if (not isinstance(args, dict) or args.get("operation") not in _PROPOSAL_OPERATIONS
-            or not isinstance(args.get("property_id"), str)
-            or not isinstance(args.get("proposal"), dict)
-            or (args["operation"] == "revise" and not isinstance(args.get("expected_plan_hash"), str))
-            or set(args) - {"operation", "property_id", "proposal", "expected_plan_hash"}):
+    # Atlas accepts exactly {operation, arguments}; arguments are validated there.
+    if (not isinstance(args, dict) or args.get("operation") != "change_set"
+            or not isinstance(args.get("property_id"), str) or not isinstance(args.get("change_set"), list)
+            or set(args) - {"operation", "property_id", "change_set"}):
         return json.dumps({"error": "Invalid import proposal"})
-    arguments = {key: args[key] for key in ("property_id", "proposal", "expected_plan_hash") if key in args}
-    return _forward_operation(args["operation"], arguments)
+    return _forward_operation("change_set", {"property_id": args["property_id"], "change_set": args["change_set"]})
 
 
 registry.register(
@@ -227,18 +169,16 @@ registry.register(
     toolset="atlas_import",
     schema={
         "name": "atlas_import_proposal",
-        "description": "Submit a cited, review-only mapping proposal or revision for the current authorized import job. Use verified Property and catalog IDs. Validation creates a user Approval preview; this tool cannot approve or execute writes.",
+        "description": "Submit a cited, review-only change set for the current authorized import job. Use verified Property and catalog IDs. Validation creates a user Approval preview; this tool cannot approve or execute writes.",
         "parameters": {
             "type": "object",
             "properties": {
                 "operation": {"type": "string", "enum": sorted(_PROPOSAL_OPERATIONS)},
                 "property_id": {"type": "string", "description": "Exact verified PRO-... Property ID returned by atlas_import lookup."},
-                "proposal": _PROPOSAL_SCHEMA,
-                "expected_plan_hash": {"type": "string", "description": "Exact current plan hash; required for revise."},
-                "change_set": {"type": "array", "description": "operation=change_set only: ordered actions, each with id, table, action (create|update), target_id (null for create), citation, fields ({name: {value}}) and dependencies ([{field, action_id}]). property_id is empty for a new Property.",
+                "change_set": {"type": "array", "description": "Ordered actions, each with id, table, action (create|update), target_id (null for create), citation, fields ({name: {value}}) and dependencies ([{field, action_id}]). property_id is empty for a new Property.",
                                "items": {"type": "object"}},
             },
-            "required": ["operation", "property_id"],
+            "required": ["operation", "property_id", "change_set"],
             "additionalProperties": False,
         },
     },
