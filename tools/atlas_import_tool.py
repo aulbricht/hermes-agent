@@ -139,9 +139,11 @@ def _handle_atlas_import_proposal(args: dict, **_kwargs) -> str:
     # Atlas accepts exactly {operation, arguments}; arguments are validated there.
     if (not isinstance(args, dict) or args.get("operation") != "change_set"
             or not isinstance(args.get("property_id"), str) or not isinstance(args.get("change_set"), list)
-            or set(args) - {"operation", "property_id", "change_set"}):
+            or ("unmapped" in args and not isinstance(args["unmapped"], list))
+            or set(args) - {"operation", "property_id", "change_set", "unmapped"}):
         return json.dumps({"error": "Invalid import proposal"})
-    return _forward_operation("change_set", {"property_id": args["property_id"], "change_set": args["change_set"]})
+    return _forward_operation("change_set", {"property_id": args["property_id"], "change_set": args["change_set"],
+                                             **({"unmapped": args["unmapped"]} if "unmapped" in args else {})})
 
 
 registry.register(
@@ -175,8 +177,15 @@ registry.register(
             "properties": {
                 "operation": {"type": "string", "enum": sorted(_PROPOSAL_OPERATIONS)},
                 "property_id": {"type": "string", "description": "Exact verified PRO-... Property ID returned by atlas_import lookup."},
-                "change_set": {"type": "array", "description": "Ordered actions. Each action has exactly: id (unique string), table (the exact catalog name starting with API_, e.g. API_Property, API_Tenant, API_JOIN_tenantLease; never a bare name like Tenant or Lease), action (create|update), target_id (null for create, the verified record id for update), citation (one id from the evidence lines), fields ({field_name: {\"value\": ...}}; value is a string or a plain number, numbers sent as plain digits with no currency symbol or commas) and optionally dependencies ([{field, action_id}] naming an id__ field to fill from the id of an earlier action in this set; omit or send [] when there are none). Send only fields a person types: never a field FileMaker fills in itself. In particular a lease never carries tenantName; FileMaker copies it from id__tenant, so link the lease to its Tenant with a dependency on id__tenant. To rename or fix an existing Tenant, call lookup with tenant_names first and use that Tenant's id (not record_id) as target_id; Atlas only accepts Tenant ids it read itself, and a refusal names the field to remove. property_id is empty for a new Property.",
+                "change_set": {"type": "array", "description": "Ordered actions. Each action has exactly: id (unique string), table (the exact catalog name starting with API_, e.g. API_Property, API_Tenant, API_JOIN_tenantLease; never a bare name like Tenant or Lease), action (create|update), target_id (null for create, the verified record id for update), citation (one id from the evidence lines), fields ({field_name: {\"value\": ...}}; value is a string or a plain number, numbers sent as plain digits with no currency symbol or commas) and optionally dependencies ([{field, action_id}] naming an id__ field to fill from the id of an earlier action in this set; omit or send [] when there are none). Send only fields a person types: never a field FileMaker fills in itself. In particular a lease never carries tenantName; FileMaker copies it from id__tenant, so link the lease to its Tenant with a dependency on id__tenant. To rename or fix an existing Tenant, call lookup with tenant_names first and use that Tenant's id (not record_id) as target_id; Atlas only accepts Tenant ids it read itself, and a refusal names the field to remove. For a stated total building SF, propose API_Property.gla on the verified existing Property, distinct from individual lease SF; do not sum occupied suites. property_id is empty for a new Property.",
                                "items": {"type": "object"}},
+                "unmapped": {"type": "array", "maxItems": 200,
+                             "description": "Always include every source fact you read but cannot map to an Acre destination. These appear visibly on the Approval as Not added to Acre, with value and source page. Include vacant suites with SF, storage without a lease, lease type, pro forma rent, rent increases and occupancy when unsupported. Do not invent fields or create a Tenant for a vacancy or unleased storage. Use [] only when every fact read is mapped. If a limit prevents a complete proposal, ask for clarification instead of silently dropping facts.",
+                             "items": {"type": "object", "properties": {
+                                 "fact": {"type": "string", "maxLength": 200},
+                                 "value": {"type": "string", "maxLength": 2000},
+                                 "citation": {"type": "string", "description": "Exact id from evidence lines; Atlas supplies the source quote."}},
+                                 "required": ["fact", "value", "citation"], "additionalProperties": False}},
             },
             "required": ["operation", "property_id", "change_set"],
             "additionalProperties": False,
