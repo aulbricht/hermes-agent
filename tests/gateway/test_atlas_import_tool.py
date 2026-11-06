@@ -176,7 +176,7 @@ def test_proposal_tool_exposes_required_typed_payload_to_the_model():
         frozenset({"property_query", "property_id", "tenant_names"})}
     assert proposal["required"] == ["operation", "property_id", "change_set"]
     assert proposal["properties"]["operation"]["enum"] == ["change_set"]
-    assert set(proposal["properties"]) == {"operation", "property_id", "change_set"}
+    assert set(proposal["properties"]) == {"operation", "property_id", "change_set", "unmapped"}
     # Mirrors apps/atlas-dashboard/backend/atlas/import_tool_capability.py OPERATIONS.
     atlas_operations = {"evidence", "catalog", "lookup", "change_set"}
     offered = set(read["properties"]["operation"]["enum"]) | set(proposal["properties"]["operation"]["enum"])
@@ -253,3 +253,30 @@ def test_change_set_refuses_the_wrong_payload_before_callback():
                  {"operation": "change_set", "property_id": "", "change_set": {}},
                  {"operation": "change_set", "property_id": "", "change_set": [], "proposal": {}}):
         assert "error" in json.loads(tool._handle_atlas_import_proposal(args))
+
+
+def test_unmapped_facts_reach_atlas_without_loss_or_executable_actions():
+    facts = [{"fact": "Vacant suite D", "value": "3,000 SF", "citation": "p2-l4"},
+             {"fact": "Lease type", "value": "NNN", "citation": "p2-l8"}]
+    seen = []
+    client = httpx.Client(transport=httpx.MockTransport(
+        lambda request: (seen.append(json.loads(request.content)), httpx.Response(200, json={"accepted": True}))[1]))
+    bound = tool.bind_import_capability("atimp_" + "a" * 32)
+    try:
+        with patch.object(tool.httpx, "Client", return_value=client):
+            result = json.loads(tool._handle_atlas_import_proposal({
+                "operation": "change_set", "property_id": "PRO-test", "change_set": [{"id": "lease"}], "unmapped": facts}))
+    finally:
+        tool.clear_import_capability(bound)
+    assert result == {"accepted": True}
+    assert seen == [{"operation": "change_set", "arguments": {
+        "property_id": "PRO-test", "change_set": [{"id": "lease"}], "unmapped": facts}}]
+
+
+def test_unmapped_must_be_a_list_before_callback():
+    with patch.object(tool, "_forward_operation") as forward:
+        for bad in (None, {}, "vacancy"):
+            assert json.loads(tool._handle_atlas_import_proposal({
+                "operation": "change_set", "property_id": "", "change_set": [], "unmapped": bad})) == {
+                    "error": "Invalid import proposal"}
+        forward.assert_not_called()
