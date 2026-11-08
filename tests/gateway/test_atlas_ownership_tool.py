@@ -666,7 +666,7 @@ def test_transformations_real_definitions_and_dispatch(operation, callback):
         entry = schema["properties"]["proposal"]["properties"]["transformations"]["items"]
         assert entry["additionalProperties"] is False
         assert entry["properties"]["source_inputs"]["items"]["additionalProperties"] is False
-        assert set(entry["required"]) == set(transform)
+        assert set(entry["required"]) == set(transform) - {"depends_on", "guidance_revision", "catalog_revision"}
         assert json.loads(handle_function_call("atlas_ownership_proposal", {
             "operation": operation, **request["arguments"]})) == success(operation)
     finally:
@@ -699,7 +699,8 @@ def invalid_transformation_request(location, value):
 
 INVALID_TRANSFORMATIONS = [
     ("transformations", {}), ("transformations", [None]),
-    ("missing", "rationale"), ("missing", "guidance_revision"), ("missing", "catalog_revision"),
+    ("missing", "rationale"), ("missing", "record_ref"),
+    ("guidance_revision", ""), ("catalog_revision", ""),
     ("extra", "unknown"), ("extra", "target_id"), ("extra", "owner_id"),
     ("input_extra", "value"), ("input_extra", "work_id"), ("input_extra", "callback_url"),
     ("path", ""), ("path", "name"), ("path", "/bad~2escape"), ("path", "/bad~"),

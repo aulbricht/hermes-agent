@@ -25,6 +25,9 @@ _MAX_RESPONSE_BYTES = 65536
 # with headroom; 32 KB was a generic transport bound, not a catalog constraint.
 _MAX_CATALOG_RESPONSE_BYTES = 65536
 _UNAVAILABLE = '{"error":"Ownership operation unavailable"}'
+_RULE_CODES = frozenset({
+    "OWNERSHIP_EVIDENCE_MISMATCH", "OWNERSHIP_SHAPE_INVALID", "OWNERSHIP_TOO_LARGE",
+})
 _ERROR_CODES = frozenset({
     "OWNERSHIP_OPERATION_INVALID", "OWNERSHIP_TURN_REQUIRED", "OWNERSHIP_UNAVAILABLE",
     "OWNERSHIP_STATE_CHANGED", "OWNERSHIP_SHAPE_INVALID", "OWNERSHIP_EVIDENCE_MISMATCH",
@@ -127,7 +130,10 @@ _TRANSFORMATION_SCHEMA = _object({
     "catalog_revision": _text(160),
     "uncertainty": _array(_text(2000), 10),
     "depends_on": {**_array(_text(160), 100), "minItems": 1, "uniqueItems": True},
-})
+}, [
+    "id", "source_ref", "association_index", "source_inputs", "record_ref",
+    "table", "field", "proposed_value", "rationale", "uncertainty",
+])
 _PROPOSAL_SCHEMA = _object({
     "property_id": _text(160),
     "evidence_hash": _text(160),
@@ -305,7 +311,8 @@ def _transformations_error(proposal):
             return path + ".association_index: out of range"
         if proposal["associations"][index]["source_ref"] != item["source_ref"]:
             return path + ".source_ref: must match association"
-        for dependency in item["depends_on"]:
+        dependencies = item.get("depends_on", [])
+        for dependency in dependencies:
             change = changes.get(dependency)
             if (change is None or change["source_ref"] != item["source_ref"]
                     or change["association_index"] != index):
@@ -313,9 +320,9 @@ def _transformations_error(proposal):
         for selector in item["source_inputs"]:
             if selector["path"].startswith("/generic/"):
                 if (selector["source_ref"] != item["source_ref"]
-                        or not any(changes[dep]["kind"] == "generic"
-                                   and changes[dep]["source_path"] == selector["path"]
-                                   for dep in item["depends_on"])):
+                        or (dependencies and not any(changes[dep]["kind"] == "generic"
+                                                     and changes[dep]["source_path"] == selector["path"]
+                                                     for dep in dependencies))):
                     return path + ".source_inputs: generic selector must match source_ref and source_path of dependency"
         seen_ids.add(item["id"])
         seen_targets.add(target)
@@ -332,7 +339,7 @@ def _response_valid(value, operation):
         error = value.get("error")
         return (set(value) == {"protocol", "ok", "error"} and type(error) is dict
                 and (set(error) == {"code"} or (set(error) == {"code", "rule"}
-                     and error.get("code") == "OWNERSHIP_EVIDENCE_MISMATCH"
+                     and error.get("code") in _RULE_CODES
                      and type(error["rule"]) is str
                      and re.fullmatch(r"[a-z][a-z0-9_]{0,95}", error["rule"]) is not None))
                 and type(error["code"]) is str
