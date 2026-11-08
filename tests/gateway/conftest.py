@@ -249,6 +249,8 @@ _ensure_discord_mock()
 # ---------------------------------------------------------------------------
 
 _GATEWAY_DIR = Path(__file__).resolve().parent
+if str(_GATEWAY_DIR) not in sys.path:
+    sys.path.insert(0, str(_GATEWAY_DIR))
 _GUARD_HINT = (
     "Plugin adapter tests must use "
     "``from tests.gateway._plugin_adapter_loader import load_plugin_adapter`` "
