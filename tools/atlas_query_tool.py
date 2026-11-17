@@ -27,7 +27,7 @@ _HTTP_ERRORS = {
     429: '{"error":"Query tool limit reached"}',
     409: '{"error":"Validate a plan before executing it"}',
 }
-_TOKEN = re.compile(r"(?:atqry_|atown_|atimp_)[A-Za-z0-9_-]{32,128}")
+_TOKEN = re.compile(r"(?:atqry_|atown_|atimp_|atmail_)[A-Za-z0-9_-]{32,128}")
 
 _SCHEMA = {
     "type": "object",
