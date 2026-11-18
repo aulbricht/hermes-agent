@@ -56,6 +56,8 @@ _TAINT_REFUSED = '{"error":"Web tools are switched off after reading email in th
 TAINT_BLOCKED_TOOLSETS = frozenset({
     "web", "browser", "browser-cdp", "terminal", "code_execution", "vision", "image_gen",
     "homeassistant", "delegation", "cronjob", "x_search", "video", "video_gen",
+    # Mail read earlier in the session must not steer an Acre import proposal either.
+    "atlas_import",
 })
 
 

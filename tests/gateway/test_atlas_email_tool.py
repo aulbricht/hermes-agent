@@ -259,7 +259,6 @@ def test_create_agent_adds_the_email_tool_without_narrowing_ambient_tools():
 @pytest.mark.parametrize("fields", [
     {"atlas_email_capability": "bad"}, {"atlas_email_capability": 42},
     {"atlas_email_capability": "atqry_" + "a" * 32},
-    {"atlas_email_capability": TOKEN, "atlas_import_capability": "atimp_" + "a" * 32},
     {"atlas_email_capability": TOKEN, "atlas_ownership_capability": "atown_" + "a" * 32},
     {"atlas_email_capability": TOKEN, "atlas_query_capability": "atqry_" + "a" * 32},
 ])
@@ -316,6 +315,61 @@ async def test_stream_binds_a_valid_email_capability_and_passes_it_on(tmp_path):
         assert captured and captured[0]["atlas_email_capability"] == TOKEN
     finally:
         db.close()
+
+
+@pytest.mark.asyncio
+async def test_stream_accepts_email_alongside_import_and_passes_both_on(tmp_path):
+    pytest.importorskip("aiohttp")
+    from aiohttp import web
+    from aiohttp.test_utils import TestClient, TestServer
+    from gateway.config import PlatformConfig
+    from gateway.platforms.api_server import APIServerAdapter
+    from hermes_state import SessionDB
+    db = SessionDB(tmp_path / "sessions.db")
+    adapter = APIServerAdapter(PlatformConfig(enabled=True))
+    adapter._session_db = db
+    app = web.Application()
+    app.router.add_post("/api/sessions/{session_id}/chat/stream", adapter._handle_session_chat_stream)
+    sid = db.create_session("import-email", "api_server")
+    captured = []
+    imp = "atimp_" + "a" * 32
+
+    async def fake_run(*args, **kwargs):
+        captured.append(kwargs)
+        return {"final_response": "ok", "messages": []}, {}
+
+    try:
+        with patch.object(adapter, "_run_agent", side_effect=fake_run):
+            async with TestClient(TestServer(app)) as client:
+                response = await client.post(f"/api/sessions/{sid}/chat/stream", json={
+                    "message": "test", "atlas_email_capability": TOKEN, "atlas_import_capability": imp})
+                assert response.status == 200
+                await response.text()
+        assert captured and captured[0]["atlas_email_capability"] == TOKEN
+        assert captured[0]["atlas_import_capability"] == imp
+    finally:
+        db.close()
+
+
+def test_create_agent_gives_import_turns_both_import_and_email_tools():
+    pytest.importorskip("aiohttp")
+    from gateway.config import PlatformConfig
+    from gateway.platforms.api_server import APIServerAdapter
+    adapter = APIServerAdapter(PlatformConfig(enabled=True))
+    with patch("gateway.run._resolve_runtime_agent_kwargs", return_value={
+            "api_key": "synthetic", "base_url": None, "provider": None,
+            "api_mode": None, "command": None, "args": []}), \
+         patch("gateway.run._resolve_gateway_model", return_value="test/model"), \
+         patch("gateway.run._load_gateway_config", return_value={}), \
+         patch("hermes_cli.tools_config._get_platform_tools",
+               return_value={"web", "atlas_import", "atlas_ownership", "atlas_query", "atlas_email"}), \
+         patch("gateway.run._current_max_iterations", return_value=90), \
+         patch("run_agent.AIAgent") as agent:
+        adapter._create_agent(atlas_import_authorized=True, atlas_email_authorized=True)
+        assert sorted(agent.call_args.kwargs["enabled_toolsets"]) == ["atlas_email", "atlas_import", "web"]
+        adapter._create_agent(atlas_import_authorized=True, atlas_email_authorized=True, atlas_email_mailbox_tainted=True)
+        # A session that read mail keeps drafting but loses web and the Acre import tools.
+        assert sorted(agent.call_args.kwargs["enabled_toolsets"]) == ["atlas_email"]
 
 
 # ---- Taint: no egress-capable tool after mailbox content has been read -------------------
@@ -612,6 +666,8 @@ def test_tainted_atlas_runs_lose_blocked_toolsets_but_keep_their_own_tool(kwargs
         untainted = set(agent.call_args.kwargs["enabled_toolsets"])
         adapter._create_agent(atlas_email_mailbox_tainted=True, **kwargs)
         tainted = set(agent.call_args.kwargs["enabled_toolsets"])
-    assert own in tainted and own in untainted
+    assert own in untainted
+    # Ownership and Queries keep their own tool; the Acre import tools are dropped once mail was read.
+    assert (own in tainted) == (own != "atlas_import")
     assert not tainted & TAINT_BLOCKED_TOOLSETS
     assert tainted == untainted - TAINT_BLOCKED_TOOLSETS
