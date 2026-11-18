@@ -2306,10 +2306,8 @@ class APIServerAdapter(BasePlatformAdapter):
             return web.json_response(_openai_error(
                 "Invalid email capability", code="invalid_email_capability"), status=400)
         atlas_email_mailbox_tainted = body.get("atlas_email_mailbox_tainted")
-        if atlas_email_mailbox_tainted is not None and (
-                atlas_email_mailbox_tainted is not True
-                or atlas_import_capability is not None or atlas_ownership_capability is not None
-                or atlas_query_capability is not None):
+        # Only restricts, so it may accompany any atlas_* capability.
+        if atlas_email_mailbox_tainted is not None and atlas_email_mailbox_tainted is not True:
             return web.json_response(_openai_error(
                 "Invalid mailbox taint flag", code="invalid_email_mailbox_tainted"), status=400)
         if toolset_scope is not None:

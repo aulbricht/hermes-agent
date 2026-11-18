@@ -451,11 +451,8 @@ async def _post(tmp_path, fields):
 @pytest.mark.parametrize("fields", [
     {"atlas_email_mailbox_tainted": False}, {"atlas_email_mailbox_tainted": "true"},
     {"atlas_email_mailbox_tainted": 1}, {"atlas_email_mailbox_tainted": []},
-    {"atlas_email_mailbox_tainted": True, "atlas_import_capability": "atimp_" + "a" * 32},
-    {"atlas_email_mailbox_tainted": True, "atlas_ownership_capability": "atown_" + "a" * 32},
-    {"atlas_email_mailbox_tainted": True, "atlas_query_capability": "atqry_" + "a" * 32},
 ])
-async def test_invalid_taint_flag_or_forbidden_combination_is_rejected(tmp_path, fields):
+async def test_invalid_taint_flag_is_rejected(tmp_path, fields):
     pytest.importorskip("aiohttp")
     status, captured = await _post(tmp_path, fields)
     assert status == 400 and captured == []
@@ -576,3 +573,45 @@ def test_delegate_task_inline_path_is_refused_after_a_read(callback):
         result = AIAgent._dispatch_delegate_task(SimpleNamespace(), {"goal": "x"})
     assert json.loads(result) == REFUSED
     delegate.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field,value", [
+    ("atlas_import_capability", "atimp_" + "a" * 32),
+    ("atlas_ownership_capability", "atown_" + "a" * 32),
+    ("atlas_query_capability", "atqry_" + "a" * 32),
+])
+async def test_taint_flag_is_accepted_with_each_other_atlas_capability(tmp_path, field, value):
+    pytest.importorskip("aiohttp")
+    status, captured = await _post(tmp_path, {"atlas_email_mailbox_tainted": True, field: value})
+    assert status == 200
+    assert captured[0]["atlas_email_mailbox_tainted"] is True and captured[0][field] == value
+
+
+@pytest.mark.parametrize("kwargs,own", [
+    ({"atlas_import_authorized": True}, "atlas_import"),
+    ({"atlas_ownership_authorized": True}, "atlas_ownership"),
+    ({"atlas_query_authorized": True}, "atlas_query"),
+])
+def test_tainted_atlas_runs_lose_blocked_toolsets_but_keep_their_own_tool(kwargs, own):
+    pytest.importorskip("aiohttp")
+    from gateway.config import PlatformConfig
+    from gateway.platforms.api_server import APIServerAdapter
+    from tools.atlas_email_tool import TAINT_BLOCKED_TOOLSETS
+    adapter = APIServerAdapter(PlatformConfig(enabled=True))
+    with patch("gateway.run._resolve_runtime_agent_kwargs", return_value={
+            "api_key": "synthetic", "base_url": None, "provider": None,
+            "api_mode": None, "command": None, "args": []}), \
+         patch("gateway.run._resolve_gateway_model", return_value="test/model"), \
+         patch("gateway.run._load_gateway_config", return_value={}), \
+         patch("hermes_cli.tools_config._get_platform_tools",
+               return_value={"web", "terminal", "browser", "todo", "file"}), \
+         patch("gateway.run._current_max_iterations", return_value=90), \
+         patch("run_agent.AIAgent") as agent:
+        adapter._create_agent(**kwargs)
+        untainted = set(agent.call_args.kwargs["enabled_toolsets"])
+        adapter._create_agent(atlas_email_mailbox_tainted=True, **kwargs)
+        tainted = set(agent.call_args.kwargs["enabled_toolsets"])
+    assert own in tainted and own in untainted
+    assert not tainted & TAINT_BLOCKED_TOOLSETS
+    assert tainted == untainted - TAINT_BLOCKED_TOOLSETS
