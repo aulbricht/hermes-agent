@@ -623,6 +623,12 @@ class ToolRegistry:
         entry = self.get_entry(name)
         if not entry:
             return json.dumps({"error": f"Unknown tool: {name}"})
+        # Atlas email taint: after mailbox content is read in a run, egress-capable
+        # tools are refused here, the one point every tool call passes through.
+        from tools.atlas_email_tool import refuse_if_tainted
+        refused = refuse_if_tainted(name, entry.toolset)
+        if refused is not None:
+            return refused
         try:
             if entry.is_async:
                 from model_tools import _run_async

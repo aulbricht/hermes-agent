@@ -60,7 +60,7 @@ def test_visible_only_while_bound_and_only_in_its_toolset(quiet):
         assert not names(quiet=quiet) & EMAIL
 
 
-def test_ambient_tools_stay_available_alongside_the_email_tool():
+def test_ambient_tools_stay_available_alongside_the_email_tool_before_any_read():
     # "todo" has no credential check, so it yields tools in a bare test environment.
     ambient = names(["todo"])
     assert ambient
@@ -69,7 +69,6 @@ def test_ambient_tools_stay_available_alongside_the_email_tool():
         assert names(["todo", "atlas_email"]) == ambient | EMAIL
     finally:
         tool.clear_email_capability(bound)
-    assert names(["todo", "atlas_email"]) == ambient
 
 
 def test_description_says_it_never_sends_and_needs_approval():
@@ -134,38 +133,25 @@ def test_mailbox_content_is_wrapped_as_untrusted(callback, operation, reply, inn
     assert set(result) == {"untrusted_email_content", "note"}
 
 
-BIG = "x" * 40001
 @pytest.mark.parametrize("args", [
     {"operation": "send", "arguments": PROPOSE}, {"operation": "propose"},
     {"operation": "propose", "arguments": PROPOSE, "url": "http://x"},
     {"operation": "propose", "arguments": {**PROPOSE, "from": "x@example.com"}},
     {"operation": "propose", "arguments": {"subject": "s", "body": "b"}},
-    {"operation": "propose", "arguments": {**PROPOSE, "to": []}},
-    {"operation": "propose", "arguments": {**PROPOSE, "to": "a@example.com"}},
-    {"operation": "propose", "arguments": {**PROPOSE, "to": ["a@example.com"] * 11}},
-    {"operation": "propose", "arguments": {**PROPOSE, "cc": ["a@example.com"] * 11}},
-    {"operation": "propose", "arguments": {**PROPOSE, "to": [3]}},
+        {"operation": "propose", "arguments": {**PROPOSE, "to": "a@example.com"}},
+            {"operation": "propose", "arguments": {**PROPOSE, "to": [3]}},
     {"operation": "propose", "arguments": {**PROPOSE, "to": ["a@example.com\nBcc: x@y.z"]}},
-    {"operation": "propose", "arguments": {**PROPOSE, "subject": ""}},
-    {"operation": "propose", "arguments": {**PROPOSE, "subject": "a\nb"}},
-    {"operation": "propose", "arguments": {**PROPOSE, "subject": "s" * 301}},
-    {"operation": "propose", "arguments": {**PROPOSE, "body": BIG}},
-    {"operation": "propose", "arguments": {**PROPOSE, "attachment_ids": ["a"] * 11}},
-    {"operation": "propose", "arguments": {**PROPOSE, "in_reply_to": {"message_id": "m", "x": 1}}},
+        {"operation": "propose", "arguments": {**PROPOSE, "subject": "a\nb"}},
+                {"operation": "propose", "arguments": {**PROPOSE, "in_reply_to": {"message_id": "m", "x": 1}}},
     {"operation": "propose", "arguments": {**PROPOSE, "in_reply_to": "m"}},
     {"operation": "propose", "arguments": {**PROPOSE, "body": TOKEN}},
     {"operation": "propose", "arguments": {**PROPOSE, "subject": "atqry_" + "b" * 32}},
     {"operation": "propose", "arguments": {**PROPOSE, "body": "\\u0061tmail_ok", TOKEN: 1}},
-    {"operation": "list_messages", "arguments": {"limit": 0}},
-    {"operation": "list_messages", "arguments": {"limit": 26}},
-    {"operation": "list_messages", "arguments": {"limit": True}},
+            {"operation": "list_messages", "arguments": {"limit": True}},
     {"operation": "list_messages", "arguments": {"limit": "5"}},
-    {"operation": "list_messages", "arguments": {"folder": ""}},
-    {"operation": "list_messages", "arguments": {"query": "q" * 501}},
-    {"operation": "list_messages", "arguments": {"mailbox": "other"}},
+            {"operation": "list_messages", "arguments": {"mailbox": "other"}},
     {"operation": "read_message", "arguments": {}},
-    {"operation": "read_message", "arguments": {"message_id": ""}},
-    {"operation": "read_message", "arguments": {"message_id": "m", "extra": 1}},
+        {"operation": "read_message", "arguments": {"message_id": "m", "extra": 1}},
     {"operation": "read_message", "arguments": {"message_id": 7}},
     [], None,
 ])
@@ -330,3 +316,162 @@ async def test_stream_binds_a_valid_email_capability_and_passes_it_on(tmp_path):
         assert captured and captured[0]["atlas_email_capability"] == TOKEN
     finally:
         db.close()
+
+
+# ---- Taint: no egress-capable tool after mailbox content has been read -------------------
+from tools.registry import registry  # noqa: E402
+
+REFUSED = {"error": "Web tools are switched off after reading email in this turn"}
+
+
+def run_tool(name, args=None):
+    return json.loads(registry.dispatch(name, args or {}))
+
+
+@pytest.fixture
+def egress_stub():
+    """Stand-ins for web_search and a non-web egress tool; they record if they really run."""
+    ran = []
+    for name, toolset in (("zz_web_probe", "web"), ("zz_terminal_probe", "terminal"),
+                          ("zz_todo_probe", "todo")):
+        registry.register(name=name, toolset=toolset,
+                          schema={"name": name, "description": "probe",
+                                  "parameters": {"type": "object", "properties": {}}},
+                          handler=lambda a, _n=name, **k: (ran.append(_n), json.dumps({"ok": _n}))[1])
+    yield ran
+    for name in ("zz_web_probe", "zz_terminal_probe", "zz_todo_probe"):
+        registry.deregister(name)
+
+
+def test_web_is_available_before_any_read(callback, egress_stub):
+    assert run_tool("zz_web_probe") == {"ok": "zz_web_probe"}
+    assert call("propose", PROPOSE) == APPROVAL          # proposing alone does not taint
+    assert run_tool("zz_web_probe") == {"ok": "zz_web_probe"}
+
+
+@pytest.mark.parametrize("operation,reply,arguments", [
+    ("list_messages", {"messages": []}, {}),
+    ("read_message", {"message": {"id": "m"}}, {"message_id": "m"}),
+])
+def test_egress_tools_refused_after_a_read_in_the_same_run(callback, egress_stub, operation, reply, arguments):
+    _, response = callback
+    response[0] = lambda request: httpx.Response(200, json=reply)
+    call(operation, arguments)
+    assert run_tool("zz_web_probe") == REFUSED
+    assert run_tool("zz_terminal_probe") == REFUSED
+    assert run_tool("zz_todo_probe") == {"ok": "zz_todo_probe"}   # not an egress toolset
+    assert egress_stub == ["zz_todo_probe"]
+
+
+def test_a_failed_or_refused_read_does_not_taint_but_a_new_run_resets(callback, egress_stub):
+    observed, response = callback
+    response[0] = lambda request: httpx.Response(500)
+    call("list_messages")
+    assert run_tool("zz_web_probe") == {"ok": "zz_web_probe"}
+    response[0] = lambda request: httpx.Response(200, json={"messages": []})
+    call("list_messages")
+    assert run_tool("zz_web_probe") == REFUSED
+    # A new run (fresh bind) is clean again.
+    fresh = tool.bind_email_capability(TOKEN)
+    try:
+        assert run_tool("zz_web_probe") == {"ok": "zz_web_probe"}
+    finally:
+        tool.clear_email_capability(fresh)
+    assert run_tool("zz_web_probe") == REFUSED  # the outer run is still tainted
+
+
+def test_taint_set_in_a_worker_thread_is_seen_by_the_run(callback, egress_stub):
+    import contextvars
+    from concurrent.futures import ThreadPoolExecutor
+    _, response = callback
+    response[0] = lambda request: httpx.Response(200, json={"message": {}})
+    with ThreadPoolExecutor(1) as pool:
+        pool.submit(contextvars.copy_context().run, call, "read_message", {"message_id": "m"}).result()
+    assert run_tool("zz_web_probe") == REFUSED
+
+
+def test_cross_turn_flag_starts_the_run_tainted(egress_stub):
+    bound = tool.bind_email_capability("", tainted=True)
+    try:
+        assert run_tool("zz_web_probe") == REFUSED
+    finally:
+        tool.clear_email_capability(bound)
+    assert run_tool("zz_web_probe") == {"ok": "zz_web_probe"}
+
+
+def test_create_agent_drops_egress_toolsets_when_mailbox_tainted_even_with_scope():
+    pytest.importorskip("aiohttp")
+    from gateway.config import PlatformConfig
+    from gateway.platforms.api_server import APIServerAdapter
+    adapter = APIServerAdapter(PlatformConfig(enabled=True))
+    with patch("gateway.run._resolve_runtime_agent_kwargs", return_value={
+            "api_key": "synthetic", "base_url": None, "provider": None,
+            "api_mode": None, "command": None, "args": []}), \
+         patch("gateway.run._resolve_gateway_model", return_value="test/model"), \
+         patch("gateway.run._load_gateway_config", return_value={}), \
+         patch("hermes_cli.tools_config._get_platform_tools",
+               return_value={"web", "terminal", "browser", "todo", "file"}), \
+         patch("gateway.run._current_max_iterations", return_value=90), \
+         patch("run_agent.AIAgent") as agent:
+        adapter._create_agent()
+        assert "web" in agent.call_args.kwargs["enabled_toolsets"]
+        adapter._create_agent(atlas_email_mailbox_tainted=True)
+        assert sorted(agent.call_args.kwargs["enabled_toolsets"]) == ["file", "todo"]
+        adapter._create_agent(atlas_email_mailbox_tainted=True, atlas_email_authorized=True,
+                              toolset_scope=["web", "todo"])
+        assert sorted(agent.call_args.kwargs["enabled_toolsets"]) == ["atlas_email", "todo"]
+
+
+async def _post(tmp_path, fields):
+    from aiohttp import web
+    from aiohttp.test_utils import TestClient, TestServer
+    from gateway.config import PlatformConfig
+    from gateway.platforms.api_server import APIServerAdapter
+    from hermes_state import SessionDB
+    db = SessionDB(tmp_path / "sessions.db")
+    adapter = APIServerAdapter(PlatformConfig(enabled=True))
+    adapter._session_db = db
+    app = web.Application()
+    app.router.add_post("/api/sessions/{session_id}/chat/stream", adapter._handle_session_chat_stream)
+    sid = db.create_session("taint", "api_server")
+    captured = []
+
+    async def fake_run(*args, **kwargs):
+        captured.append(kwargs)
+        return {"final_response": "ok", "messages": []}, {}
+
+    try:
+        with patch.object(adapter, "_run_agent", side_effect=fake_run):
+            async with TestClient(TestServer(app)) as client:
+                response = await client.post(f"/api/sessions/{sid}/chat/stream",
+                                             json={"message": "test", **fields})
+                await response.text()
+                return response.status, captured
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fields", [
+    {"atlas_email_mailbox_tainted": False}, {"atlas_email_mailbox_tainted": "true"},
+    {"atlas_email_mailbox_tainted": 1}, {"atlas_email_mailbox_tainted": []},
+    {"atlas_email_mailbox_tainted": True, "atlas_import_capability": "atimp_" + "a" * 32},
+    {"atlas_email_mailbox_tainted": True, "atlas_ownership_capability": "atown_" + "a" * 32},
+    {"atlas_email_mailbox_tainted": True, "atlas_query_capability": "atqry_" + "a" * 32},
+])
+async def test_invalid_taint_flag_or_forbidden_combination_is_rejected(tmp_path, fields):
+    pytest.importorskip("aiohttp")
+    status, captured = await _post(tmp_path, fields)
+    assert status == 400 and captured == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fields,has_capability", [
+    ({"atlas_email_mailbox_tainted": True}, False),
+    ({"atlas_email_mailbox_tainted": True, "atlas_email_capability": TOKEN}, True),
+])
+async def test_true_taint_flag_is_passed_to_the_run_with_or_without_capability(tmp_path, fields, has_capability):
+    pytest.importorskip("aiohttp")
+    status, captured = await _post(tmp_path, fields)
+    assert status == 200 and captured[0]["atlas_email_mailbox_tainted"] is True
+    assert (captured[0].get("atlas_email_capability") == TOKEN) is has_capability

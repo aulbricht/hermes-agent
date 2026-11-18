@@ -25,7 +25,6 @@ _CALLBACK = "http://127.0.0.1:8243/api/v1/internal/email-tool"
 _MAX_REQUEST_BYTES = 200000
 _MAX_RESPONSE_BYTES = 65536
 _MAX_ERROR_BYTES = 4096
-_MAX_LIST = 10
 _UNAVAILABLE = '{"error":"Email tool unavailable"}'
 _LIMIT = '{"error":"Email tool limit reached"}'
 _OPERATIONS = ("propose", "list_messages", "read_message")
@@ -45,14 +44,43 @@ _SCHEMA = {
 }
 
 
-def bind_email_capability(value: str):
+# Per-run taint. A mutable holder (not a bare bool) so a set made inside a tool worker
+# thread, which runs in a copied context, is still seen by the run that bound it.
+_tainted: ContextVar[dict] = ContextVar("atlas_email_tainted", default=None)
+_TAINT_REFUSED = '{"error":"Web tools are switched off after reading email in this turn"}'
+# Toolsets whose tools can send data to an address the model (or an injected email)
+# chooses. Found enabled by default for api_server in toolsets._HERMES_CORE_TOOLS:
+# web (web_search, web_extract), browser/browser-cdp, terminal (+process), code_execution,
+# vision (fetches URLs), image_gen, homeassistant, delegation, cronjob, plus x_search,
+# video/video_gen and MCP tools where configured. Production's enabled set is config-driven.
+TAINT_BLOCKED_TOOLSETS = frozenset({
+    "web", "browser", "browser-cdp", "terminal", "code_execution", "vision", "image_gen",
+    "homeassistant", "delegation", "cronjob", "x_search", "video", "video_gen",
+})
+
+
+def bind_email_capability(value: str, tainted: bool = False):
     # Invalid callers cannot enable the definition or put arbitrary text in headers.
     value = value if isinstance(value, str) and re.fullmatch(r"atmail_[A-Za-z0-9_-]{32,128}", value) else ""
-    return _capability.set(value)
+    # A fresh holder per run; the cross-turn flag starts the run already tainted.
+    return (_capability.set(value), _tainted.set({"read": bool(tainted)}))
 
 
 def clear_email_capability(token) -> None:
-    _capability.reset(token)
+    _capability.reset(token[0])
+    _tainted.reset(token[1])
+
+
+def mailbox_read_this_run() -> bool:
+    holder = _tainted.get()
+    return bool(holder and holder["read"])
+
+
+def refuse_if_tainted(tool_name: str, toolset: str):
+    """Fixed refusal text when an egress-capable tool is called after mailbox content was read."""
+    if toolset in TAINT_BLOCKED_TOOLSETS and mailbox_read_this_run():
+        return _TAINT_REFUSED
+    return None
 
 
 def email_capability_available() -> bool:
@@ -73,39 +101,36 @@ def _clean(value, depth=0):
     return value is None or type(value) in {int, float, bool}
 
 
-def _text(value, low, high, single_line=False):
-    return (type(value) is str and low <= len(value) <= high
-            and not (single_line and ("\r" in value or "\n" in value)))
+def _text(value, single_line=False):
+    return type(value) is str and not (single_line and ("\r" in value or "\n" in value))
 
 
-def _text_list(value, low, high, item_high, single_line=True):
-    return (type(value) is list and low <= len(value) <= high
-            and all(_text(item, 1, item_high, single_line) for item in value))
+def _text_list(value, single_line=True):
+    return type(value) is list and all(_text(item, single_line) for item in value)
 
 
 def _arguments_valid(operation, arguments):
+    """Type and key-set checks only. Content limits (lengths, counts, ranges, which
+    recipients are allowed) belong to Atlas's one validator, which answers 422."""
     if operation == "propose":
         allowed = {"to", "cc", "subject", "body", "attachment_ids", "in_reply_to"}
         if not ({"to", "subject", "body"} <= set(arguments) <= allowed):
             return False
         reply = arguments.get("in_reply_to")
-        return (_text_list(arguments["to"], 1, _MAX_LIST, 320)
-                and ("cc" not in arguments or _text_list(arguments["cc"], 0, _MAX_LIST, 320))
-                and _text(arguments["subject"], 1, 300, single_line=True)
-                and _text(arguments["body"], 1, 40000)
-                and ("attachment_ids" not in arguments
-                     or _text_list(arguments["attachment_ids"], 0, _MAX_LIST, 128))
+        return (_text_list(arguments["to"])
+                and ("cc" not in arguments or _text_list(arguments["cc"]))
+                and _text(arguments["subject"], single_line=True)
+                and _text(arguments["body"])
+                and ("attachment_ids" not in arguments or _text_list(arguments["attachment_ids"]))
                 and ("in_reply_to" not in arguments or (
-                    type(reply) is dict and set(reply) == {"message_id"}
-                    and _text(reply["message_id"], 1, 512))))
+                    type(reply) is dict and set(reply) == {"message_id"} and _text(reply["message_id"]))))
     if operation == "list_messages":
-        limit = arguments.get("limit")
         return (set(arguments) <= {"folder", "query", "limit"}
-                and ("folder" not in arguments or _text(arguments["folder"], 1, 100, True))
-                and ("query" not in arguments or _text(arguments["query"], 1, 500, True))
-                and ("limit" not in arguments or (type(limit) is int and 1 <= limit <= 25)))
+                and ("folder" not in arguments or _text(arguments["folder"], True))
+                and ("query" not in arguments or _text(arguments["query"], True))
+                and ("limit" not in arguments or type(arguments["limit"]) is int))
     return (operation == "read_message" and set(arguments) == {"message_id"}
-            and _text(arguments["message_id"], 1, 512))
+            and _text(arguments["message_id"]))
 
 
 def _response_valid(value, operation):
@@ -114,8 +139,8 @@ def _response_valid(value, operation):
     if operation == "propose":
         return (set(value) == {"status", "approval_id", "outside_recipients"}
                 and value["status"] == "waiting_for_approval"
-                and _text(value["approval_id"], 1, 128)
-                and _text_list(value["outside_recipients"], 0, 50, 320, single_line=False))
+                and _text(value["approval_id"]) and value["approval_id"]
+                and _text_list(value["outside_recipients"], single_line=False))
     if operation == "list_messages":
         return set(value) == {"messages"} and type(value["messages"]) is list
     return set(value) == {"message"} and type(value["message"]) is dict
@@ -177,6 +202,9 @@ def _handle_atlas_email(args: dict, **_kwargs) -> str:
         if not _response_valid(value, operation) or _TOKEN.search(result):
             return _UNAVAILABLE
         if operation != "propose":
+            holder = _tainted.get()
+            if holder is not None:
+                holder["read"] = True
             # Mailbox content is third-party data; mark it so it is read as data.
             value = {"untrusted_email_content": value, "note": _UNTRUSTED_NOTE}
         return json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":"))

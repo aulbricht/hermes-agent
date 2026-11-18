@@ -1498,6 +1498,7 @@ class APIServerAdapter(BasePlatformAdapter):
         atlas_ownership_authorized: bool = False,
         atlas_query_authorized: bool = False,
         atlas_email_authorized: bool = False,
+        atlas_email_mailbox_tainted: bool = False,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -1633,6 +1634,11 @@ class APIServerAdapter(BasePlatformAdapter):
             # toolset only yields a tool while the capability is bound
             # (model_tools gates on the contextvar).
             enabled_toolsets = sorted(set(enabled_toolsets) | {"atlas_email"})
+        if atlas_email_mailbox_tainted:
+            # An earlier turn read mailbox content: no egress-capable toolset, however
+            # it was configured or requested through toolset_scope.
+            from tools.atlas_email_tool import TAINT_BLOCKED_TOOLSETS
+            enabled_toolsets = sorted(set(enabled_toolsets) - TAINT_BLOCKED_TOOLSETS)
 
         max_iterations = _current_max_iterations()
         if route and not session_override and route.get("max_iterations"):
@@ -2299,6 +2305,13 @@ class APIServerAdapter(BasePlatformAdapter):
                 or atlas_query_capability is not None)):
             return web.json_response(_openai_error(
                 "Invalid email capability", code="invalid_email_capability"), status=400)
+        atlas_email_mailbox_tainted = body.get("atlas_email_mailbox_tainted")
+        if atlas_email_mailbox_tainted is not None and (
+                atlas_email_mailbox_tainted is not True
+                or atlas_import_capability is not None or atlas_ownership_capability is not None
+                or atlas_query_capability is not None):
+            return web.json_response(_openai_error(
+                "Invalid mailbox taint flag", code="invalid_email_mailbox_tainted"), status=400)
         if toolset_scope is not None:
             if (not isinstance(toolset_scope, list) or len(toolset_scope) > 32
                     or any(not isinstance(name, str) or not name or len(name) > 80
@@ -2389,6 +2402,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     atlas_ownership_capability=atlas_ownership_capability,
                     atlas_query_capability=atlas_query_capability,
                     atlas_email_capability=atlas_email_capability,
+                    atlas_email_mailbox_tainted=atlas_email_mailbox_tainted is True,
                 )
                 final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
                 effective_session_id = result.get("session_id", session_id) if isinstance(result, dict) else session_id
@@ -4487,6 +4501,7 @@ class APIServerAdapter(BasePlatformAdapter):
         atlas_ownership_capability: Optional[str] = None,
         atlas_query_capability: Optional[str] = None,
         atlas_email_capability: Optional[str] = None,
+        atlas_email_mailbox_tainted: bool = False,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -4520,7 +4535,8 @@ class APIServerAdapter(BasePlatformAdapter):
             from tools.atlas_query_tool import bind_query_capability, clear_query_capability
             query_token = bind_query_capability(atlas_query_capability or "")
             from tools.atlas_email_tool import bind_email_capability, clear_email_capability
-            email_token = bind_email_capability(atlas_email_capability or "")
+            email_token = bind_email_capability(
+                atlas_email_capability or "", tainted=atlas_email_mailbox_tainted)
             try:
                 agent = self._create_agent(
                     ephemeral_system_prompt=ephemeral_system_prompt,
@@ -4536,6 +4552,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     atlas_ownership_authorized=bool(atlas_ownership_capability),
                     atlas_query_authorized=bool(atlas_query_capability),
                     atlas_email_authorized=bool(atlas_email_capability),
+                    atlas_email_mailbox_tainted=atlas_email_mailbox_tainted,
                 )
                 if atlas_route_request_id:
                     agent._atlas_route_request_id = atlas_route_request_id
