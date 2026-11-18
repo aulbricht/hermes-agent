@@ -83,7 +83,8 @@ _CHANGE_SCHEMA = {"anyOf": [_LEGACY_CHANGE_SCHEMA, _GENERIC_CHANGE_SCHEMA]}
 _AUTHORITY_KEYS = frozenset({
     "id", "work_id", "session_id", "turn_id", "principal", "principal_id",
     "user_id", "owner_id", "token", "capability", "atlas_ownership_capability",
-    "atlas_import_capability", "callback_url", "url", "database",
+    "atlas_import_capability", "atlas_query_capability", "atlas_email_capability",
+    "atlas_email_mailbox_tainted", "callback_url", "url", "database",
 })
 _FIELD_MAP_SCHEMA = {
     "type": "object", "properties": {}, "required": [],
@@ -212,7 +213,7 @@ def _matches(value, schema):
         return (schema.get("minLength", 0) <= len(value) <= schema.get("maxLength", _MAX_REQUEST_BYTES)
                 and (not schema.get("minLength") or bool(value.strip()))
                 and ("pattern" not in schema or re.fullmatch(schema["pattern"], value) is not None)
-                and re.search(r"(?:atown_|atimp_|atmail_)[A-Za-z0-9_-]{32,128}", value) is None)
+                and re.search(r"(?:atqry_|atown_|atimp_|atmail_)[A-Za-z0-9_-]{32,128}", value) is None)
     if kind == "integer":
         return schema.get("minimum", value) <= value <= schema.get("maximum", value)
     return True
@@ -375,7 +376,7 @@ def _forward_operation(operation, arguments):
         value = json.loads(raw)
         # Check decoded strings too, so JSON unicode escapes cannot echo a token.
         result = json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
-        if not _response_valid(value, operation) or re.search(r"(?:atown_|atimp_|atmail_)[A-Za-z0-9_-]{32,128}", result):
+        if not _response_valid(value, operation) or re.search(r"(?:atqry_|atown_|atimp_|atmail_)[A-Za-z0-9_-]{32,128}", result):
             return _UNAVAILABLE
         return result
     except (httpx.HTTPError, ValueError, TypeError, UnicodeError, RecursionError):

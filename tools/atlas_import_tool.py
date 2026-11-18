@@ -1,6 +1,7 @@
 """One-turn, Atlas-owned import operations through a fixed local callback."""
 
 import json
+import re
 from contextvars import ContextVar
 
 import httpx
@@ -19,6 +20,7 @@ _READ_ARGUMENT_KEYS = {
 _PROPOSAL_OPERATIONS = {"change_set"}
 _MAX_REQUEST_BYTES = 128 * 1024
 _MAX_RESPONSE_BYTES = 32_768
+_TOKEN = re.compile(r"(?:atqry_|atown_|atimp_|atmail_)[A-Za-z0-9_-]{32,128}")
 
 _READ_ARGUMENTS_SCHEMA = {
     "type": "object",
@@ -76,8 +78,11 @@ def _forward_operation(operation: str, arguments: dict) -> str:
         return json.dumps({"error": "Import capability unavailable"})
     body = {"operation": operation, "arguments": arguments}
     try:
-        encoded = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    except (TypeError, ValueError):
+        serialized = json.dumps(body, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+        if _TOKEN.search(serialized):
+            return json.dumps({"error": "Import operation unavailable"})
+        encoded = serialized.encode("utf-8")
+    except (TypeError, ValueError, UnicodeError, RecursionError):
         return json.dumps({"error": "Invalid import operation"})
     if len(encoded) > _MAX_REQUEST_BYTES:
         return json.dumps({"error": "Import request exceeds limit"})
@@ -105,7 +110,7 @@ def _forward_operation(operation: str, arguments: dict) -> str:
                             try:
                                 detail = json.loads(b"".join(chunks)).get("detail")
                                 if (isinstance(detail, str) and 0 < len(detail) <= 160
-                                        and detail.isprintable()):
+                                        and detail.isprintable() and not _TOKEN.search(detail)):
                                     return json.dumps({"error": detail})
                             except (ValueError, AttributeError):
                                 pass
@@ -120,8 +125,11 @@ def _forward_operation(operation: str, arguments: dict) -> str:
         value = json.loads(b"".join(chunks))
         if not isinstance(value, dict):
             raise ValueError("response object required")
-        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
-    except (httpx.HTTPError, ValueError, UnicodeError):
+        result = json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+        if _TOKEN.search(result):
+            return json.dumps({"error": "Import operation unavailable"})
+        return result
+    except (httpx.HTTPError, ValueError, TypeError, UnicodeError, RecursionError):
         return json.dumps({"error": "Import operation unavailable"})
 
 

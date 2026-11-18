@@ -56,6 +56,8 @@ _TAINT_REFUSED = '{"error":"Web tools are switched off after reading email in th
 TAINT_BLOCKED_TOOLSETS = frozenset({
     "web", "browser", "browser-cdp", "terminal", "code_execution", "vision", "image_gen",
     "homeassistant", "delegation", "cronjob", "x_search", "video", "video_gen",
+    "search", "tts", "spotify", "discord", "discord_admin", "yuanbao", "feishu_doc",
+    "feishu_drive", "computer_use", "debugging", "safe", "coding",
 })
 
 
@@ -83,19 +85,22 @@ def _mark_tainted() -> None:
 
 
 def _is_mailbox_read(name, arguments) -> bool:
-    if isinstance(arguments, str):
-        try:
-            arguments = json.loads(arguments)
-        except ValueError:
-            arguments = None
-    if name == "tool_call" and isinstance(arguments, dict):
-        # Tool Search bridge: the real call is nested; unwrap it once.
-        name, arguments = arguments.get("name"), arguments.get("arguments")
+    # Match Tool Search's target normalization. Bound nested wrappers so malformed
+    # or excessively deep bridge calls fail closed without unbounded recursion.
+    for _ in range(25):
+        name = name.strip() if isinstance(name, str) else name
         if isinstance(arguments, str):
             try:
                 arguments = json.loads(arguments)
-            except ValueError:
+            except (ValueError, RecursionError):
                 arguments = None
+        if name != "tool_call":
+            break
+        if not isinstance(arguments, dict):
+            return True
+        name, arguments = arguments.get("name"), arguments.get("arguments")
+    else:
+        return True
     if name != "atlas_email":
         return False
     # An unreadable atlas_email call is treated as a read: err safe.
@@ -116,9 +121,16 @@ def taint_batch_if_it_reads_mailbox(tool_calls) -> bool:
     return False
 
 
+def taint_blocks_toolset(toolset: str) -> bool:
+    """Shared dispatch/start-of-turn policy, including dynamically named MCP sets."""
+    return toolset in TAINT_BLOCKED_TOOLSETS or (
+        isinstance(toolset, str) and toolset.startswith("mcp-")
+    )
+
+
 def refuse_if_tainted(tool_name: str, toolset: str):
     """Fixed refusal text when an egress-capable tool is called after mailbox content was read."""
-    if toolset in TAINT_BLOCKED_TOOLSETS and mailbox_read_this_run():
+    if taint_blocks_toolset(toolset) and mailbox_read_this_run():
         return _TAINT_REFUSED
     return None
 
@@ -163,14 +175,14 @@ def _arguments_valid(operation, arguments):
                 and _text(arguments["body"])
                 and ("attachment_ids" not in arguments or _text_list(arguments["attachment_ids"]))
                 and ("in_reply_to" not in arguments or (
-                    type(reply) is dict and set(reply) == {"message_id"} and _text(reply["message_id"]))))
+                    type(reply) is dict and set(reply) == {"message_id"} and _text(reply["message_id"], single_line=True))))
     if operation == "list_messages":
         return (set(arguments) <= {"folder", "query", "limit"}
                 and ("folder" not in arguments or _text(arguments["folder"], True))
                 and ("query" not in arguments or _text(arguments["query"], True))
                 and ("limit" not in arguments or type(arguments["limit"]) is int))
     return (operation == "read_message" and set(arguments) == {"message_id"}
-            and _text(arguments["message_id"]))
+            and _text(arguments["message_id"], single_line=True))
 
 
 def _response_valid(value, operation):

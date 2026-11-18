@@ -1628,7 +1628,7 @@ class APIServerAdapter(BasePlatformAdapter):
             # Query turns see only the Atlas query tool, whatever scope was sent.
             enabled_toolsets = ["atlas_query"]
             runtime_kwargs["max_tokens"] = ATLAS_QUERY_TURN_MAX_OUTPUT_TOKENS
-        if atlas_email_authorized:
+        if atlas_email_authorized and not (atlas_ownership_authorized or atlas_query_authorized):
             # Unlike Queries, an email turn is an ordinary chat turn: the email
             # tool is added to the ambient tools, nothing is narrowed. The
             # toolset only yields a tool while the capability is bound
@@ -1637,8 +1637,13 @@ class APIServerAdapter(BasePlatformAdapter):
         if atlas_email_mailbox_tainted:
             # An earlier turn read mailbox content: no egress-capable toolset, however
             # it was configured or requested through toolset_scope.
-            from tools.atlas_email_tool import TAINT_BLOCKED_TOOLSETS
-            enabled_toolsets = sorted(set(enabled_toolsets) - TAINT_BLOCKED_TOOLSETS)
+            from tools.atlas_email_tool import taint_blocks_toolset
+            from hermes_cli.tools_config import enabled_mcp_server_names
+            mcp_servers = enabled_mcp_server_names(user_config)
+            enabled_toolsets = sorted(
+                name for name in enabled_toolsets
+                if not taint_blocks_toolset(name) and name not in mcp_servers
+            )
 
         max_iterations = _current_max_iterations()
         if route and not session_override and route.get("max_iterations"):
@@ -2207,6 +2212,67 @@ class APIServerAdapter(BasePlatformAdapter):
         fork = db.get_session(fork_id) or {"id": fork_id, "parent_session_id": source_id}
         return web.json_response({"object": "hermes.session", "session": self._session_response(fork)}, status=201)
 
+    @staticmethod
+    def _parse_session_turn_options(body):
+        """Validate capability, taint and narrowing identically for both session endpoints."""
+        toolset_scope = body.get("toolset_scope")
+        atlas_import_capability = body.get("atlas_import_capability")
+        if atlas_import_capability is not None:
+            if (not isinstance(atlas_import_capability, str) or not re.fullmatch(
+                    r"atimp_[A-Za-z0-9_-]{32,128}", atlas_import_capability)):
+                return None, web.json_response(_openai_error(
+                    "Invalid import capability", code="invalid_import_capability"), status=400)
+        atlas_ownership_capability = body.get("atlas_ownership_capability")
+        if (atlas_ownership_capability is not None and (
+                not isinstance(atlas_ownership_capability, str) or not re.fullmatch(
+                    r"atown_[A-Za-z0-9_-]{32,128}", atlas_ownership_capability))
+                or (atlas_import_capability is not None and atlas_ownership_capability is not None)):
+            return None, web.json_response(_openai_error(
+                "Invalid ownership capability", code="invalid_ownership_capability"), status=400)
+        atlas_query_capability = body.get("atlas_query_capability")
+        if (atlas_query_capability is not None and (
+                not isinstance(atlas_query_capability, str) or not re.fullmatch(
+                    r"atqry_[A-Za-z0-9_-]{32,128}", atlas_query_capability)
+                or atlas_import_capability is not None or atlas_ownership_capability is not None)):
+            return None, web.json_response(_openai_error(
+                "Invalid query capability", code="invalid_query_capability"), status=400)
+        atlas_email_capability = body.get("atlas_email_capability")
+        if (atlas_email_capability is not None and (
+                not isinstance(atlas_email_capability, str) or not re.fullmatch(
+                    r"atmail_[A-Za-z0-9_-]{32,128}", atlas_email_capability)
+                or atlas_import_capability is not None or atlas_ownership_capability is not None
+                or atlas_query_capability is not None)):
+            return None, web.json_response(_openai_error(
+                "Invalid email capability", code="invalid_email_capability"), status=400)
+        atlas_email_mailbox_tainted = body.get("atlas_email_mailbox_tainted")
+        # Only restricts, so it may accompany any atlas_* capability.
+        if atlas_email_mailbox_tainted is not None and atlas_email_mailbox_tainted is not True:
+            return None, web.json_response(_openai_error(
+                "Invalid mailbox taint flag", code="invalid_email_mailbox_tainted"), status=400)
+        if toolset_scope is not None:
+            if (not isinstance(toolset_scope, list) or len(toolset_scope) > 32
+                    or any(not isinstance(name, str) or not name or len(name) > 80
+                           for name in toolset_scope)
+                    or len(toolset_scope) != len(set(toolset_scope))):
+                return None, web.json_response(_openai_error(
+                    "toolset_scope must be a list of distinct toolset names",
+                    code="invalid_toolset_scope"), status=400)
+            from gateway.run import _load_gateway_config
+            from hermes_cli.tools_config import _get_platform_tools
+            configured = set(_get_platform_tools(_load_gateway_config(), "api_server")) - {"atlas_import", "atlas_ownership", "atlas_query", "atlas_email"}
+            if not set(toolset_scope).issubset(configured):
+                return None, web.json_response(_openai_error(
+                    "toolset_scope cannot enable unconfigured toolsets",
+                    code="invalid_toolset_scope"), status=400)
+        return {
+            "toolset_scope": toolset_scope,
+            "atlas_import_capability": atlas_import_capability,
+            "atlas_ownership_capability": atlas_ownership_capability,
+            "atlas_query_capability": atlas_query_capability,
+            "atlas_email_capability": atlas_email_capability,
+            "atlas_email_mailbox_tainted": atlas_email_mailbox_tainted is True,
+        }, None
+
     @_admit_api_agent_request
     async def _handle_session_chat(self, request: "web.Request") -> "web.Response":
         """POST /api/sessions/{session_id}/chat — one synchronous agent turn."""
@@ -2219,6 +2285,9 @@ class APIServerAdapter(BasePlatformAdapter):
             return err
         body, err = await self._read_json_body(request)
         if err:
+            return err
+        turn_options, err = self._parse_session_turn_options(body)
+        if err is not None:
             return err
         user_message, err = _session_chat_user_message(body)
         if err is not None:
@@ -2247,6 +2316,7 @@ class APIServerAdapter(BasePlatformAdapter):
             provider_user_hash=provider_user_hash or None,
             atlas_route_request_id=atlas_route_request_id,
             route=route,
+            **turn_options,
         )
         effective_session_id = result.get("session_id") if isinstance(result, dict) else session_id
         final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
@@ -2276,55 +2346,9 @@ class APIServerAdapter(BasePlatformAdapter):
         body, err = await self._read_json_body(request)
         if err:
             return err
-        toolset_scope = body.get("toolset_scope")
-        atlas_import_capability = body.get("atlas_import_capability")
-        if atlas_import_capability is not None:
-            if (not isinstance(atlas_import_capability, str) or not re.fullmatch(
-                    r"atimp_[A-Za-z0-9_-]{32,128}", atlas_import_capability)):
-                return web.json_response(_openai_error(
-                    "Invalid import capability", code="invalid_import_capability"), status=400)
-        atlas_ownership_capability = body.get("atlas_ownership_capability")
-        if (atlas_ownership_capability is not None and (
-                not isinstance(atlas_ownership_capability, str) or not re.fullmatch(
-                    r"atown_[A-Za-z0-9_-]{32,128}", atlas_ownership_capability))
-                or (atlas_import_capability is not None and atlas_ownership_capability is not None)):
-            return web.json_response(_openai_error(
-                "Invalid ownership capability", code="invalid_ownership_capability"), status=400)
-        atlas_query_capability = body.get("atlas_query_capability")
-        if (atlas_query_capability is not None and (
-                not isinstance(atlas_query_capability, str) or not re.fullmatch(
-                    r"atqry_[A-Za-z0-9_-]{32,128}", atlas_query_capability)
-                or atlas_import_capability is not None or atlas_ownership_capability is not None)):
-            return web.json_response(_openai_error(
-                "Invalid query capability", code="invalid_query_capability"), status=400)
-        atlas_email_capability = body.get("atlas_email_capability")
-        if (atlas_email_capability is not None and (
-                not isinstance(atlas_email_capability, str) or not re.fullmatch(
-                    r"atmail_[A-Za-z0-9_-]{32,128}", atlas_email_capability)
-                or atlas_import_capability is not None or atlas_ownership_capability is not None
-                or atlas_query_capability is not None)):
-            return web.json_response(_openai_error(
-                "Invalid email capability", code="invalid_email_capability"), status=400)
-        atlas_email_mailbox_tainted = body.get("atlas_email_mailbox_tainted")
-        # Only restricts, so it may accompany any atlas_* capability.
-        if atlas_email_mailbox_tainted is not None and atlas_email_mailbox_tainted is not True:
-            return web.json_response(_openai_error(
-                "Invalid mailbox taint flag", code="invalid_email_mailbox_tainted"), status=400)
-        if toolset_scope is not None:
-            if (not isinstance(toolset_scope, list) or len(toolset_scope) > 32
-                    or any(not isinstance(name, str) or not name or len(name) > 80
-                           for name in toolset_scope)
-                    or len(toolset_scope) != len(set(toolset_scope))):
-                return web.json_response(_openai_error(
-                    "toolset_scope must be a list of distinct toolset names",
-                    code="invalid_toolset_scope"), status=400)
-            from gateway.run import _load_gateway_config
-            from hermes_cli.tools_config import _get_platform_tools
-            configured = set(_get_platform_tools(_load_gateway_config(), "api_server")) - {"atlas_import", "atlas_ownership", "atlas_query", "atlas_email"}
-            if not set(toolset_scope).issubset(configured):
-                return web.json_response(_openai_error(
-                    "toolset_scope cannot enable unconfigured toolsets",
-                    code="invalid_toolset_scope"), status=400)
+        turn_options, err = self._parse_session_turn_options(body)
+        if err is not None:
+            return err
         user_message, err = _session_chat_user_message(body)
         if err is not None:
             return err
@@ -2395,12 +2419,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     provider_user_hash=provider_user_hash or None,
                     atlas_route_request_id=atlas_route_request_id,
                     route=route,
-                    toolset_scope=toolset_scope,
-                    atlas_import_capability=atlas_import_capability,
-                    atlas_ownership_capability=atlas_ownership_capability,
-                    atlas_query_capability=atlas_query_capability,
-                    atlas_email_capability=atlas_email_capability,
-                    atlas_email_mailbox_tainted=atlas_email_mailbox_tainted is True,
+                    **turn_options,
                 )
                 final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
                 effective_session_id = result.get("session_id", session_id) if isinstance(result, dict) else session_id
