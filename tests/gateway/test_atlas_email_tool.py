@@ -363,21 +363,17 @@ def test_egress_tools_refused_after_a_read_in_the_same_run(callback, egress_stub
     assert egress_stub == ["zz_todo_probe"]
 
 
-def test_a_failed_or_refused_read_does_not_taint_but_a_new_run_resets(callback, egress_stub):
-    observed, response = callback
-    response[0] = lambda request: httpx.Response(500)
-    call("list_messages")
-    assert run_tool("zz_web_probe") == {"ok": "zz_web_probe"}
+def test_a_new_run_resets_taint_while_the_outer_run_stays_tainted(callback, egress_stub):
+    _, response = callback
     response[0] = lambda request: httpx.Response(200, json={"messages": []})
     call("list_messages")
     assert run_tool("zz_web_probe") == REFUSED
-    # A new run (fresh bind) is clean again.
     fresh = tool.bind_email_capability(TOKEN)
     try:
         assert run_tool("zz_web_probe") == {"ok": "zz_web_probe"}
     finally:
         tool.clear_email_capability(fresh)
-    assert run_tool("zz_web_probe") == REFUSED  # the outer run is still tainted
+    assert run_tool("zz_web_probe") == REFUSED
 
 
 def test_taint_set_in_a_worker_thread_is_seen_by_the_run(callback, egress_stub):
@@ -475,3 +471,108 @@ async def test_true_taint_flag_is_passed_to_the_run_with_or_without_capability(t
     status, captured = await _post(tmp_path, fields)
     assert status == 200 and captured[0]["atlas_email_mailbox_tainted"] is True
     assert (captured[0].get("atlas_email_capability") == TOKEN) is has_capability
+
+
+# ---- Same-batch race: taint before any call of a response runs ---------------------------
+def _tc(name, arguments):
+    return SimpleNamespace(id="t", function=SimpleNamespace(
+        name=name, arguments=arguments if isinstance(arguments, str) else json.dumps(arguments)))
+
+
+READ = ("atlas_email", {"operation": "read_message", "arguments": {"message_id": "m"}})
+LIST = ("atlas_email", {"operation": "list_messages", "arguments": {}})
+WEB = ("zz_web_probe", {"url": "http://attacker.example"})
+
+
+@pytest.mark.parametrize("batch", [[READ, WEB], [WEB, READ], [LIST, WEB], [WEB, LIST]])
+def test_batch_with_a_read_refuses_egress_in_either_order(callback, egress_stub, batch):
+    assert tool.taint_batch_if_it_reads_mailbox([_tc(*c) for c in batch]) is True
+    assert run_tool("zz_web_probe") == REFUSED
+    assert egress_stub == []
+
+
+@pytest.mark.parametrize("batch", [
+    [("atlas_email", {"operation": "propose", "arguments": PROPOSE}), WEB],
+    [WEB, ("zz_todo_probe", {})],
+])
+def test_batch_without_a_read_taints_nothing(callback, egress_stub, batch):
+    assert tool.taint_batch_if_it_reads_mailbox([_tc(*c) for c in batch]) is False
+    assert run_tool("zz_web_probe") == {"ok": "zz_web_probe"}
+
+
+@pytest.mark.parametrize("call", [
+    _tc("tool_call", {"name": "atlas_email", "arguments": READ[1]}),
+    _tc("tool_call", {"name": "atlas_email", "arguments": json.dumps(READ[1])}),
+    _tc("atlas_email", "{not json"),
+])
+def test_bridge_wrapped_and_unreadable_email_calls_count_as_reads(callback, egress_stub, call):
+    assert tool.taint_batch_if_it_reads_mailbox([call, _tc(*WEB)]) is True
+    assert run_tool("zz_web_probe") == REFUSED
+
+
+def test_batch_scan_without_capability_does_nothing(egress_stub):
+    assert tool.taint_batch_if_it_reads_mailbox([_tc(*READ), _tc(*WEB)]) is False
+    assert run_tool("zz_web_probe") == {"ok": "zz_web_probe"}
+
+
+@pytest.mark.parametrize("parallel", [True, False])
+@pytest.mark.parametrize("batch", [[READ, WEB], [WEB, READ]])
+def test_execute_tool_calls_taints_before_either_execution_path_runs(callback, parallel, batch):
+    import types
+    from run_agent import AIAgent
+    seen = []
+    agent = SimpleNamespace(_executing_tools=False)
+    for path in ("_execute_tool_calls_sequential", "_execute_tool_calls_concurrent"):
+        setattr(agent, path, lambda *a, _p=path, **k: seen.append((_p, tool.mailbox_read_this_run())))
+    assistant = SimpleNamespace(tool_calls=[_tc(*c) for c in batch])
+    with patch("run_agent._should_parallelize_tool_batch", return_value=parallel):
+        AIAgent._execute_tool_calls(agent, assistant, [], "task")
+    expected = "_execute_tool_calls_concurrent" if parallel else "_execute_tool_calls_sequential"
+    assert seen == [(expected, True)]
+
+
+def test_concurrent_workers_cannot_slip_an_egress_call_past_a_batch_read(callback, egress_stub):
+    import contextvars
+    from concurrent.futures import ThreadPoolExecutor
+    _, response = callback
+    response[0] = lambda request: httpx.Response(200, json={"message": {}})
+    tool.taint_batch_if_it_reads_mailbox([_tc(*READ), _tc(*WEB)])
+    with ThreadPoolExecutor(2) as pool:
+        futures = [pool.submit(contextvars.copy_context().run, run_tool, "zz_web_probe"),
+                   pool.submit(contextvars.copy_context().run, call, "read_message", {"message_id": "m"}),
+                   pool.submit(contextvars.copy_context().run, run_tool, "zz_web_probe")]
+        results = [f.result() for f in futures]
+    assert results[0] == REFUSED and results[2] == REFUSED and egress_stub == []
+
+
+def test_taint_is_set_before_the_read_request_starts(callback):
+    _, response = callback
+    during = []
+
+    def slow(request):
+        during.append(tool.mailbox_read_this_run())
+        return httpx.Response(200, json={"message": {}})
+
+    response[0] = slow
+    call("read_message", {"message_id": "m"})
+    assert during == [True]
+
+
+@pytest.mark.parametrize("make", [
+    lambda: httpx.Response(500), lambda: httpx.Response(404), lambda: httpx.Response(429),
+    lambda: httpx.Response(200, content=b"not json", headers={"content-type": "application/json"}),
+])
+def test_a_failed_read_still_taints_the_run(callback, egress_stub, make):
+    _, response = callback
+    response[0] = lambda request: make()
+    call("read_message", {"message_id": "m"})
+    assert run_tool("zz_web_probe") == REFUSED
+
+
+def test_delegate_task_inline_path_is_refused_after_a_read(callback):
+    from run_agent import AIAgent
+    call("list_messages")
+    with patch("tools.delegate_tool.delegate_task") as delegate:
+        result = AIAgent._dispatch_delegate_task(SimpleNamespace(), {"goal": "x"})
+    assert json.loads(result) == REFUSED
+    delegate.assert_not_called()

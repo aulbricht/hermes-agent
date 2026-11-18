@@ -76,6 +76,46 @@ def mailbox_read_this_run() -> bool:
     return bool(holder and holder["read"])
 
 
+def _mark_tainted() -> None:
+    holder = _tainted.get()
+    if holder is not None:
+        holder["read"] = True
+
+
+def _is_mailbox_read(name, arguments) -> bool:
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except ValueError:
+            arguments = None
+    if name == "tool_call" and isinstance(arguments, dict):
+        # Tool Search bridge: the real call is nested; unwrap it once.
+        name, arguments = arguments.get("name"), arguments.get("arguments")
+        if isinstance(arguments, str):
+            try:
+                arguments = json.loads(arguments)
+            except ValueError:
+                arguments = None
+    if name != "atlas_email":
+        return False
+    # An unreadable atlas_email call is treated as a read: err safe.
+    return not isinstance(arguments, dict) or arguments.get("operation") in ("list_messages", "read_message")
+
+
+def taint_batch_if_it_reads_mailbox(tool_calls) -> bool:
+    """Called once per model response BEFORE any of its tool calls runs (sequential or
+    concurrent). If any call in the batch reads the mailbox, the run is tainted now, so
+    every egress-capable call in the same batch is refused whatever the execution order."""
+    if _tainted.get() is None or not _capability.get():
+        return False
+    for call in tool_calls or []:
+        function = getattr(call, "function", None)
+        if _is_mailbox_read(getattr(function, "name", None), getattr(function, "arguments", None)):
+            _mark_tainted()
+            return True
+    return False
+
+
 def refuse_if_tainted(tool_name: str, toolset: str):
     """Fixed refusal text when an egress-capable tool is called after mailbox content was read."""
     if toolset in TAINT_BLOCKED_TOOLSETS and mailbox_read_this_run():
@@ -176,6 +216,10 @@ def _handle_atlas_email(args: dict, **_kwargs) -> str:
             or not _clean(args["arguments"])):
         return _UNAVAILABLE
     operation = args["operation"]
+    if operation != "propose":
+        # Taint BEFORE the request starts, so a slower concurrent egress call cannot
+        # slip through; a failed read leaves the run tainted (err safe).
+        _mark_tainted()
     try:
         encoded = json.dumps({"operation": operation, "arguments": args["arguments"]},
                              ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode("utf-8")
@@ -202,9 +246,6 @@ def _handle_atlas_email(args: dict, **_kwargs) -> str:
         if not _response_valid(value, operation) or _TOKEN.search(result):
             return _UNAVAILABLE
         if operation != "propose":
-            holder = _tainted.get()
-            if holder is not None:
-                holder["read"] = True
             # Mailbox content is third-party data; mark it so it is read as data.
             value = {"untrusted_email_content": value, "note": _UNTRUSTED_NOTE}
         return json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
