@@ -1619,6 +1619,9 @@ class AIAgent:
         here so existing tests that patch ``run_agent.threading.Thread``
         keep working.
         """
+        from tools.atlas_email_tool import mailbox_read_this_run
+        if mailbox_read_this_run():
+            return
         from agent.background_review import spawn_background_review_thread
         from tools.thread_context import propagate_context_to_thread
         target, _prompt = spawn_background_review_thread(
@@ -3406,6 +3409,9 @@ class AIAgent:
         providers are strictly best-effort — a misconfigured or offline
         backend must not block the user from seeing their response.
         """
+        from tools.atlas_email_tool import mailbox_read_this_run
+        if mailbox_read_this_run():
+            return
         if interrupted:
             return
         if not (self._memory_manager and final_response and original_user_message):
@@ -5687,6 +5693,10 @@ class AIAgent:
         """
         tool_calls = assistant_message.tool_calls
 
+        # Atlas email: taint the run before any call in this batch executes.
+        from tools.atlas_email_tool import taint_batch_if_it_reads_mailbox
+        taint_batch_if_it_reads_mailbox(tool_calls)
+
         # Allow _vprint during tool execution even with stream consumers
         self._executing_tools = True
         try:
@@ -5723,6 +5733,12 @@ class AIAgent:
         #     gateway session the async result would route back to.
         # The schema-level `background` param is intentionally ignored here.
         _is_subagent = getattr(self, "_delegate_depth", 0) > 0
+        # delegate_task is dispatched inline, not through registry.dispatch, so the
+        # Atlas email taint check is repeated here.
+        from tools.atlas_email_tool import refuse_if_tainted
+        refused = refuse_if_tainted("delegate_task", "delegation")
+        if refused is not None:
+            return refused
         return _delegate_task(
             goal=function_args.get("goal"),
             context=function_args.get("context"),

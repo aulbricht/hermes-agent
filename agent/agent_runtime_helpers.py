@@ -2163,6 +2163,13 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
     tools. Used by the concurrent execution path; the sequential path retains
     its own inline invocation for backward-compatible display handling.
     """
+    from tools.atlas_email_tool import refuse_if_tainted
+    if (function_name == "memory"
+            or function_name in getattr(agent, "_context_engine_tool_names", set())
+            or (getattr(agent, "_memory_manager", None) and agent._memory_manager.has_tool(function_name))):
+        refusal = refuse_if_tainted(function_name, "memory")
+        if refusal is not None:
+            return refusal
     if not isinstance(function_args, dict):
         function_args = {}
 

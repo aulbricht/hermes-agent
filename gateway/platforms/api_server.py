@@ -1032,6 +1032,7 @@ class APIServerAdapter(BasePlatformAdapter):
         self._runner: Optional["web.AppRunner"] = None
         self._site: Optional["web.TCPSite"] = None
         self._response_store = ResponseStore()
+        self._tainted_session_ids: set[str] = set()
         # Active run streams: run_id -> asyncio.Queue of SSE event dicts
         self._run_streams: Dict[str, "asyncio.Queue[Optional[Dict]]"] = {}
         # Creation timestamps for orphaned-run TTL sweep
@@ -1497,6 +1498,8 @@ class APIServerAdapter(BasePlatformAdapter):
         atlas_import_authorized: bool = False,
         atlas_ownership_authorized: bool = False,
         atlas_query_authorized: bool = False,
+        atlas_email_authorized: bool = False,
+        atlas_email_mailbox_tainted: bool = False,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -1600,7 +1603,7 @@ class APIServerAdapter(BasePlatformAdapter):
             )
 
         user_config = _load_gateway_config()
-        enabled_toolsets = sorted(set(_get_platform_tools(user_config, "api_server")) - {"atlas_import", "atlas_ownership", "atlas_query"})
+        enabled_toolsets = sorted(set(_get_platform_tools(user_config, "api_server")) - {"atlas_import", "atlas_ownership", "atlas_query", "atlas_email"})
         if toolset_scope is not None:
             # Request scope can only remove configured tools. Keep it local to
             # this agent instance; the API server's default remains unchanged.
@@ -1626,6 +1629,20 @@ class APIServerAdapter(BasePlatformAdapter):
             # Query turns see only the Atlas query tool, whatever scope was sent.
             enabled_toolsets = ["atlas_query"]
             runtime_kwargs["max_tokens"] = ATLAS_QUERY_TURN_MAX_OUTPUT_TOKENS
+        if atlas_email_authorized and not (atlas_ownership_authorized or atlas_query_authorized):
+            # Unlike Queries, an email turn is an ordinary chat turn: the email
+            # tool is added to the ambient tools, nothing is narrowed. The
+            # toolset only yields a tool while the capability is bound
+            # (model_tools gates on the contextvar).
+            enabled_toolsets = sorted(set(enabled_toolsets) | {"atlas_email"})
+        if atlas_email_mailbox_tainted:
+            # An earlier turn read mailbox content: no egress-capable toolset, however
+            # it was configured or requested through toolset_scope.
+            from tools.atlas_email_tool import taint_blocks_toolset
+            enabled_toolsets = sorted(
+                name for name in enabled_toolsets
+                if not taint_blocks_toolset(name)
+            )
 
         max_iterations = _current_max_iterations()
         if route and not session_override and route.get("max_iterations"):
@@ -2001,6 +2018,32 @@ class APIServerAdapter(BasePlatformAdapter):
             return None, web.json_response(_openai_error(f"Session not found: {session_id}", code="session_not_found"), status=404)
         return session, None
 
+    def _session_is_mailbox_tainted(self, session_id: Optional[str]) -> bool:
+        if not session_id:
+            return False
+        if session_id in self._tainted_session_ids:
+            return True
+        from tools.atlas_email_tool import conversation_history_is_mailbox_tainted
+        db = self._ensure_session_db()
+        if db is None:
+            return False
+        # Include inactive and ancestor transcripts: compression and branching
+        # cannot erase the trust boundary of replayed content.
+        history = db.get_messages_as_conversation(
+            session_id, include_ancestors=True, include_inactive=True,
+        )
+        return conversation_history_is_mailbox_tainted(history)
+
+    def _record_mailbox_taint(self, result, *session_ids, tainted=False) -> bool:
+        from tools.atlas_email_tool import mailbox_read_this_run
+        observed = bool(tainted or mailbox_read_this_run()
+                        or (isinstance(result, dict) and result.get("atlas_email_mailbox_tainted")))
+        if isinstance(result, dict):
+            result["atlas_email_mailbox_tainted"] = observed
+        if observed:
+            self._tainted_session_ids.update(sid for sid in session_ids if isinstance(sid, str) and sid)
+        return observed
+
     def _conversation_history_for_session(self, session_id: str) -> List[Dict[str, Any]]:
         db = self._ensure_session_db()
         if db is None:
@@ -2194,6 +2237,67 @@ class APIServerAdapter(BasePlatformAdapter):
         fork = db.get_session(fork_id) or {"id": fork_id, "parent_session_id": source_id}
         return web.json_response({"object": "hermes.session", "session": self._session_response(fork)}, status=201)
 
+    @staticmethod
+    def _parse_session_turn_options(body):
+        """Validate capability, taint and narrowing identically for both session endpoints."""
+        toolset_scope = body.get("toolset_scope")
+        atlas_import_capability = body.get("atlas_import_capability")
+        if atlas_import_capability is not None:
+            if (not isinstance(atlas_import_capability, str) or not re.fullmatch(
+                    r"atimp_[A-Za-z0-9_-]{32,128}", atlas_import_capability)):
+                return None, web.json_response(_openai_error(
+                    "Invalid import capability", code="invalid_import_capability"), status=400)
+        atlas_ownership_capability = body.get("atlas_ownership_capability")
+        if (atlas_ownership_capability is not None and (
+                not isinstance(atlas_ownership_capability, str) or not re.fullmatch(
+                    r"atown_[A-Za-z0-9_-]{32,128}", atlas_ownership_capability))
+                or (atlas_import_capability is not None and atlas_ownership_capability is not None)):
+            return None, web.json_response(_openai_error(
+                "Invalid ownership capability", code="invalid_ownership_capability"), status=400)
+        atlas_query_capability = body.get("atlas_query_capability")
+        if (atlas_query_capability is not None and (
+                not isinstance(atlas_query_capability, str) or not re.fullmatch(
+                    r"atqry_[A-Za-z0-9_-]{32,128}", atlas_query_capability)
+                or atlas_import_capability is not None or atlas_ownership_capability is not None)):
+            return None, web.json_response(_openai_error(
+                "Invalid query capability", code="invalid_query_capability"), status=400)
+        atlas_email_capability = body.get("atlas_email_capability")
+        if (atlas_email_capability is not None and (
+                not isinstance(atlas_email_capability, str) or not re.fullmatch(
+                    r"atmail_[A-Za-z0-9_-]{32,128}", atlas_email_capability)
+                or atlas_import_capability is not None or atlas_ownership_capability is not None
+                or atlas_query_capability is not None)):
+            return None, web.json_response(_openai_error(
+                "Invalid email capability", code="invalid_email_capability"), status=400)
+        atlas_email_mailbox_tainted = body.get("atlas_email_mailbox_tainted")
+        # Only restricts, so it may accompany any atlas_* capability.
+        if atlas_email_mailbox_tainted is not None and atlas_email_mailbox_tainted is not True:
+            return None, web.json_response(_openai_error(
+                "Invalid mailbox taint flag", code="invalid_email_mailbox_tainted"), status=400)
+        if toolset_scope is not None:
+            if (not isinstance(toolset_scope, list) or len(toolset_scope) > 32
+                    or any(not isinstance(name, str) or not name or len(name) > 80
+                           for name in toolset_scope)
+                    or len(toolset_scope) != len(set(toolset_scope))):
+                return None, web.json_response(_openai_error(
+                    "toolset_scope must be a list of distinct toolset names",
+                    code="invalid_toolset_scope"), status=400)
+            from gateway.run import _load_gateway_config
+            from hermes_cli.tools_config import _get_platform_tools
+            configured = set(_get_platform_tools(_load_gateway_config(), "api_server")) - {"atlas_import", "atlas_ownership", "atlas_query", "atlas_email"}
+            if not set(toolset_scope).issubset(configured):
+                return None, web.json_response(_openai_error(
+                    "toolset_scope cannot enable unconfigured toolsets",
+                    code="invalid_toolset_scope"), status=400)
+        return {
+            "toolset_scope": toolset_scope,
+            "atlas_import_capability": atlas_import_capability,
+            "atlas_ownership_capability": atlas_ownership_capability,
+            "atlas_query_capability": atlas_query_capability,
+            "atlas_email_capability": atlas_email_capability,
+            "atlas_email_mailbox_tainted": atlas_email_mailbox_tainted is True,
+        }, None
+
     @_admit_api_agent_request
     async def _handle_session_chat(self, request: "web.Request") -> "web.Response":
         """POST /api/sessions/{session_id}/chat — one synchronous agent turn."""
@@ -2206,6 +2310,9 @@ class APIServerAdapter(BasePlatformAdapter):
             return err
         body, err = await self._read_json_body(request)
         if err:
+            return err
+        turn_options, err = self._parse_session_turn_options(body)
+        if err is not None:
             return err
         user_message, err = _session_chat_user_message(body)
         if err is not None:
@@ -2234,6 +2341,7 @@ class APIServerAdapter(BasePlatformAdapter):
             provider_user_hash=provider_user_hash or None,
             atlas_route_request_id=atlas_route_request_id,
             route=route,
+            **turn_options,
         )
         effective_session_id = result.get("session_id") if isinstance(result, dict) else session_id
         final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
@@ -2242,6 +2350,7 @@ class APIServerAdapter(BasePlatformAdapter):
             headers["X-Hermes-Session-Key"] = gateway_session_key
         return web.json_response(
             {
+                "atlas_email_mailbox_tainted": bool(result.get("atlas_email_mailbox_tainted")) if isinstance(result, dict) else False,
                 "object": "hermes.session.chat.completion",
                 "session_id": effective_session_id or session_id,
                 "message": {"role": "assistant", "content": final_response},
@@ -2263,42 +2372,9 @@ class APIServerAdapter(BasePlatformAdapter):
         body, err = await self._read_json_body(request)
         if err:
             return err
-        toolset_scope = body.get("toolset_scope")
-        atlas_import_capability = body.get("atlas_import_capability")
-        if atlas_import_capability is not None:
-            if (not isinstance(atlas_import_capability, str) or not re.fullmatch(
-                    r"atimp_[A-Za-z0-9_-]{32,128}", atlas_import_capability)):
-                return web.json_response(_openai_error(
-                    "Invalid import capability", code="invalid_import_capability"), status=400)
-        atlas_ownership_capability = body.get("atlas_ownership_capability")
-        if (atlas_ownership_capability is not None and (
-                not isinstance(atlas_ownership_capability, str) or not re.fullmatch(
-                    r"atown_[A-Za-z0-9_-]{32,128}", atlas_ownership_capability))
-                or (atlas_import_capability is not None and atlas_ownership_capability is not None)):
-            return web.json_response(_openai_error(
-                "Invalid ownership capability", code="invalid_ownership_capability"), status=400)
-        atlas_query_capability = body.get("atlas_query_capability")
-        if (atlas_query_capability is not None and (
-                not isinstance(atlas_query_capability, str) or not re.fullmatch(
-                    r"atqry_[A-Za-z0-9_-]{32,128}", atlas_query_capability)
-                or atlas_import_capability is not None or atlas_ownership_capability is not None)):
-            return web.json_response(_openai_error(
-                "Invalid query capability", code="invalid_query_capability"), status=400)
-        if toolset_scope is not None:
-            if (not isinstance(toolset_scope, list) or len(toolset_scope) > 32
-                    or any(not isinstance(name, str) or not name or len(name) > 80
-                           for name in toolset_scope)
-                    or len(toolset_scope) != len(set(toolset_scope))):
-                return web.json_response(_openai_error(
-                    "toolset_scope must be a list of distinct toolset names",
-                    code="invalid_toolset_scope"), status=400)
-            from gateway.run import _load_gateway_config
-            from hermes_cli.tools_config import _get_platform_tools
-            configured = set(_get_platform_tools(_load_gateway_config(), "api_server")) - {"atlas_import", "atlas_ownership", "atlas_query"}
-            if not set(toolset_scope).issubset(configured):
-                return web.json_response(_openai_error(
-                    "toolset_scope cannot enable unconfigured toolsets",
-                    code="invalid_toolset_scope"), status=400)
+        turn_options, err = self._parse_session_turn_options(body)
+        if err is not None:
+            return err
         user_message, err = _session_chat_user_message(body)
         if err is not None:
             return err
@@ -2369,10 +2445,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     provider_user_hash=provider_user_hash or None,
                     atlas_route_request_id=atlas_route_request_id,
                     route=route,
-                    toolset_scope=toolset_scope,
-                    atlas_import_capability=atlas_import_capability,
-                    atlas_ownership_capability=atlas_ownership_capability,
-                    atlas_query_capability=atlas_query_capability,
+                    **turn_options,
                 )
                 final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
                 effective_session_id = result.get("session_id", session_id) if isinstance(result, dict) else session_id
@@ -2386,6 +2459,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     "interrupted": False,
                 }))
                 await queue.put(_event_payload("run.completed", {
+                    "atlas_email_mailbox_tainted": bool(result.get("atlas_email_mailbox_tainted")) if isinstance(result, dict) else False,
                     "session_id": effective_session_id,
                     "message_id": message_id,
                     "completed": True,
@@ -3132,11 +3206,13 @@ class APIServerAdapter(BasePlatformAdapter):
         ) -> None:
             if not store:
                 return
+            from tools.atlas_email_tool import conversation_history_is_mailbox_tainted
             if conversation_history_snapshot is None:
                 conversation_history_snapshot = list(conversation_history)
                 conversation_history_snapshot.append({"role": "user", "content": user_message})
             self._response_store.put(response_id, {
                 "response": response_env,
+                "atlas_email_mailbox_tainted": self._session_is_mailbox_tainted(session_id) or conversation_history_is_mailbox_tainted(conversation_history_snapshot),
                 "conversation_history": conversation_history_snapshot,
                 "instructions": instructions,
                 "session_id": session_id,
@@ -3692,17 +3768,24 @@ class APIServerAdapter(BasePlatformAdapter):
                     entry_content = _normalize_multimodal_content(entry["content"])
                 except ValueError as exc:
                     return _multimodal_validation_error(exc, param=f"conversation_history[{i}].content")
-                conversation_history.append({"role": str(entry["role"]), "content": entry_content})
+                conversation_history.append({**entry, "role": str(entry["role"]), "content": entry_content})
             if previous_response_id:
                 logger.debug("Both conversation_history and previous_response_id provided; using conversation_history")
 
         stored_session_id = None
+        stored_tainted = False
         if not conversation_history and previous_response_id:
             stored = self._response_store.get(previous_response_id)
             if stored is None:
                 return web.json_response(_openai_error(f"Previous response not found: {previous_response_id}"), status=404)
             conversation_history = list(stored.get("conversation_history", []))
             stored_session_id = stored.get("session_id")
+            from tools.atlas_email_tool import conversation_history_is_mailbox_tainted
+            stored_tainted = bool(
+                stored.get("atlas_email_mailbox_tainted")
+                or conversation_history_is_mailbox_tainted(conversation_history)
+                or self._session_is_mailbox_tainted(stored_session_id)
+            )
             # If no instructions provided, carry forward from previous
             if instructions is None:
                 instructions = stored.get("instructions")
@@ -3772,6 +3855,7 @@ class APIServerAdapter(BasePlatformAdapter):
             agent_task = asyncio.ensure_future(self._run_agent(
                 user_message=user_message,
                 conversation_history=conversation_history,
+                atlas_email_mailbox_tainted=stored_tainted,
                 ephemeral_system_prompt=instructions,
                 session_id=session_id,
                 stream_delta_callback=_on_delta,
@@ -3811,6 +3895,7 @@ class APIServerAdapter(BasePlatformAdapter):
             return await self._run_agent(
                 user_message=user_message,
                 conversation_history=conversation_history,
+                atlas_email_mailbox_tainted=stored_tainted,
                 ephemeral_system_prompt=instructions,
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
@@ -3885,6 +3970,7 @@ class APIServerAdapter(BasePlatformAdapter):
         if store:
             self._response_store.put(response_id, {
                 "response": response_data,
+                "atlas_email_mailbox_tainted": bool(result.get("atlas_email_mailbox_tainted")) or self._session_is_mailbox_tainted(session_id),
                 "conversation_history": full_history,
                 "instructions": instructions,
                 "session_id": session_id,
@@ -4470,6 +4556,8 @@ class APIServerAdapter(BasePlatformAdapter):
         atlas_import_capability: Optional[str] = None,
         atlas_ownership_capability: Optional[str] = None,
         atlas_query_capability: Optional[str] = None,
+        atlas_email_capability: Optional[str] = None,
+        atlas_email_mailbox_tainted: bool = False,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -4487,6 +4575,12 @@ class APIServerAdapter(BasePlatformAdapter):
         another thread to stop in-progress LLM calls.
         """
         loop = asyncio.get_running_loop()
+        from tools.atlas_email_tool import conversation_history_is_mailbox_tainted
+        atlas_email_mailbox_tainted = bool(
+            atlas_email_mailbox_tainted
+            or conversation_history_is_mailbox_tainted(conversation_history)
+            or self._session_is_mailbox_tainted(session_id)
+        )
 
         def _run():
             from gateway.session_context import clear_session_vars
@@ -4502,6 +4596,9 @@ class APIServerAdapter(BasePlatformAdapter):
             ownership_token = bind_ownership_capability(atlas_ownership_capability or "")
             from tools.atlas_query_tool import bind_query_capability, clear_query_capability
             query_token = bind_query_capability(atlas_query_capability or "")
+            from tools.atlas_email_tool import bind_email_capability, clear_email_capability
+            email_token = bind_email_capability(
+                atlas_email_capability or "", tainted=atlas_email_mailbox_tainted)
             try:
                 agent = self._create_agent(
                     ephemeral_system_prompt=ephemeral_system_prompt,
@@ -4516,6 +4613,8 @@ class APIServerAdapter(BasePlatformAdapter):
                     atlas_import_authorized=bool(atlas_import_capability),
                     atlas_ownership_authorized=bool(atlas_ownership_capability),
                     atlas_query_authorized=bool(atlas_query_capability),
+                    atlas_email_authorized=bool(atlas_email_capability),
+                    atlas_email_mailbox_tainted=atlas_email_mailbox_tainted,
                 )
                 if atlas_route_request_id:
                     agent._atlas_route_request_id = atlas_route_request_id
@@ -4555,8 +4654,14 @@ class APIServerAdapter(BasePlatformAdapter):
                 _eff_sid = getattr(agent, "session_id", session_id)
                 if isinstance(_eff_sid, str) and _eff_sid:
                     result["session_id"] = _eff_sid
+                self._record_mailbox_taint(
+                    result, session_id, _eff_sid, tainted=atlas_email_mailbox_tainted,
+                )
                 return result, usage
             finally:
+                # Retain taint even if the run raises after reading a transcript.
+                self._record_mailbox_taint(None, session_id, tainted=atlas_email_mailbox_tainted)
+                clear_email_capability(email_token)
                 clear_query_capability(query_token)
                 clear_ownership_capability(ownership_token)
                 clear_import_capability(import_token)
@@ -4683,16 +4788,18 @@ class APIServerAdapter(BasePlatformAdapter):
                         _openai_error(f"conversation_history[{i}] must have 'role' and 'content' fields"),
                         status=400,
                     )
-                conversation_history.append({"role": str(entry["role"]), "content": str(entry["content"])})
+                conversation_history.append({**entry, "role": str(entry["role"]), "content": str(entry["content"])})
             if previous_response_id:
                 logger.debug("Both conversation_history and previous_response_id provided; using conversation_history")
 
         stored_session_id = None
+        stored_tainted = False
         if not conversation_history and previous_response_id:
             stored = self._response_store.get(previous_response_id)
             if stored:
                 conversation_history = list(stored.get("conversation_history", []))
                 stored_session_id = stored.get("session_id")
+                stored_tainted = bool(stored.get("atlas_email_mailbox_tainted"))
                 if instructions is None:
                     instructions = stored.get("instructions")
 
@@ -4776,7 +4883,14 @@ class APIServerAdapter(BasePlatformAdapter):
                         last_event="run.cancelled",
                     )
                     return
+                from tools.atlas_email_tool import conversation_history_is_mailbox_tainted
+                runs_mailbox_tainted = bool(
+                    stored_tainted
+                    or conversation_history_is_mailbox_tainted(conversation_history)
+                    or self._session_is_mailbox_tainted(session_id)
+                )
                 agent = self._create_agent(
+                    atlas_email_mailbox_tainted=runs_mailbox_tainted,
                     ephemeral_system_prompt=ephemeral_system_prompt,
                     session_id=session_id,
                     stream_delta_callback=_text_cb,
@@ -4824,7 +4938,10 @@ class APIServerAdapter(BasePlatformAdapter):
                         unregister_gateway_notify,
                     )
 
+                    from tools.atlas_email_tool import bind_email_capability, clear_email_capability
+                    email_token = bind_email_capability("", tainted=runs_mailbox_tainted)
                     effective_task_id = session_id or run_id
+                    r = None
                     approval_token = None
                     session_tokens = []
                     try:
@@ -4842,6 +4959,11 @@ class APIServerAdapter(BasePlatformAdapter):
                             task_id=effective_task_id,
                         )
                     finally:
+                        self._record_mailbox_taint(
+                            r, session_id, getattr(agent, "session_id", None),
+                            tainted=runs_mailbox_tainted,
+                        )
+                        clear_email_capability(email_token)
                         try:
                             unregister_gateway_notify(approval_session_key)
                         finally:

@@ -974,6 +974,10 @@ def memory_tool(
 
     Returns JSON string with results.
     """
+    from tools.atlas_email_tool import refuse_if_tainted
+    refusal = refuse_if_tainted('memory', 'memory')
+    if refusal is not None:
+        return refusal
     if store is None:
         return tool_error("Memory is not available. It may be disabled in config or this environment.", success=False)
 

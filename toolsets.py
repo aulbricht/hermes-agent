@@ -98,6 +98,11 @@ TOOLSETS = {
         "tools": ["atlas_query"],
         "includes": [],
     },
+    "atlas_email": {
+        "description": "Atlas email tool: propose a draft for Approval, list and read messages (requires request capability)",
+        "tools": ["atlas_email"],
+        "includes": [],
+    },
     "atlas_ownership": {
         "description": "One-turn Atlas ownership previews (requires request capability)",
         "tools": ["atlas_ownership", "atlas_ownership_proposal"],
