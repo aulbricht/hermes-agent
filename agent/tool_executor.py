@@ -374,6 +374,33 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             )
             continue
 
+        from tools.atlas_outreach_tool import outreach_capability_available
+        if outreach_capability_available() and function_name != "atlas_outreach_save":
+            parsed_calls.append(
+                (
+                    tool_call,
+                    function_name,
+                    function_args,
+                    [],
+                    _ra().handle_function_call(
+                        function_name,
+                        function_args,
+                        effective_task_id,
+                        tool_call_id=getattr(tool_call, "id", "") or "",
+                        session_id=getattr(agent, "session_id", "") or "",
+                        turn_id=getattr(agent, "_current_turn_id", "") or "",
+                        api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+                        enabled_tools=list(agent.valid_tool_names) if getattr(agent, "valid_tool_names", None) else None,
+                        skip_pre_tool_call_hook=True,
+                        skip_tool_request_middleware=True,
+                        enabled_toolsets=getattr(agent, "enabled_toolsets", None),
+                        disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                    ),
+                    False,
+                )
+            )
+            continue
+
         # Reset nudge counters only for a structurally valid invocation.
         if function_name == "memory":
             agent._turns_since_memory = 0
@@ -1064,6 +1091,38 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 agent,
                 messages,
                 stage=f"invalid tool arguments {function_name}",
+            )
+            agent._apply_pending_steer_to_tool_results(messages, 1)
+            continue
+
+        from tools.atlas_outreach_tool import outreach_capability_available
+        if outreach_capability_available() and function_name != "atlas_outreach_save":
+            function_result = _ra().handle_function_call(
+                function_name,
+                function_args,
+                effective_task_id,
+                tool_call_id=getattr(tool_call, "id", "") or "",
+                session_id=getattr(agent, "session_id", "") or "",
+                turn_id=getattr(agent, "_current_turn_id", "") or "",
+                api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+                enabled_tools=list(agent.valid_tool_names) if getattr(agent, "valid_tool_names", None) else None,
+                skip_pre_tool_call_hook=True,
+                skip_tool_request_middleware=True,
+                enabled_toolsets=getattr(agent, "enabled_toolsets", None),
+                disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+            )
+            messages.append(
+                make_tool_result_message(
+                    function_name,
+                    function_result,
+                    tool_call.id,
+                    effect_disposition="none",
+                )
+            )
+            _flush_session_db_after_tool_progress(
+                agent,
+                messages,
+                stage=f"tool result {function_name}",
             )
             agent._apply_pending_steer_to_tool_results(messages, 1)
             continue
