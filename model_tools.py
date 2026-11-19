@@ -306,6 +306,8 @@ def get_tool_definitions(
     ownership_allowed = ownership_capability_available() and enabled_toolsets is not None and "atlas_ownership" in enabled_toolsets
     from tools.atlas_query_tool import query_capability_available
     query_allowed = query_capability_available() and enabled_toolsets is not None and "atlas_query" in enabled_toolsets
+    from tools.atlas_email_tool import email_capability_available
+    email_allowed = email_capability_available() and enabled_toolsets is not None and "atlas_email" in enabled_toolsets
     # Fast path: memoized result when the caller doesn't need stdout prints.
     # The cache key captures every argument-level input; the registry
     # generation captures registry mutations (MCP refresh, plugin load).
@@ -332,6 +334,7 @@ def get_tool_definitions(
             import_allowed,
             ownership_allowed,
             query_allowed,
+            email_allowed,
         )
         cached = _tool_defs_cache.get(cache_key)
         if cached is not None:
@@ -378,6 +381,8 @@ def _compute_tool_definitions(
     ownership_allowed = ownership_capability_available() and enabled_toolsets is not None and "atlas_ownership" in enabled_toolsets
     from tools.atlas_query_tool import query_capability_available
     query_allowed = query_capability_available() and enabled_toolsets is not None and "atlas_query" in enabled_toolsets
+    from tools.atlas_email_tool import email_capability_available
+    email_allowed = email_capability_available() and enabled_toolsets is not None and "atlas_email" in enabled_toolsets
 
     if enabled_toolsets is not None:
         effective_enabled_toolsets = list(enabled_toolsets)
@@ -408,6 +413,8 @@ def _compute_tool_definitions(
             tools_to_include.update(resolve_toolset(ts_name))
     if not query_allowed:
         tools_to_include.discard("atlas_query")
+    if not email_allowed:
+        tools_to_include.discard("atlas_email")
     if not ownership_allowed:
         tools_to_include.discard("atlas_ownership")
         tools_to_include.discard("atlas_ownership_proposal")

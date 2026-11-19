@@ -1021,6 +1021,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
 
 def execute_tool_calls_sequential(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
     """Execute tool calls sequentially (original behavior). Used for single calls or interactive tools."""
+    from tools.atlas_email_tool import mailbox_read_this_run
     # Resolve the context-scaled tool-output budget once per turn.
     _tool_budget = _budget_for_agent(agent)
     for i, tool_call in enumerate(assistant_message.tool_calls, 1):
@@ -1233,6 +1234,12 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 error_message=getattr(_guardrail_block_decision, "message", None) or "Tool blocked by guardrail policy",
                 middleware_trace=list(middleware_trace),
             )
+        elif (function_name == "memory"
+              or function_name in getattr(agent, "_context_engine_tool_names", set())
+              or (getattr(agent, "_memory_manager", None) and agent._memory_manager.has_tool(function_name))) and mailbox_read_this_run():
+            from tools.atlas_email_tool import _TAINT_REFUSED
+            function_result = _TAINT_REFUSED
+            tool_duration = time.time() - tool_start_time
         elif function_name == "todo":
             def _execute(next_args: dict) -> Any:
                 from tools.todo_tool import todo_tool as _todo_tool
