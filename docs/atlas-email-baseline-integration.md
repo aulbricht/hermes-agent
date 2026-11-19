@@ -185,7 +185,7 @@ tests remains for CI and the Verifier, including the approved read-only host pat
 ### Rework accounting and amendments
 
 Relative to accepted code-review head `f162054964b8241d7b06beae80edec0d47fb8aa1`,
-no test is deleted. The only weakened/replaced assertions are the two expectations
+no test is deleted. The signed attack's weakened/replaced assertions are the two expectations
 that `file` stays enabled on already-tainted email/import turns. Authority:
 current attack note: “take the addendum edits (including the in-place replacement
 and the replayed-history test ... ) from `a6a17e48`”; signed addendum (d).6 and
@@ -219,3 +219,34 @@ and the same command for `976e25fc671fb2a7fa2154f92bb0aef963eadc33` exit 0;
 the excluded `d74466816b7baf69e177527266729502bf01ea82` command exits 1 as required.
 The unchanged contributor workflow's shell predicate exits 0:
 “All contributor emails are mapped in AUTHOR_MAP.”
+
+### CI failure repair
+
+The exact-head check of `d98d90547e996e4da4f8efd1892fd1566a1a3bcf` found
+two failures in [CI run 44511362836](https://github.com/aulbricht/hermes-agent/actions/runs/44511362836).
+The frozen persistence test reached the sequential refusal branch, which set
+`function_result` but omitted `tool_duration`; reporting the refused call raised
+`UnboundLocalError` in `agent/tool_executor.py`. That branch now records elapsed
+time like the other inline branches. The unchanged frozen test exercises two
+sequential refusals (built-in and external memory) and asserts both results and
+unchanged stores, covering the fix without an additional duplicate test.
+
+The other failure was the baseline
+`test_create_agent_drops_egress_toolsets_when_mailbox_tainted_even_with_scope`:
+its old expected list included `file`. The assertion now expects only `todo`.
+Authority: signed addendum (d).1 explicitly says start-of-turn filtering
+“automatically strips `"file"`, `"memory"`, `"skills"`”; the PM repair directive
+requires “persistence-write isolation”. This is the only additional replaced
+baseline assertion; no test is deleted, skipped or weakened to admit writes.
+The clean web control and capability-scoped email control remain intact. The
+attacker-owned file remains byte-identical to revision `a6a17e48`, SHA-256
+`b6ef6261d61d1ea6fb043fa52dfbaed89fdaf3cc5597325b6a6085b9868c34b8`.
+No product change is reverted and no later PM amendment was received this wake.
+
+`python3 -m py_compile agent/tool_executor.py tests/gateway/test_atlas_email_tool.py`
+and `git diff --check` passed. The focused canonical command
+`scripts/run_tests.sh tests/gateway/test_atlas_email_main_integration_attack.py tests/gateway/test_atlas_email_tool.py tests/gateway/test_atlas_email_taint_runtime.py -j 2`
+still exits before collection because no supported virtualenv exists: **not
+verified locally**. Ruff and ty remain unavailable. Both source ancestry checks
+and exclusion of d744 remain required; required CI and all three independent
+reviews must accept the new head.

@@ -412,7 +412,7 @@ def test_create_agent_drops_egress_toolsets_when_mailbox_tainted_even_with_scope
         adapter._create_agent()
         assert "web" in agent.call_args.kwargs["enabled_toolsets"]
         adapter._create_agent(atlas_email_mailbox_tainted=True)
-        assert sorted(agent.call_args.kwargs["enabled_toolsets"]) == ["file", "todo"]
+        assert sorted(agent.call_args.kwargs["enabled_toolsets"]) == ["todo"]
         adapter._create_agent(atlas_email_mailbox_tainted=True, atlas_email_authorized=True,
                               toolset_scope=["web", "todo"])
         assert sorted(agent.call_args.kwargs["enabled_toolsets"]) == ["atlas_email", "todo"]
