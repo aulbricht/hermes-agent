@@ -374,8 +374,14 @@ def test_create_agent_strips_mcp_composite_and_external_toolsets_when_mailbox_ta
         "coding",
         "mcp-github",
         "github",
-        "todo",
         "file",
+        "memory",
+        "skills",
+        "session_search",
+        "kanban",
+        "project",
+        "google_meet",
+        "todo",
     }
     with patch(
         "gateway.run._resolve_runtime_agent_kwargs",
@@ -397,24 +403,34 @@ def test_create_agent_strips_mcp_composite_and_external_toolsets_when_mailbox_ta
     ), patch(
         "run_agent.AIAgent"
     ) as agent:
-        # Control: untainted run retains configured non-atlas toolsets.
+        # Control: untainted run retains configured non-atlas toolsets (including file/memory/skills/session_search).
         adapter._create_agent(atlas_email_authorized=True)
         untainted = set(agent.call_args.kwargs["enabled_toolsets"])
-        assert {"atlas_email", "web", "mcp-github", "todo", "file"} <= untainted
+        assert {
+            "atlas_email",
+            "web",
+            "mcp-github",
+            "todo",
+            "file",
+            "memory",
+            "skills",
+            "session_search",
+        } <= untainted
 
-        # Tainted run strips every egress, composite, and MCP toolset, keeping only local/email.
+        # Tainted run strips egress, persistence (file, memory, skills), transcript-reader (session_search),
+        # multi-agent/plugin (kanban, project, google_meet), composite, and MCP toolsets, keeping only allow-listed toolsets.
         adapter._create_agent(
             atlas_email_authorized=True, atlas_email_mailbox_tainted=True
         )
         tainted = sorted(agent.call_args.kwargs["enabled_toolsets"])
-        assert tainted == ["atlas_email", "file", "todo"]
+        assert tainted == ["atlas_email", "todo"]
 
-        # Pinned ed377 control (not d744): tainted import turn keeps atlas_import.
+        # Pinned ed377 control (not d744): tainted import turn keeps atlas_import and todo only.
         adapter._create_agent(
             atlas_import_authorized=True, atlas_email_mailbox_tainted=True
         )
         tainted_import = sorted(agent.call_args.kwargs["enabled_toolsets"])
-        assert tainted_import == ["atlas_import", "file", "todo"]
+        assert tainted_import == ["atlas_import", "todo"]
 
 
 # ---- (a.3) Same-batch taint pre-scan under Tool Search bridge & single-line message_id ------
@@ -736,3 +752,1009 @@ def test_main_sno2018_r1_ownership_contract_and_query_fixes_survive_email_integr
         ownership_tool.clear_ownership_capability(own_bound)
         email_tool.clear_email_capability(email_bound)
     assert len(own_obs) == 4
+
+# ---- SNO-3978 Defensive Addendum (SNO-3980 repair coverage) ---------------------------------
+
+
+def test_tainted_run_refuses_persistence_writes_across_all_dispatch_paths_while_preserving_read_only_controls(
+    tmp_path, monkeypatch, email_callback
+):
+    from agent.agent_runtime_helpers import invoke_tool
+    from agent.memory_manager import MemoryManager
+    from agent.memory_provider import MemoryProvider
+    from agent.tool_executor import execute_tool_calls_sequential
+    from tools.file_tools import patch_tool, write_file_tool
+    from tools.memory_tool import MemoryStore, memory_tool
+    from tools.skill_manager_tool import skill_manage
+
+    _, response = email_callback
+    hermes_home = tmp_path / "hermes_home"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    store = MemoryStore()
+    store.load_from_disk()
+    notes_file = tmp_path / "workspace_notes.txt"
+
+    skill_doc = (
+        "---\n"
+        "name: clean-skill\n"
+        "description: Disposable clean skill fixture\n"
+        "---\n"
+        "# Clean Skill\n"
+        "Step 1: Inspect local state.\n"
+    )
+
+    # 1. Clean-run controls BEFORE mailbox taint: persistence writes and read-only tools succeed.
+    assert json.loads(
+        memory_tool(action="add", target="memory", content="clean memory entry", store=store)
+    )["success"] is True
+    assert store.memory_entries == ["clean memory entry"]
+
+    assert json.loads(
+        handle_function_call(
+            "skill_manage",
+            {"action": "create", "name": "clean-skill", "content": skill_doc},
+        )
+    )["success"] is True
+
+    assert "error" not in json.loads(
+        handle_function_call(
+            "write_file",
+            {"path": str(notes_file), "content": "alpha\nbeta\n"},
+            task_id="persist-control",
+        )
+    )
+    assert "error" not in json.loads(
+        handle_function_call(
+            "patch",
+            {
+                "mode": "replace",
+                "path": str(notes_file),
+                "old_string": "beta",
+                "new_string": "gamma",
+            },
+            task_id="persist-control",
+        )
+    )
+    assert notes_file.read_text(encoding="utf-8") == "alpha\ngamma\n"
+
+    # 2. Reading mailbox content taints the current run.
+    response[0] = lambda request: httpx.Response(
+        200, json={"message": {"id": "m1", "body": "Untrusted mailbox text"}}
+    )
+    read_out = json.loads(
+        handle_function_call(
+            "atlas_email", {"operation": "read_message", "arguments": {"message_id": "m1"}}
+        )
+    )
+    assert "untrusted_email_content" in read_out
+    assert email_tool.mailbox_read_this_run() is True
+
+    # 3. Direct, registry, and handle_function_call persistence writes are refused while tainted.
+    # Note: _handle_memory pops `store` from `kw` (not `args`), so `registry.dispatch("memory", ...)`
+    # must be refused by `refuse_if_tainted` at the registry dispatch boundary before `_handle_memory` runs.
+    for mem_kwargs in (
+        {"action": "add", "target": "memory", "content": "tainted entry"},
+        {"action": "add", "target": "user", "content": "tainted user entry"},
+        {
+            "action": "replace",
+            "target": "memory",
+            "old_text": "clean memory entry",
+            "content": "tainted replacement",
+        },
+        {"action": "remove", "target": "memory", "old_text": "clean memory entry"},
+        {
+            "target": "memory",
+            "operations": [{"action": "add", "content": "tainted batch entry"}],
+        },
+    ):
+        assert json.loads(memory_tool(**mem_kwargs, store=store)) == TAINT_REFUSED
+        assert json.loads(registry.dispatch("memory", {**mem_kwargs, "store": store})) == TAINT_REFUSED
+
+    for skill_args in (
+        {"action": "create", "name": "tainted-skill", "content": skill_doc.replace("clean-skill", "tainted-skill")},
+        {
+            "action": "patch",
+            "name": "clean-skill",
+            "old_string": "Step 1: Inspect local state.",
+            "new_string": "Step 1: Overwritten.",
+        },
+        {"action": "edit", "name": "clean-skill", "content": skill_doc + "\nExtra\n"},
+        {
+            "action": "write_file",
+            "name": "clean-skill",
+            "file_path": "references/note.md",
+            "file_content": "tainted reference",
+        },
+        {
+            "action": "remove_file",
+            "name": "clean-skill",
+            "file_path": "references/note.md",
+        },
+        {"action": "delete", "name": "clean-skill", "absorbed_into": ""},
+    ):
+        assert json.loads(handle_function_call("skill_manage", skill_args)) == TAINT_REFUSED
+        assert json.loads(skill_manage(**skill_args)) == TAINT_REFUSED
+
+    assert (
+        json.loads(
+            handle_function_call(
+                "write_file",
+                {"path": str(notes_file), "content": "overwritten\n"},
+                task_id="persist-control",
+            )
+        )
+        == TAINT_REFUSED
+    )
+    assert (
+        json.loads(
+            write_file_tool(
+                path=str(notes_file), content="overwritten\n", task_id="persist-control"
+            )
+        )
+        == TAINT_REFUSED
+    )
+    assert (
+        json.loads(
+            handle_function_call(
+                "patch",
+                {
+                    "mode": "replace",
+                    "path": str(notes_file),
+                    "old_string": "gamma",
+                    "new_string": "delta",
+                },
+                task_id="persist-control",
+            )
+        )
+        == TAINT_REFUSED
+    )
+    v4a_patch = (
+        f"*** Begin Patch\n*** Update File: {notes_file}\n@@\n-alpha\n+omega\n*** End Patch"
+    )
+    assert (
+        json.loads(
+            handle_function_call(
+                "patch",
+                {"mode": "patch", "patch": v4a_patch},
+                task_id="persist-control",
+            )
+        )
+        == TAINT_REFUSED
+    )
+    assert (
+        json.loads(
+            patch_tool(mode="patch", patch=v4a_patch, task_id="persist-control")
+        )
+        == TAINT_REFUSED
+    )
+
+    # 4. Agent-intercepted sequential and concurrent (invoke_tool) paths + external MemoryManager tools.
+    ext_writes = []
+
+    class _FakeExternalMemoryProvider(MemoryProvider):
+        @property
+        def name(self) -> str:
+            return "fake_ext"
+
+        def is_available(self) -> bool:
+            return True
+
+        def initialize(self, session_id: str, **kwargs) -> None:
+            pass
+
+        def get_tool_schemas(self):
+            return [
+                {
+                    "name": "ext_memory_retain",
+                    "description": "External memory write probe",
+                    "parameters": {"type": "object", "properties": {}},
+                }
+            ]
+
+        def handle_tool_call(self, tool_name: str, args: dict, **kwargs) -> str:
+            ext_writes.append((tool_name, args))
+            return json.dumps({"success": True})
+
+        def on_memory_write(self, action: str, target: str, content: str, **kwargs) -> None:
+            ext_writes.append(("mirror", action, target, content))
+
+    mm = MemoryManager()
+    mm.add_provider(_FakeExternalMemoryProvider())
+
+    class _DummyGuardrails:
+        def before_call(self, name, args):
+            return SimpleNamespace(allows_execution=True)
+
+        def after_call(self, name, args, result, *, failed=False):
+            return SimpleNamespace(action="allow", should_halt=False)
+
+    dummy_agent = SimpleNamespace(
+        session_id="sess-taint-agent",
+        _current_turn_id="turn-1",
+        _current_api_request_id="req-1",
+        _memory_store=store,
+        _memory_manager=mm,
+        _context_engine_tool_names=set(),
+        _turns_since_memory=5,
+        _iters_since_skill=5,
+        _interrupt_requested=False,
+        quiet_mode=True,
+        verbose_logging=False,
+        tool_progress_mode="off",
+        tool_progress_callback=None,
+        tool_start_callback=None,
+        tool_complete_callback=None,
+        _checkpoint_mgr=SimpleNamespace(enabled=False),
+        _tool_guardrails=_DummyGuardrails(),
+        _subdirectory_hints=SimpleNamespace(check_tool_call=lambda n, a: ""),
+        _should_emit_quiet_tool_messages=lambda: False,
+        _should_start_quiet_spinner=lambda: False,
+        _touch_activity=lambda desc: None,
+        _record_file_mutation_result=lambda *a, **k: None,
+        _append_guardrail_observation=lambda n, a, r, failed=False: r,
+        _tool_result_content_for_active_model=lambda n, r: r,
+        _flush_messages_to_session_db=lambda msgs: None,
+        _apply_pending_steer_to_tool_results=lambda msgs, n: None,
+        _build_memory_write_metadata=lambda **k: {},
+        valid_tool_names={"memory", "ext_memory_retain", "skill_manage", "write_file", "patch"},
+        enabled_toolsets=["memory", "skills", "file"],
+        disabled_toolsets=None,
+        tool_delay=0,
+    )
+
+    assert (
+        json.loads(
+            invoke_tool(
+                dummy_agent,
+                "memory",
+                {"action": "add", "target": "memory", "content": "concurrent tainted"},
+                "persist-control",
+            )
+        )
+        == TAINT_REFUSED
+    )
+    assert (
+        json.loads(
+            invoke_tool(
+                dummy_agent,
+                "ext_memory_retain",
+                {"content": "concurrent ext tainted"},
+                "persist-control",
+            )
+        )
+        == TAINT_REFUSED
+    )
+
+    seq_messages = []
+    seq_assistant = SimpleNamespace(
+        tool_calls=[
+            _tc("memory", {"action": "add", "target": "memory", "content": "seq tainted"}),
+            _tc("ext_memory_retain", {"content": "seq ext tainted"}),
+        ]
+    )
+    execute_tool_calls_sequential(
+        dummy_agent, seq_assistant, seq_messages, "persist-control", api_call_count=1
+    )
+    assert [json.loads(m["content"]) for m in seq_messages] == [
+        TAINT_REFUSED,
+        TAINT_REFUSED,
+    ]
+    assert ext_writes == []
+    assert store.memory_entries == ["clean memory entry"]
+    assert notes_file.read_text(encoding="utf-8") == "alpha\ngamma\n"
+    assert not (hermes_home / "skills" / "tainted-skill").exists()
+
+    # 5. Legitimate read-only controls remain usable in a mid-turn tainted run.
+    read_file_res = json.loads(
+        handle_function_call(
+            "read_file", {"path": str(notes_file)}, task_id="persist-control"
+        )
+    )
+    assert "error" not in read_file_res and "gamma" in json.dumps(read_file_res)
+
+    search_res = json.loads(
+        handle_function_call(
+            "search_files",
+            {"pattern": "gamma", "path": str(tmp_path)},
+            task_id="persist-control",
+        )
+    )
+    assert "error" not in search_res
+
+    skills_list_res = json.loads(handle_function_call("skills_list", {}))
+    assert "error" not in skills_list_res
+
+    skill_view_res = json.loads(
+        handle_function_call("skill_view", {"name": "clean-skill"})
+    )
+    assert skill_view_res.get("success") is True
+
+
+def test_tainted_turn_suppresses_background_review_and_external_memory_sync():
+    from agent.turn_finalizer import finalize_turn
+
+    spawned_reviews = []
+    synced_turns = []
+
+    def _make_agent():
+        return SimpleNamespace(
+            max_iterations=10,
+            iteration_budget=SimpleNamespace(remaining=5, used=1, max_total=10),
+            no_iteration_summary=False,
+            quiet_mode=True,
+            model="test/model",
+            provider="openrouter",
+            base_url="https://openrouter.ai/api/v1",
+            session_id="sess-bg-review",
+            platform="api_server",
+            session_input_tokens=10,
+            session_output_tokens=5,
+            session_cache_read_tokens=0,
+            session_cache_write_tokens=0,
+            session_reasoning_tokens=0,
+            session_prompt_tokens=10,
+            session_completion_tokens=5,
+            session_total_tokens=15,
+            session_estimated_cost_usd=0.0,
+            session_cost_status="ok",
+            session_cost_source="estimated",
+            context_compressor=SimpleNamespace(last_prompt_tokens=10),
+            request_overrides={},
+            _tool_guardrail_halt_decision=None,
+            _response_was_previewed=False,
+            _stream_callback=None,
+            _interrupt_message=None,
+            _skill_nudge_interval=10,
+            _iters_since_skill=10,
+            valid_tool_names={"skill_manage", "memory"},
+            _save_trajectory=lambda *a, **k: None,
+            _cleanup_task_resources=lambda *a, **k: None,
+            _drop_trailing_empty_response_scaffolding=lambda msgs: None,
+            _persist_session=lambda msgs, hist: None,
+            _file_mutation_verifier_enabled=lambda: False,
+            _turn_completion_explainer_enabled=lambda: False,
+            _drain_pending_steer=lambda: None,
+            clear_interrupt=lambda: None,
+            _sync_external_memory_for_turn=lambda **kw: synced_turns.append(kw),
+            _spawn_background_review=lambda **kw: spawned_reviews.append(kw),
+        )
+
+    # 1. Clean untainted control: background review and external memory sync both run.
+    clean_bound = email_tool.bind_email_capability("", tainted=False)
+    try:
+        clean_agent = _make_agent()
+        clean_res = finalize_turn(
+            clean_agent,
+            final_response="Clean reply",
+            api_call_count=1,
+            interrupted=False,
+            failed=False,
+            messages=[
+                {"role": "user", "content": "Hello"},
+                {"role": "assistant", "content": "Clean reply"},
+            ],
+            conversation_history=[],
+            effective_task_id="task-clean",
+            turn_id="turn-clean",
+            user_message="Hello",
+            original_user_message="Hello",
+            _should_review_memory=True,
+            _turn_exit_reason="text_response(finish_reason=stop)",
+        )
+        assert clean_res.get("atlas_email_mailbox_tainted") is False
+        assert len(spawned_reviews) == 1
+        assert spawned_reviews[0]["review_memory"] is True
+        assert spawned_reviews[0]["review_skills"] is True
+        assert len(synced_turns) == 1
+    finally:
+        email_tool.clear_email_capability(clean_bound)
+
+    spawned_reviews.clear()
+    synced_turns.clear()
+
+    # 2. Tainted run: background review and external memory sync are suppressed, and result reports taint.
+    tainted_bound = email_tool.bind_email_capability(EMAIL_TOKEN, tainted=True)
+    try:
+        tainted_agent = _make_agent()
+        tainted_res = finalize_turn(
+            tainted_agent,
+            final_response="Tainted reply",
+            api_call_count=1,
+            interrupted=False,
+            failed=False,
+            messages=[
+                {"role": "user", "content": "Read my email"},
+                {"role": "assistant", "content": "Tainted reply"},
+            ],
+            conversation_history=[],
+            effective_task_id="task-tainted",
+            turn_id="turn-tainted",
+            user_message="Read my email",
+            original_user_message="Read my email",
+            _should_review_memory=True,
+            _turn_exit_reason="text_response(finish_reason=stop)",
+        )
+        assert tainted_res.get("atlas_email_mailbox_tainted") is True
+        assert spawned_reviews == []
+        assert synced_turns == []
+    finally:
+        email_tool.clear_email_capability(tainted_bound)
+
+
+def test_session_search_taints_batch_and_run_across_all_dispatch_paths(
+    tmp_path, web_probe
+):
+    from agent.agent_runtime_helpers import invoke_tool
+    from hermes_state import SessionDB
+    from tools.session_search_tool import session_search
+
+    db = SessionDB(tmp_path / "sessions.db")
+    try:
+        past_sid = db.create_session("past-mailbox-session", "api_server")
+        db.append_message(
+            past_sid,
+            role="user",
+            content="Please summarize the neighbor parcel boundary email thread",
+        )
+        db.append_message(
+            past_sid,
+            role="assistant",
+            content="The email thread discusses parcel 42 boundary survey details.",
+        )
+
+        # 1. Same-batch pre-scan on an ordinary NON-EMAIL turn (empty capability token):
+        #    both direct session_search and Tool Search bridge-wrapped session_search taint the batch
+        #    before an earlier egress tool in the same batch can run.
+        for search_call in (
+            _tc("session_search", {"query": "parcel"}),
+            _tc("session_search", {}),
+            _tc(
+                "tool_call",
+                {"name": " session_search ", "arguments": {"query": "parcel"}},
+            ),
+        ):
+            bound = email_tool.bind_email_capability("", tainted=False)
+            try:
+                assert email_tool.mailbox_read_this_run() is False
+                assert (
+                    email_tool.taint_batch_if_it_reads_mailbox(
+                        [_tc("zz_web_probe", {}), search_call]
+                    )
+                    is True
+                )
+                assert email_tool.mailbox_read_this_run() is True
+                assert _run_tool("zz_web_probe") == TAINT_REFUSED
+                assert web_probe == []
+            finally:
+                email_tool.clear_email_capability(bound)
+
+        # 2. Executing session_search directly, via registry.dispatch, or via agent invoke_tool
+        #    in discovery, read, and browse shapes taints the run before returning transcript content.
+        for call_fn in (
+            lambda: json.loads(
+                session_search(query="parcel", db=db, current_session_id="cur-sess")
+            ),
+            lambda: json.loads(
+                session_search(session_id=past_sid, db=db, current_session_id="cur-sess")
+            ),
+            lambda: json.loads(
+                session_search(db=db, current_session_id="cur-sess")
+            ),
+            lambda: json.loads(
+                registry.dispatch(
+                    "session_search",
+                    {"query": "parcel", "db": db, "current_session_id": "cur-sess"},
+                )
+            ),
+            lambda: json.loads(
+                invoke_tool(
+                    SimpleNamespace(
+                        session_id="cur-sess",
+                        _current_turn_id="t1",
+                        _current_api_request_id="r1",
+                        _get_session_db_for_recall=lambda: db,
+                    ),
+                    "session_search",
+                    {"query": "parcel"},
+                    "task-recall",
+                )
+            ),
+        ):
+            bound = email_tool.bind_email_capability("", tainted=False)
+            try:
+                assert email_tool.mailbox_read_this_run() is False
+                search_res = call_fn()
+                assert search_res.get("success") is True
+                assert email_tool.mailbox_read_this_run() is True
+                # Outbound egress and persistence writes are immediately refused in the same run.
+                assert _run_tool("zz_web_probe") == TAINT_REFUSED
+                assert (
+                    json.loads(
+                        handle_function_call(
+                            "write_file",
+                            {"path": str(tmp_path / "out.txt"), "content": "x"},
+                            task_id="task-recall",
+                        )
+                    )
+                    == TAINT_REFUSED
+                )
+            finally:
+                email_tool.clear_email_capability(bound)
+
+        # 3. Reset control: after clearing the tainted binding, a fresh untainted run can use web tools.
+        fresh_bound = email_tool.bind_email_capability("", tainted=False)
+        try:
+            assert email_tool.mailbox_read_this_run() is False
+            assert _run_tool("zz_web_probe") == {"ok": "zz_web_probe"}
+            assert web_probe == ["zz_web_probe"]
+        finally:
+            email_tool.clear_email_capability(fresh_bound)
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("endpoint", ["/chat", "/chat/stream"])
+@pytest.mark.parametrize("taint_during_turn", [False, True])
+async def test_session_chat_and_stream_return_observed_mailbox_taint_in_turn_result(
+    tmp_path, endpoint, taint_during_turn
+):
+    pytest.importorskip("aiohttp")
+    from aiohttp import web
+    from aiohttp.test_utils import TestClient, TestServer
+    from gateway.config import PlatformConfig
+    from gateway.platforms.api_server import APIServerAdapter
+    from hermes_state import SessionDB
+
+    db = SessionDB(tmp_path / "sessions.db")
+    adapter = APIServerAdapter(PlatformConfig(enabled=True))
+    adapter._session_db = db
+    app = web.Application()
+    app.router.add_post("/api/sessions/{session_id}/chat", adapter._handle_session_chat)
+    app.router.add_post(
+        "/api/sessions/{session_id}/chat/stream", adapter._handle_session_chat_stream
+    )
+    sid = db.create_session("session-taint-result", "api_server")
+
+    class _FakeAgent:
+        def __init__(self, **kwargs):
+            self.session_id = kwargs.get("session_id") or sid
+            self.model = "test/model"
+            self.provider = "openrouter"
+            self.session_prompt_tokens = 1
+            self.session_completion_tokens = 1
+            self.session_total_tokens = 2
+
+        def run_conversation(self, **kwargs):
+            if taint_during_turn:
+                email_tool._mark_tainted()
+            # Intentionally omit "atlas_email_mailbox_tainted" so the test verifies
+            # that APIServerAdapter._run_agent computes it from mailbox_read_this_run().
+            return {
+                "final_response": "Turn complete",
+                "messages": [
+                    {"role": "user", "content": kwargs.get("user_message", "")},
+                    {"role": "assistant", "content": "Turn complete"},
+                ],
+                "session_id": self.session_id,
+            }
+
+    try:
+        with patch.object(
+            adapter, "_create_agent", side_effect=lambda **kw: _FakeAgent(**kw)
+        ), patch("gateway.run._load_gateway_config", return_value={}), patch(
+            "hermes_cli.tools_config._get_platform_tools",
+            return_value={"web", "todo", "atlas_email"},
+        ):
+            async with TestClient(TestServer(app)) as client:
+                resp = await client.post(
+                    f"/api/sessions/{sid}{endpoint}",
+                    json={"message": "hello", "atlas_email_capability": EMAIL_TOKEN},
+                )
+                assert resp.status == 200
+                raw_text = await resp.text()
+                if endpoint == "/chat":
+                    payload = json.loads(raw_text)
+                    assert (
+                        payload.get("atlas_email_mailbox_tainted") is taint_during_turn
+                    )
+                else:
+                    completed_events = [
+                        json.loads(line[len("data: ") :])
+                        for line in raw_text.splitlines()
+                        if line.startswith("data: ")
+                        and '"run.completed"' in line
+                    ]
+                    if not completed_events:
+                        # Parse SSE event/data pairs when event name is on the preceding `event:` line
+                        lines = raw_text.splitlines()
+                        for idx, line in enumerate(lines):
+                            if line.strip() == "event: run.completed" and idx + 1 < len(lines):
+                                data_line = lines[idx + 1]
+                                if data_line.startswith("data: "):
+                                    completed_events.append(json.loads(data_line[len("data: ") :]))
+                    assert len(completed_events) == 1
+                    assert (
+                        completed_events[0].get("atlas_email_mailbox_tainted")
+                        is taint_during_turn
+                    )
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_replayed_session_history_and_responses_chaining_propagate_mailbox_taint_while_clean_sessions_keep_tools(
+    tmp_path, web_probe
+):
+    pytest.importorskip("aiohttp")
+    from aiohttp import web
+    from aiohttp.test_utils import TestClient, TestServer
+    from gateway.config import PlatformConfig
+    from gateway.platforms.api_server import APIServerAdapter
+    from hermes_state import SessionDB
+
+    db = SessionDB(tmp_path / "sessions.db")
+    adapter = APIServerAdapter(
+        PlatformConfig(enabled=True, extra={"key": "test-api-key"})
+    )
+    adapter._session_db = db
+    app = web.Application()
+    app.router.add_post("/api/sessions/{session_id}/chat", adapter._handle_session_chat)
+    app.router.add_post(
+        "/api/sessions/{session_id}/chat/stream", adapter._handle_session_chat_stream
+    )
+    app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
+    app.router.add_post("/v1/responses", adapter._handle_responses)
+
+    # 1. Tainted session in SessionDB with a saved atlas_email read_message tool call + tool result.
+    tainted_sid = db.create_session("session-replayed-tainted", "api_server")
+    db.append_message(tainted_sid, role="user", content="Read message m1")
+    db.append_message(
+        tainted_sid,
+        role="assistant",
+        content="",
+        tool_calls=[
+            {
+                "id": "call_read_m1",
+                "type": "function",
+                "function": {
+                    "name": "atlas_email",
+                    "arguments": json.dumps(
+                        {"operation": "read_message", "arguments": {"message_id": "m1"}}
+                    ),
+                },
+            }
+        ],
+    )
+    db.append_message(
+        tainted_sid,
+        role="tool",
+        tool_name="atlas_email",
+        tool_call_id="call_read_m1",
+        content=json.dumps(
+            {
+                "untrusted_email_content": {
+                    "message": {"id": "m1", "body": "Untrusted mailbox text"}
+                }
+            }
+        ),
+    )
+    db.append_message(
+        tainted_sid, role="assistant", content="Here is the message summary."
+    )
+
+    # 2. Clean session in SessionDB with normal prose and an untainted atlas_email propose call.
+    clean_sid = db.create_session("session-replayed-clean", "api_server")
+    db.append_message(clean_sid, role="user", content="Draft an email to Alice")
+    db.append_message(
+        clean_sid,
+        role="assistant",
+        content="",
+        tool_calls=[
+            {
+                "id": "call_propose_1",
+                "type": "function",
+                "function": {
+                    "name": "atlas_email",
+                    "arguments": json.dumps(
+                        {"operation": "propose", "arguments": PROPOSE}
+                    ),
+                },
+            }
+        ],
+    )
+    db.append_message(
+        clean_sid,
+        role="tool",
+        tool_name="atlas_email",
+        tool_call_id="call_propose_1",
+        content=json.dumps(APPROVAL),
+    )
+    db.append_message(
+        clean_sid, role="assistant", content="The draft is waiting for approval."
+    )
+
+    observed_turns = []
+    taint_next_turn = [False]
+    configured_toolsets = {
+        "web",
+        "file",
+        "memory",
+        "skills",
+        "session_search",
+        "todo",
+    }
+
+    class _RecordingAgent:
+        def __init__(self, **kwargs):
+            self.session_id = kwargs.get("session_id")
+            self.enabled_toolsets = list(kwargs.get("enabled_toolsets") or [])
+            self.model = "test/model"
+            self.provider = "openrouter"
+            self.session_prompt_tokens = 1
+            self.session_completion_tokens = 1
+            self.session_total_tokens = 2
+
+        def run_conversation(self, **kwargs):
+            if taint_next_turn[0]:
+                email_tool._mark_tainted()
+            history = list(kwargs.get("conversation_history") or [])
+            user_msg = kwargs.get("user_message", "")
+            tainted_now = email_tool.mailbox_read_this_run()
+            probe_out = _run_tool("zz_web_probe")
+            web_probe.clear()
+            observed_turns.append(
+                {
+                    "session_id": self.session_id,
+                    "enabled_toolsets": sorted(self.enabled_toolsets),
+                    "tainted_in_run": tainted_now,
+                    "probe_out": probe_out,
+                    "history_len": len(history),
+                }
+            )
+            messages = list(history)
+            messages.append({"role": "user", "content": user_msg})
+            if taint_next_turn[0]:
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "call_ss_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "session_search",
+                                    "arguments": json.dumps({"query": "m1"}),
+                                },
+                            }
+                        ],
+                    }
+                )
+                messages.append(
+                    {
+                        "role": "tool",
+                        "name": "session_search",
+                        "tool_name": "session_search",
+                        "tool_call_id": "call_ss_1",
+                        "content": json.dumps({"success": True, "results": []}),
+                    }
+                )
+            messages.append({"role": "assistant", "content": "Turn complete"})
+            return {
+                "final_response": "Turn complete",
+                "messages": messages,
+                "session_id": self.session_id,
+            }
+
+    try:
+        with patch(
+            "gateway.run._resolve_runtime_agent_kwargs",
+            return_value={
+                "api_key": "synthetic",
+                "base_url": None,
+                "provider": None,
+                "api_mode": None,
+                "command": None,
+                "args": [],
+            },
+        ), patch(
+            "gateway.run._resolve_gateway_model", return_value="test/model"
+        ), patch(
+            "gateway.run._load_gateway_config", return_value={}
+        ), patch(
+            "hermes_cli.tools_config._get_platform_tools",
+            return_value=configured_toolsets,
+        ), patch(
+            "gateway.run._current_max_iterations", return_value=90
+        ), patch(
+            "run_agent.AIAgent", side_effect=lambda **kw: _RecordingAgent(**kw)
+        ):
+            async with TestClient(TestServer(app)) as client:
+                auth_headers = {"Authorization": "Bearer test-api-key"}
+                # 1. Tainted stored history replayed on /api/sessions/{id}/chat without taint flag in request.
+                r_chat = await client.post(
+                    f"/api/sessions/{tainted_sid}/chat",
+                    headers=auth_headers,
+                    json={"message": "Follow up", "atlas_email_capability": EMAIL_TOKEN},
+                )
+                assert r_chat.status == 200
+                assert (await r_chat.json()).get("atlas_email_mailbox_tainted") is True
+                assert observed_turns[-1]["enabled_toolsets"] == ["atlas_email", "todo"]
+                assert observed_turns[-1]["tainted_in_run"] is True
+                assert observed_turns[-1]["probe_out"] == TAINT_REFUSED
+
+                # 2. Tainted stored history replayed on /api/sessions/{id}/chat/stream without taint flag.
+                r_stream = await client.post(
+                    f"/api/sessions/{tainted_sid}/chat/stream",
+                    headers=auth_headers,
+                    json={"message": "Follow up stream", "atlas_email_capability": EMAIL_TOKEN},
+                )
+                assert r_stream.status == 200
+                _ = await r_stream.text()
+                assert observed_turns[-1]["enabled_toolsets"] == ["atlas_email", "todo"]
+                assert observed_turns[-1]["tainted_in_run"] is True
+                assert observed_turns[-1]["probe_out"] == TAINT_REFUSED
+
+                # 3. Tainted stored history replayed on /v1/chat/completions via X-Hermes-Session-Id.
+                r_cc = await client.post(
+                    "/v1/chat/completions",
+                    headers={
+                        **auth_headers,
+                        "X-Hermes-Session-Id": tainted_sid,
+                    },
+                    json={"messages": [{"role": "user", "content": "Continue on /v1/chat/completions"}]},
+                )
+                assert r_cc.status == 200
+                assert observed_turns[-1]["enabled_toolsets"] == ["todo"]
+                assert observed_turns[-1]["tainted_in_run"] is True
+                assert observed_turns[-1]["probe_out"] == TAINT_REFUSED
+
+                # 4. Clean session controls (including prior atlas_email propose) keep all tools enabled.
+                r_clean_chat = await client.post(
+                    f"/api/sessions/{clean_sid}/chat",
+                    headers=auth_headers,
+                    json={"message": "Clean chat", "atlas_email_capability": EMAIL_TOKEN},
+                )
+                assert r_clean_chat.status == 200
+                assert (await r_clean_chat.json()).get("atlas_email_mailbox_tainted") is False
+                assert {
+                    "atlas_email",
+                    "web",
+                    "file",
+                    "memory",
+                    "skills",
+                    "session_search",
+                    "todo",
+                } <= set(observed_turns[-1]["enabled_toolsets"])
+                assert observed_turns[-1]["tainted_in_run"] is False
+                assert observed_turns[-1]["probe_out"] == {"ok": "zz_web_probe"}
+
+                r_clean_stream = await client.post(
+                    f"/api/sessions/{clean_sid}/chat/stream",
+                    headers=auth_headers,
+                    json={"message": "Clean stream", "atlas_email_capability": EMAIL_TOKEN},
+                )
+                assert r_clean_stream.status == 200
+                _ = await r_clean_stream.text()
+                assert {
+                    "atlas_email",
+                    "web",
+                    "file",
+                    "memory",
+                    "skills",
+                    "session_search",
+                    "todo",
+                } <= set(observed_turns[-1]["enabled_toolsets"])
+                assert observed_turns[-1]["tainted_in_run"] is False
+                assert observed_turns[-1]["probe_out"] == {"ok": "zz_web_probe"}
+
+                r_clean_cc = await client.post(
+                    "/v1/chat/completions",
+                    headers={
+                        **auth_headers,
+                        "X-Hermes-Session-Id": clean_sid,
+                    },
+                    json={"messages": [{"role": "user", "content": "Clean chat completions"}]},
+                )
+                assert r_clean_cc.status == 200
+                assert {
+                    "web",
+                    "file",
+                    "memory",
+                    "skills",
+                    "session_search",
+                    "todo",
+                } <= set(observed_turns[-1]["enabled_toolsets"])
+                assert observed_turns[-1]["tainted_in_run"] is False
+                assert observed_turns[-1]["probe_out"] == {"ok": "zz_web_probe"}
+
+                # 5. /v1/responses chaining via previous_response_id and conversation:
+                #    tainted turn 1 taints chained turn 2 on both paths; clean chain keeps tools.
+                taint_next_turn[0] = True
+                r_resp1 = await client.post(
+                    "/v1/responses",
+                    headers=auth_headers,
+                    json={"input": "Turn 1 reads transcript", "conversation": "conv-tainted"},
+                )
+                assert r_resp1.status == 200
+                resp1_id = (await r_resp1.json())["id"]
+                taint_next_turn[0] = False
+
+                r_resp2_prev = await client.post(
+                    "/v1/responses",
+                    headers=auth_headers,
+                    json={
+                        "input": "Turn 2 via previous_response_id",
+                        "previous_response_id": resp1_id,
+                    },
+                )
+                assert r_resp2_prev.status == 200
+                assert observed_turns[-1]["enabled_toolsets"] == ["todo"]
+                assert observed_turns[-1]["tainted_in_run"] is True
+                assert observed_turns[-1]["probe_out"] == TAINT_REFUSED
+
+                r_resp2_conv = await client.post(
+                    "/v1/responses",
+                    headers=auth_headers,
+                    json={
+                        "input": "Turn 2 via conversation",
+                        "conversation": "conv-tainted",
+                    },
+                )
+                assert r_resp2_conv.status == 200
+                assert observed_turns[-1]["enabled_toolsets"] == ["todo"]
+                assert observed_turns[-1]["tainted_in_run"] is True
+                assert observed_turns[-1]["probe_out"] == TAINT_REFUSED
+
+                # Clean /v1/responses chain control
+                r_clean_resp1 = await client.post(
+                    "/v1/responses",
+                    headers=auth_headers,
+                    json={"input": "Clean responses turn 1", "conversation": "conv-clean"},
+                )
+                assert r_clean_resp1.status == 200
+                clean_resp1_id = (await r_clean_resp1.json())["id"]
+
+                r_clean_resp2_prev = await client.post(
+                    "/v1/responses",
+                    headers=auth_headers,
+                    json={
+                        "input": "Clean responses turn 2 via previous_response_id",
+                        "previous_response_id": clean_resp1_id,
+                    },
+                )
+                assert r_clean_resp2_prev.status == 200
+                assert {
+                    "web",
+                    "file",
+                    "memory",
+                    "skills",
+                    "session_search",
+                    "todo",
+                } <= set(observed_turns[-1]["enabled_toolsets"])
+                assert observed_turns[-1]["tainted_in_run"] is False
+                assert observed_turns[-1]["probe_out"] == {"ok": "zz_web_probe"}
+
+                r_clean_resp2_conv = await client.post(
+                    "/v1/responses",
+                    headers=auth_headers,
+                    json={
+                        "input": "Clean responses turn 2 via conversation",
+                        "conversation": "conv-clean",
+                    },
+                )
+                assert r_clean_resp2_conv.status == 200
+                assert {
+                    "web",
+                    "file",
+                    "memory",
+                    "skills",
+                    "session_search",
+                    "todo",
+                } <= set(observed_turns[-1]["enabled_toolsets"])
+                assert observed_turns[-1]["tainted_in_run"] is False
+                assert observed_turns[-1]["probe_out"] == {"ok": "zz_web_probe"}
+    finally:
+        db.close()
