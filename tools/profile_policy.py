@@ -21,12 +21,17 @@ _active_policy = ContextVar('profile_tool_policy', default=None)
 _active_tools = ContextVar('profile_callable_names', default=None)
 
 
+def active_callable_names():
+    """The current turn's immutable ceiling, also used to isolate schema caches."""
+    return _active_tools.get()
+
+
 def get_profile_tool_policy():
     """Read a fresh policy; malformed explicit configuration never grants access."""
     import yaml
     home = get_hermes_home().resolve()
     try:
-        config = yaml.safe_load((home / 'config.yaml').read_text()) or {}
+        config = yaml.safe_load((home / 'config.yaml').read_text(encoding='utf-8')) or {}
     except FileNotFoundError:
         config = {}
     if not isinstance(config, dict):
@@ -105,9 +110,24 @@ def initialize_tool_policy(fn):
     @wraps(fn)
     def initialize(agent, *args, **kwargs):
         agent._tool_policy = get_profile_tool_policy()
+        from agent.skill_utils import external_only_skills, approved_skill_roots
+        if external_only_skills() and not approved_skill_roots():
+            raise ValueError('skills.external_only requires usable skills.external_dirs')
         with active_tool_policy(agent._tool_policy):
             result = fn(agent, *args, **kwargs)
             agent.tools = [t for t in agent.tools if tool_refusal(t['function']['name']) is None]
-            agent.valid_tool_names = {t['function']['name'] for t in agent.tools}
+            names = {t['function']['name'] for t in agent.tools}
+            from tools.tool_search import BRIDGE_TOOL_NAMES
+            if names & BRIDGE_TOOL_NAMES:
+                # Deferred tools remain callable through the bridge. Freeze the
+                # authorized underlying catalog at initialization as well.
+                from model_tools import get_tool_definitions
+                catalog = get_tool_definitions(
+                    enabled_toolsets=agent.enabled_toolsets,
+                    disabled_toolsets=agent.disabled_toolsets,
+                    quiet_mode=True, skip_tool_search_assembly=True,
+                )
+                names.update(t['function']['name'] for t in catalog)
+            agent.valid_tool_names = frozenset(names)
             return result
     return initialize

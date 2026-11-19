@@ -694,9 +694,8 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
     # Collect directories to scan — same resolution as the scan loop below
     # (_skills_dir() resolves the LIVE profile HERMES_HOME; the module-level
     # SKILLS_DIR can be stale in long-lived runtimes).
-    dirs_to_scan: list = []
-    active_skills_dir = _skills_dir()
-    dirs_to_scan = get_all_skills_dirs()
+    dirs_to_scan = (get_all_skills_dirs() if external_only_skills()
+                    else [_skills_dir(), *get_external_skills_dirs()])
 
     signature = _skills_scan_signature(dirs_to_scan, disabled)
     now = time.monotonic()
@@ -1082,9 +1081,9 @@ def skill_view(
                 )
 
         # Build list of all skill directories to search
-        all_dirs = []
         active_skills_dir = _skills_dir()
-        all_dirs = get_all_skills_dirs()
+        all_dirs = (get_all_skills_dirs() if external_only_skills()
+                    else [active_skills_dir, *get_external_skills_dirs()])
 
         if not all_dirs:
             return json.dumps(

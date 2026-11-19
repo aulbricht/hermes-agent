@@ -316,7 +316,7 @@ def get_tool_definitions(
     # user-visible config edits that affect dynamic schemas (execute_code
     # mode, discord action allowlist, etc.) without needing an explicit
     # invalidate hook on every config-writer.
-    from tools.profile_policy import effective_tool_policy, tool_refusal
+    from tools.profile_policy import effective_tool_policy, tool_refusal, active_callable_names
     policy = effective_tool_policy()
     if quiet_mode:
         try:
@@ -331,6 +331,7 @@ def get_tool_definitions(
             frozenset(disabled_toolsets) if disabled_toolsets else None,
             registry._generation,
             policy,
+            active_callable_names(),
             cfg_fp,
             bool(os.environ.get("HERMES_KANBAN_TASK")),
             bool(skip_tool_search_assembly),
@@ -599,7 +600,7 @@ def _compute_tool_definitions(
     except Exception as e:  # pragma: no cover — never break tool loading
         logger.warning("Tool search assembly skipped: %s", e)
 
-    return filtered_tools
+    return [t for t in filtered_tools if tool_refusal(t['function']['name']) is None]
 
 
 def _resolve_active_context_length() -> int:

@@ -1521,7 +1521,9 @@ class APIServerAdapter(BasePlatformAdapter):
         this session — its model/provider/api_key/base_url override the
         global defaults for this agent instance only.
         """
-        self._validate_toolset_scope(toolset_scope)
+        from tools.profile_policy import get_profile_tool_policy
+        if get_profile_tool_policy().require_explicit_scope:
+            self._validate_toolset_scope(toolset_scope)
         from run_agent import AIAgent
         from gateway.run import (
             _current_max_iterations,
@@ -1639,10 +1641,23 @@ class APIServerAdapter(BasePlatformAdapter):
         if atlas_email_mailbox_tainted:
             # An earlier turn read mailbox content: no egress-capable toolset, however
             # it was configured or requested through toolset_scope.
-            from tools.atlas_email_tool import taint_blocks_toolset
+            from tools.atlas_email_tool import taint_blocks_toolset, TAINT_ALLOWED_READ_ONLY_TOOLS
+            from tools.profile_policy import effective_tool_policy
+            from toolsets import resolve_toolset
+            policy = effective_tool_policy()
+
+            def safe_skill_reads(name):
+                # Retain the requested skills toolset only when profile policy
+                # has removed every tool other than the existing safe reads.
+                # The ordinary profile's skill_manage remains taint-blocked.
+                if name != 'skills':
+                    return False
+                callable_names = set(resolve_toolset(name)) - policy.denied_tools
+                return bool(callable_names) and callable_names <= TAINT_ALLOWED_READ_ONLY_TOOLS
+
             enabled_toolsets = sorted(
                 name for name in enabled_toolsets
-                if not taint_blocks_toolset(name)
+                if not taint_blocks_toolset(name) or safe_skill_reads(name)
             )
 
         max_iterations = _current_max_iterations()
@@ -4662,7 +4677,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     agent_ref[0] = agent
                 effective_task_id = session_id or str(uuid.uuid4())
                 from tools.profile_policy import active_tool_policy, effective_tool_policy
-                with active_tool_policy(effective_tool_policy(agent), agent.valid_tool_names):
+                with active_tool_policy(effective_tool_policy(agent), getattr(agent, 'valid_tool_names', None)):
                     result = agent.run_conversation(
                         user_message=user_message,
                         conversation_history=conversation_history,
@@ -5008,7 +5023,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         register_gateway_notify(approval_session_key, _approval_notify)
                         from tools.profile_policy import active_tool_policy, effective_tool_policy
                         with _turn_capabilities(turn_options), active_tool_policy(
-                                effective_tool_policy(agent), agent.valid_tool_names):
+                                effective_tool_policy(agent), getattr(agent, 'valid_tool_names', None)):
                             r = agent.run_conversation(
                                 user_message=user_message,
                                 conversation_history=conversation_history,

@@ -510,10 +510,9 @@ def external_only_skills() -> bool:
 
 
 def approved_skill_roots() -> List[Path]:
-    roots = [d.resolve() for d in get_external_skills_dirs() if d.is_dir()]
-    if external_only_skills() and not roots:
-        raise ValueError("skills.external_only requires usable skills.external_dirs")
-    return roots
+    # Discovery must stay empty if a release root disappears after startup.
+    # Initialization validates the roots separately; never fall back to local skills.
+    return [d.resolve() for d in get_external_skills_dirs() if d.is_dir()]
 
 
 def approved_skill_path(path) -> bool:
