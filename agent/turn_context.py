@@ -22,6 +22,8 @@ move-and-name refactor with no semantic change.
 
 from __future__ import annotations
 
+from tools.profile_policy import memory_allowed
+
 import logging
 import threading
 import uuid
@@ -548,7 +550,7 @@ def build_turn_context(
         agent._interrupt_thread_signal_pending = False
 
     # Notify memory providers of the new turn (BEFORE prefetch_all).
-    if agent._memory_manager:
+    if memory_allowed(agent) and agent._memory_manager:
         try:
             _turn_msg = original_user_message if isinstance(original_user_message, str) else ""
             agent._memory_manager.on_turn_start(agent._user_turn_count, _turn_msg)
@@ -557,7 +559,7 @@ def build_turn_context(
 
     # External memory provider: prefetch once before the tool loop.
     ext_prefetch_cache = ""
-    if agent._memory_manager:
+    if memory_allowed(agent) and agent._memory_manager:
         try:
             _query = original_user_message if isinstance(original_user_message, str) else ""
             ext_prefetch_cache = agent._memory_manager.prefetch_all(_query) or ""

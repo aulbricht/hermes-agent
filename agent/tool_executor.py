@@ -12,6 +12,8 @@ extracted functions reach back through the ``run_agent`` module via
 
 from __future__ import annotations
 
+from tools.profile_policy import scoped_agent_tools, tool_refusal
+
 import concurrent.futures
 import json
 import logging
@@ -253,7 +255,7 @@ def _tool_search_scoped_names(agent) -> frozenset:
             quiet_mode=True,
             skip_tool_search_assembly=True,
         ) or []
-        names = _ts.scoped_deferrable_names(scoped_defs)
+        names = frozenset(n for n in _ts.scoped_deferrable_names(scoped_defs) if tool_refusal(n, agent=agent) is None)
     except Exception:
         names = frozenset()
     try:
@@ -271,6 +273,8 @@ def _apply_tool_request_middleware_for_agent(
     effective_task_id: str,
     tool_call_id: str,
 ) -> tuple[dict, list[dict[str, Any]]]:
+    if tool_refusal(function_name, agent=agent) is not None:
+        return function_args, []
     try:
         from hermes_cli.middleware import apply_tool_request_middleware
 
@@ -322,6 +326,7 @@ def _run_agent_tool_execution_middleware(
     return result, observed_args
 
 
+@scoped_agent_tools
 def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
     """Execute multiple tool calls concurrently using a thread pool.
 
@@ -415,6 +420,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         except Exception:
             pass
 
+        _ts_scope_block = _ts_scope_block or tool_refusal(function_name, agent=agent)
         function_args, middleware_trace = _apply_tool_request_middleware_for_agent(
             agent,
             function_name=function_name,
@@ -1019,6 +1025,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
 
 
 
+@scoped_agent_tools
 def execute_tool_calls_sequential(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
     """Execute tool calls sequentially (original behavior). Used for single calls or interactive tools."""
     from tools.atlas_email_tool import mailbox_read_this_run
@@ -1088,6 +1095,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         except Exception:
             pass
 
+        _ts_scope_block = _ts_scope_block or tool_refusal(function_name, agent=agent)
         function_args, middleware_trace = _apply_tool_request_middleware_for_agent(
             agent,
             function_name=function_name,
@@ -1485,7 +1493,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     session_id=agent.session_id or "",
                     turn_id=getattr(agent, "_current_turn_id", "") or "",
                     api_request_id=getattr(agent, "_current_api_request_id", "") or "",
-                    enabled_tools=list(agent.valid_tool_names) if agent.valid_tool_names else None,
+                    enabled_tools=list(agent.valid_tool_names),
                     skip_pre_tool_call_hook=True,
                     skip_tool_request_middleware=True,
                     enabled_toolsets=getattr(agent, "enabled_toolsets", None),
@@ -1527,7 +1535,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     session_id=agent.session_id or "",
                     turn_id=getattr(agent, "_current_turn_id", "") or "",
                     api_request_id=getattr(agent, "_current_api_request_id", "") or "",
-                    enabled_tools=list(agent.valid_tool_names) if agent.valid_tool_names else None,
+                    enabled_tools=list(agent.valid_tool_names),
                     skip_pre_tool_call_hook=True,
                     skip_tool_request_middleware=True,
                     enabled_toolsets=getattr(agent, "enabled_toolsets", None),

@@ -22,6 +22,8 @@ Methods covered:
 
 from __future__ import annotations
 
+from tools.profile_policy import scoped_agent_tools, tool_refusal
+
 import copy
 import json
 import logging
@@ -2152,6 +2154,7 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
             )
 
 
+@scoped_agent_tools
 def invoke_tool(agent, function_name: str, function_args: dict, effective_task_id: str,
                  tool_call_id: Optional[str] = None, messages: list = None,
                  pre_tool_block_checked: bool = False,
@@ -2163,6 +2166,9 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
     tools. Used by the concurrent execution path; the sequential path retains
     its own inline invocation for backward-compatible display handling.
     """
+    refusal = tool_refusal(function_name, agent=agent)
+    if refusal is not None:
+        return refusal
     from tools.atlas_email_tool import refuse_if_tainted
     if (function_name == "memory"
             or function_name in getattr(agent, "_context_engine_tool_names", set())
@@ -2347,7 +2353,7 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 session_id=agent.session_id or "",
                 turn_id=getattr(agent, "_current_turn_id", "") or "",
                 api_request_id=getattr(agent, "_current_api_request_id", "") or "",
-                enabled_tools=list(agent.valid_tool_names) if agent.valid_tool_names else None,
+                enabled_tools=list(agent.valid_tool_names),
                 skip_pre_tool_call_hook=True,
                 skip_tool_request_middleware=True,
                 enabled_toolsets=getattr(agent, "enabled_toolsets", None),

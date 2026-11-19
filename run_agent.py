@@ -31,6 +31,8 @@ except ModuleNotFoundError:
     # means UTF-8 stdio setup is skipped on Windows; POSIX is unaffected.
     pass
 
+from tools.profile_policy import scoped_agent_tools, memory_allowed
+
 import asyncio
 import base64
 import copy
@@ -3414,7 +3416,7 @@ class AIAgent:
             return
         if interrupted:
             return
-        if not (self._memory_manager and final_response and original_user_message):
+        if not (memory_allowed(self) and self._memory_manager and final_response and original_user_message):
             return
         # Multimodal turns carry content as a list of typed parts; providers
         # expect plain strings, so flatten to text first (newline-joined for
@@ -5808,6 +5810,7 @@ class AIAgent:
         from agent.chat_completion_helpers import handle_max_iterations
         return handle_max_iterations(self, messages, api_call_count)
 
+    @scoped_agent_tools
     def run_conversation(
         self,
         user_message: str,

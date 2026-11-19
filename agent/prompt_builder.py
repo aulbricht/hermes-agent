@@ -1468,7 +1468,9 @@ def build_skills_system_prompt(
     descriptions are dropped, and a footer note explains the demotion.
     """
     skills_dir = get_skills_dir()
-    external_dirs = get_all_skills_dirs()[1:]  # skip local (index 0)
+    from agent.skill_utils import external_only_skills, approved_skill_roots
+    strict = external_only_skills()
+    external_dirs = approved_skill_roots() if strict else get_all_skills_dirs()[1:]
 
     if not skills_dir.exists() and not external_dirs:
         return ""
@@ -1480,6 +1482,7 @@ def build_skills_system_prompt(
     disabled = get_disabled_skill_names(_platform_hint or None)
     cache_key = (
         str(skills_dir),
+        strict,
         tuple(str(d) for d in external_dirs),
         tuple(sorted(str(t) for t in (available_tools or set()))),
         tuple(sorted(str(ts) for ts in (available_toolsets or set()))),
@@ -1494,7 +1497,7 @@ def build_skills_system_prompt(
             return cached
 
     # ── Layer 2: disk snapshot ────────────────────────────────────────
-    snapshot = _load_skills_snapshot(skills_dir)
+    snapshot = {"skills": []} if strict else _load_skills_snapshot(skills_dir)
 
     skills_by_category: dict[str, list[tuple[str, str]]] = {}
     category_descriptions: dict[str, str] = {}

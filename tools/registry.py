@@ -620,6 +620,10 @@ class ToolRegistry:
         * All exceptions are caught and returned as ``{"error": "..."}``
           for consistent error format.
         """
+        from tools.profile_policy import tool_refusal
+        refusal = tool_refusal(name)
+        if refusal is not None:
+            return refusal
         entry = self.get_entry(name)
         if not entry:
             return json.dumps({"error": f"Unknown tool: {name}"})

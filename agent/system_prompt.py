@@ -23,6 +23,8 @@ Pure helpers that read the agent's state.  AIAgent keeps thin forwarders.
 
 from __future__ import annotations
 
+from tools.profile_policy import memory_allowed
+
 import json
 import os
 from typing import Any, Dict, List, Optional
@@ -457,7 +459,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # ── Volatile tier (changes per session/turn — never cached) ───
     volatile_parts: List[str] = []
 
-    if agent._memory_store:
+    if memory_allowed(agent) and agent._memory_store:
         if agent._memory_enabled:
             mem_block = agent._memory_store.format_for_system_prompt("memory")
             if mem_block:
@@ -469,7 +471,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
                 volatile_parts.append(user_block)
 
     # External memory provider system prompt block (additive to built-in)
-    if agent._memory_manager:
+    if memory_allowed(agent) and agent._memory_manager:
         try:
             _ext_mem_block = agent._memory_manager.build_system_prompt()
             if _ext_mem_block:
@@ -534,7 +536,7 @@ def invalidate_system_prompt(agent: Any) -> None:
     so the rebuilt prompt captures any writes from this session.
     """
     agent._cached_system_prompt = None
-    if agent._memory_store:
+    if memory_allowed(agent) and agent._memory_store:
         agent._memory_store.load_from_disk()
 
 
