@@ -743,6 +743,10 @@ class MemoryManager:
         Returns JSON string result. Raises ValueError if no provider
         handles the tool.
         """
+        from tools.atlas_email_tool import refuse_if_tainted
+        refusal = refuse_if_tainted(tool_name, 'memory')
+        if refusal is not None:
+            return refusal
         provider = self._tool_to_provider.get(tool_name)
         if provider is None:
             return tool_error(f"No memory provider handles tool '{tool_name}'")

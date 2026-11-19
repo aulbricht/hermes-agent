@@ -642,6 +642,8 @@ def session_search(
     ``@session:<profile>/<id>`` link). Scroll wins over read/discovery when an
     anchor is set — the agent has asked for a specific slice.
     """
+    from tools.atlas_email_tool import _mark_tainted
+    _mark_tainted()
     if db is None:
         try:
             from hermes_state import SessionDB

@@ -1334,6 +1334,10 @@ def skill_manage(
 
     Returns JSON string with results.
     """
+    from tools.atlas_email_tool import refuse_if_tainted
+    refusal = refuse_if_tainted('skill_manage', 'skills')
+    if refusal is not None:
+        return refusal
     preflight = _background_review_preflight(action, name)
     if preflight is not None:
         return json.dumps(preflight, ensure_ascii=False)

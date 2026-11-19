@@ -1619,6 +1619,9 @@ class AIAgent:
         here so existing tests that patch ``run_agent.threading.Thread``
         keep working.
         """
+        from tools.atlas_email_tool import mailbox_read_this_run
+        if mailbox_read_this_run():
+            return
         from agent.background_review import spawn_background_review_thread
         from tools.thread_context import propagate_context_to_thread
         target, _prompt = spawn_background_review_thread(
@@ -3406,6 +3409,9 @@ class AIAgent:
         providers are strictly best-effort — a misconfigured or offline
         backend must not block the user from seeing their response.
         """
+        from tools.atlas_email_tool import mailbox_read_this_run
+        if mailbox_read_this_run():
+            return
         if interrupted:
             return
         if not (self._memory_manager and final_response and original_user_message):

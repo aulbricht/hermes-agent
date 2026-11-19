@@ -48,16 +48,23 @@ _SCHEMA = {
 # thread, which runs in a copied context, is still seen by the run that bound it.
 _tainted: ContextVar[dict] = ContextVar("atlas_email_tainted", default=None)
 _TAINT_REFUSED = '{"error":"Web tools are switched off after reading email in this turn"}'
-# Toolsets whose tools can send data to an address the model (or an injected email)
-# chooses. Found enabled by default for api_server in toolsets._HERMES_CORE_TOOLS:
-# web (web_search, web_extract), browser/browser-cdp, terminal (+process), code_execution,
-# vision (fetches URLs), image_gen, homeassistant, delegation, cronjob, plus x_search,
-# video/video_gen and MCP tools where configured. Production's enabled set is config-driven.
+# Start-of-turn schemas are restricted to capability-bound Atlas tools and local
+# controls. Mid-turn checks preserve the cached schema and permit safe reads.
+TAINT_ALLOWED_TOOLSETS = frozenset({
+    "atlas_email", "atlas_import", "atlas_ownership", "atlas_query", "todo", "clarify",
+})
+TAINT_ALLOWED_READ_ONLY_TOOLS = frozenset({
+    "read_file", "search_files", "skills_list", "skill_view", "session_search",
+})
+
+# Compatibility export for callers inspecting the legacy known blocked sets.
+# Enforcement uses the allow-list above, so newly registered toolsets fail closed.
 TAINT_BLOCKED_TOOLSETS = frozenset({
     "web", "browser", "browser-cdp", "terminal", "code_execution", "vision", "image_gen",
     "homeassistant", "delegation", "cronjob", "x_search", "video", "video_gen",
     "search", "tts", "spotify", "discord", "discord_admin", "yuanbao", "feishu_doc",
-    "feishu_drive", "computer_use", "debugging", "safe", "coding",
+    "feishu_drive", "computer_use", "debugging", "safe", "coding", "file", "memory",
+    "skills", "session_search", "kanban", "project", "context_engine",
 })
 
 
@@ -80,7 +87,9 @@ def mailbox_read_this_run() -> bool:
 
 def _mark_tainted() -> None:
     holder = _tainted.get()
-    if holder is not None:
+    if holder is None:
+        _tainted.set({"read": True})
+    else:
         holder["read"] = True
 
 
@@ -101,21 +110,56 @@ def _is_mailbox_read(name, arguments) -> bool:
         name, arguments = arguments.get("name"), arguments.get("arguments")
     else:
         return True
+    if name == "session_search":
+        return True
     if name != "atlas_email":
         return False
     # An unreadable atlas_email call is treated as a read: err safe.
     return not isinstance(arguments, dict) or arguments.get("operation") in ("list_messages", "read_message")
 
 
+def _history_tool_call(call):
+    def field(obj, key, default=None):
+        return obj.get(key, default) if isinstance(obj, dict) else getattr(obj, key, default)
+    function = field(call, "function") or call
+    return field(function, "name"), field(function, "arguments")
+
+
+def conversation_history_is_mailbox_tainted(messages) -> bool:
+    """Recognize stored reads before replaying any transcript into a new run."""
+    for msg in messages or []:
+        if not isinstance(msg, dict):
+            continue
+        if any(_is_mailbox_read(*_history_tool_call(call)) for call in msg.get("tool_calls") or []):
+            return True
+        if msg.get("role") != "tool":
+            continue
+        name = str(msg.get("tool_name") or msg.get("name") or "").strip()
+        content = msg.get("content")
+        if isinstance(content, str):
+            try:
+                content = json.loads(content)
+            except (ValueError, RecursionError):
+                content = None
+        if name == "session_search" or (isinstance(content, dict) and "untrusted_email_content" in content):
+            return True
+        if name == "atlas_email" and not (
+            isinstance(content, dict) and content.get("status") == "waiting_for_approval"
+            and "untrusted_email_content" not in content
+        ):
+            return True
+    return False
+
+
 def taint_batch_if_it_reads_mailbox(tool_calls) -> bool:
     """Called once per model response BEFORE any of its tool calls runs (sequential or
     concurrent). If any call in the batch reads the mailbox, the run is tainted now, so
     every egress-capable call in the same batch is refused whatever the execution order."""
-    if _tainted.get() is None or not _capability.get():
+    if _tainted.get() is None:
         return False
     for call in tool_calls or []:
-        function = getattr(call, "function", None)
-        if _is_mailbox_read(getattr(function, "name", None), getattr(function, "arguments", None)):
+        name, arguments = _history_tool_call(call)
+        if _is_mailbox_read(name, arguments):
             _mark_tainted()
             return True
     return False
@@ -123,14 +167,13 @@ def taint_batch_if_it_reads_mailbox(tool_calls) -> bool:
 
 def taint_blocks_toolset(toolset: str) -> bool:
     """Shared dispatch/start-of-turn policy, including dynamically named MCP sets."""
-    return toolset in TAINT_BLOCKED_TOOLSETS or (
-        isinstance(toolset, str) and toolset.startswith("mcp-")
-    )
+    return toolset not in TAINT_ALLOWED_TOOLSETS
 
 
 def refuse_if_tainted(tool_name: str, toolset: str):
     """Fixed refusal text when an egress-capable tool is called after mailbox content was read."""
-    if taint_blocks_toolset(toolset) and mailbox_read_this_run():
+    if (mailbox_read_this_run() and taint_blocks_toolset(toolset)
+            and tool_name not in TAINT_ALLOWED_READ_ONLY_TOOLS):
         return _TAINT_REFUSED
     return None
 

@@ -1032,6 +1032,7 @@ class APIServerAdapter(BasePlatformAdapter):
         self._runner: Optional["web.AppRunner"] = None
         self._site: Optional["web.TCPSite"] = None
         self._response_store = ResponseStore()
+        self._tainted_session_ids: set[str] = set()
         # Active run streams: run_id -> asyncio.Queue of SSE event dicts
         self._run_streams: Dict[str, "asyncio.Queue[Optional[Dict]]"] = {}
         # Creation timestamps for orphaned-run TTL sweep
@@ -1638,11 +1639,9 @@ class APIServerAdapter(BasePlatformAdapter):
             # An earlier turn read mailbox content: no egress-capable toolset, however
             # it was configured or requested through toolset_scope.
             from tools.atlas_email_tool import taint_blocks_toolset
-            from hermes_cli.tools_config import enabled_mcp_server_names
-            mcp_servers = enabled_mcp_server_names(user_config)
             enabled_toolsets = sorted(
                 name for name in enabled_toolsets
-                if not taint_blocks_toolset(name) and name not in mcp_servers
+                if not taint_blocks_toolset(name)
             )
 
         max_iterations = _current_max_iterations()
@@ -2019,6 +2018,32 @@ class APIServerAdapter(BasePlatformAdapter):
             return None, web.json_response(_openai_error(f"Session not found: {session_id}", code="session_not_found"), status=404)
         return session, None
 
+    def _session_is_mailbox_tainted(self, session_id: Optional[str]) -> bool:
+        if not session_id:
+            return False
+        if session_id in self._tainted_session_ids:
+            return True
+        from tools.atlas_email_tool import conversation_history_is_mailbox_tainted
+        db = self._ensure_session_db()
+        if db is None:
+            return False
+        # Include inactive and ancestor transcripts: compression and branching
+        # cannot erase the trust boundary of replayed content.
+        history = db.get_messages_as_conversation(
+            session_id, include_ancestors=True, include_inactive=True,
+        )
+        return conversation_history_is_mailbox_tainted(history)
+
+    def _record_mailbox_taint(self, result, *session_ids, tainted=False) -> bool:
+        from tools.atlas_email_tool import mailbox_read_this_run
+        observed = bool(tainted or mailbox_read_this_run()
+                        or (isinstance(result, dict) and result.get("atlas_email_mailbox_tainted")))
+        if isinstance(result, dict):
+            result["atlas_email_mailbox_tainted"] = observed
+        if observed:
+            self._tainted_session_ids.update(sid for sid in session_ids if isinstance(sid, str) and sid)
+        return observed
+
     def _conversation_history_for_session(self, session_id: str) -> List[Dict[str, Any]]:
         db = self._ensure_session_db()
         if db is None:
@@ -2325,6 +2350,7 @@ class APIServerAdapter(BasePlatformAdapter):
             headers["X-Hermes-Session-Key"] = gateway_session_key
         return web.json_response(
             {
+                "atlas_email_mailbox_tainted": bool(result.get("atlas_email_mailbox_tainted")) if isinstance(result, dict) else False,
                 "object": "hermes.session.chat.completion",
                 "session_id": effective_session_id or session_id,
                 "message": {"role": "assistant", "content": final_response},
@@ -2433,6 +2459,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     "interrupted": False,
                 }))
                 await queue.put(_event_payload("run.completed", {
+                    "atlas_email_mailbox_tainted": bool(result.get("atlas_email_mailbox_tainted")) if isinstance(result, dict) else False,
                     "session_id": effective_session_id,
                     "message_id": message_id,
                     "completed": True,
@@ -3179,11 +3206,13 @@ class APIServerAdapter(BasePlatformAdapter):
         ) -> None:
             if not store:
                 return
+            from tools.atlas_email_tool import conversation_history_is_mailbox_tainted
             if conversation_history_snapshot is None:
                 conversation_history_snapshot = list(conversation_history)
                 conversation_history_snapshot.append({"role": "user", "content": user_message})
             self._response_store.put(response_id, {
                 "response": response_env,
+                "atlas_email_mailbox_tainted": self._session_is_mailbox_tainted(session_id) or conversation_history_is_mailbox_tainted(conversation_history_snapshot),
                 "conversation_history": conversation_history_snapshot,
                 "instructions": instructions,
                 "session_id": session_id,
@@ -3739,17 +3768,24 @@ class APIServerAdapter(BasePlatformAdapter):
                     entry_content = _normalize_multimodal_content(entry["content"])
                 except ValueError as exc:
                     return _multimodal_validation_error(exc, param=f"conversation_history[{i}].content")
-                conversation_history.append({"role": str(entry["role"]), "content": entry_content})
+                conversation_history.append({**entry, "role": str(entry["role"]), "content": entry_content})
             if previous_response_id:
                 logger.debug("Both conversation_history and previous_response_id provided; using conversation_history")
 
         stored_session_id = None
+        stored_tainted = False
         if not conversation_history and previous_response_id:
             stored = self._response_store.get(previous_response_id)
             if stored is None:
                 return web.json_response(_openai_error(f"Previous response not found: {previous_response_id}"), status=404)
             conversation_history = list(stored.get("conversation_history", []))
             stored_session_id = stored.get("session_id")
+            from tools.atlas_email_tool import conversation_history_is_mailbox_tainted
+            stored_tainted = bool(
+                stored.get("atlas_email_mailbox_tainted")
+                or conversation_history_is_mailbox_tainted(conversation_history)
+                or self._session_is_mailbox_tainted(stored_session_id)
+            )
             # If no instructions provided, carry forward from previous
             if instructions is None:
                 instructions = stored.get("instructions")
@@ -3819,6 +3855,7 @@ class APIServerAdapter(BasePlatformAdapter):
             agent_task = asyncio.ensure_future(self._run_agent(
                 user_message=user_message,
                 conversation_history=conversation_history,
+                atlas_email_mailbox_tainted=stored_tainted,
                 ephemeral_system_prompt=instructions,
                 session_id=session_id,
                 stream_delta_callback=_on_delta,
@@ -3858,6 +3895,7 @@ class APIServerAdapter(BasePlatformAdapter):
             return await self._run_agent(
                 user_message=user_message,
                 conversation_history=conversation_history,
+                atlas_email_mailbox_tainted=stored_tainted,
                 ephemeral_system_prompt=instructions,
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
@@ -3932,6 +3970,7 @@ class APIServerAdapter(BasePlatformAdapter):
         if store:
             self._response_store.put(response_id, {
                 "response": response_data,
+                "atlas_email_mailbox_tainted": bool(result.get("atlas_email_mailbox_tainted")) or self._session_is_mailbox_tainted(session_id),
                 "conversation_history": full_history,
                 "instructions": instructions,
                 "session_id": session_id,
@@ -4536,6 +4575,12 @@ class APIServerAdapter(BasePlatformAdapter):
         another thread to stop in-progress LLM calls.
         """
         loop = asyncio.get_running_loop()
+        from tools.atlas_email_tool import conversation_history_is_mailbox_tainted
+        atlas_email_mailbox_tainted = bool(
+            atlas_email_mailbox_tainted
+            or conversation_history_is_mailbox_tainted(conversation_history)
+            or self._session_is_mailbox_tainted(session_id)
+        )
 
         def _run():
             from gateway.session_context import clear_session_vars
@@ -4609,8 +4654,13 @@ class APIServerAdapter(BasePlatformAdapter):
                 _eff_sid = getattr(agent, "session_id", session_id)
                 if isinstance(_eff_sid, str) and _eff_sid:
                     result["session_id"] = _eff_sid
+                self._record_mailbox_taint(
+                    result, session_id, _eff_sid, tainted=atlas_email_mailbox_tainted,
+                )
                 return result, usage
             finally:
+                # Retain taint even if the run raises after reading a transcript.
+                self._record_mailbox_taint(None, session_id, tainted=atlas_email_mailbox_tainted)
                 clear_email_capability(email_token)
                 clear_query_capability(query_token)
                 clear_ownership_capability(ownership_token)
@@ -4738,16 +4788,18 @@ class APIServerAdapter(BasePlatformAdapter):
                         _openai_error(f"conversation_history[{i}] must have 'role' and 'content' fields"),
                         status=400,
                     )
-                conversation_history.append({"role": str(entry["role"]), "content": str(entry["content"])})
+                conversation_history.append({**entry, "role": str(entry["role"]), "content": str(entry["content"])})
             if previous_response_id:
                 logger.debug("Both conversation_history and previous_response_id provided; using conversation_history")
 
         stored_session_id = None
+        stored_tainted = False
         if not conversation_history and previous_response_id:
             stored = self._response_store.get(previous_response_id)
             if stored:
                 conversation_history = list(stored.get("conversation_history", []))
                 stored_session_id = stored.get("session_id")
+                stored_tainted = bool(stored.get("atlas_email_mailbox_tainted"))
                 if instructions is None:
                     instructions = stored.get("instructions")
 
@@ -4831,7 +4883,14 @@ class APIServerAdapter(BasePlatformAdapter):
                         last_event="run.cancelled",
                     )
                     return
+                from tools.atlas_email_tool import conversation_history_is_mailbox_tainted
+                runs_mailbox_tainted = bool(
+                    stored_tainted
+                    or conversation_history_is_mailbox_tainted(conversation_history)
+                    or self._session_is_mailbox_tainted(session_id)
+                )
                 agent = self._create_agent(
+                    atlas_email_mailbox_tainted=runs_mailbox_tainted,
                     ephemeral_system_prompt=ephemeral_system_prompt,
                     session_id=session_id,
                     stream_delta_callback=_text_cb,
@@ -4879,7 +4938,10 @@ class APIServerAdapter(BasePlatformAdapter):
                         unregister_gateway_notify,
                     )
 
+                    from tools.atlas_email_tool import bind_email_capability, clear_email_capability
+                    email_token = bind_email_capability("", tainted=runs_mailbox_tainted)
                     effective_task_id = session_id or run_id
+                    r = None
                     approval_token = None
                     session_tokens = []
                     try:
@@ -4897,6 +4959,11 @@ class APIServerAdapter(BasePlatformAdapter):
                             task_id=effective_task_id,
                         )
                     finally:
+                        self._record_mailbox_taint(
+                            r, session_id, getattr(agent, "session_id", None),
+                            tainted=runs_mailbox_tainted,
+                        )
+                        clear_email_capability(email_token)
                         try:
                             unregister_gateway_notify(approval_session_key)
                         finally:
