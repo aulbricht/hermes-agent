@@ -222,6 +222,32 @@ def test_control_unrestricted_profile_preserves_default_memory_skills_and_option
     assert listed["success"] is True
     assert any(s["name"] == "control-local-skill" for s in listed["skills"])
 
+    snapshot_path = prompt_builder._skills_prompt_snapshot_path()
+    snapshot_path.write_text(
+        json.dumps(
+            {
+                "version": prompt_builder._SKILLS_SNAPSHOT_VERSION,
+                "manifest": prompt_builder._build_skills_manifest(local_skills),
+                "skills": [
+                    {
+                        "skill_name": "stale-snapshot-ghost",
+                        "frontmatter_name": "stale-snapshot-ghost",
+                        "description": "Stale snapshot skill that must not appear",
+                        "category": "general",
+                        "platforms": [],
+                        "conditions": {},
+                    }
+                ],
+                "category_descriptions": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    _clear_skill_caches()
+    control_prompt_index = prompt_builder.build_skills_system_prompt()
+    assert "stale-snapshot-ghost" in control_prompt_index
+    assert "Stale snapshot skill that must not appear" in control_prompt_index
+
 
 def test_control_existing_atlas_capability_isolation_without_strict_policy() -> None:
     """Control: Capability tools remain invisible when unbound and visible only when bound."""
@@ -1455,22 +1481,23 @@ def test_gap4_skills_external_only_excludes_local_bundled_plugin_and_stale_snaps
         "Local shadow override description",
         "LOCAL_SHADOW_OVERRIDE_BODY_404",
     )
-    snapshot_path = local_skills_dir / ".skills_prompt_snapshot.json"
+    snapshot_path = prompt_builder._skills_prompt_snapshot_path()
     snapshot_path.write_text(
         json.dumps(
             {
-                "version": 1,
-                "manifest": prompt_builder._compute_skills_manifest(local_skills_dir),
+                "version": prompt_builder._SKILLS_SNAPSHOT_VERSION,
+                "manifest": prompt_builder._build_skills_manifest(local_skills_dir),
                 "skills": [
                     {
-                        "name": "stale-snapshot-ghost",
+                        "skill_name": "stale-snapshot-ghost",
+                        "frontmatter_name": "stale-snapshot-ghost",
                         "description": "Stale snapshot skill that must not appear",
                         "category": "general",
                         "platforms": [],
-                        "conditions": [],
+                        "conditions": {},
                     }
                 ],
-                "Frontmatter": {},
+                "category_descriptions": {},
             }
         ),
         encoding="utf-8",
@@ -1501,6 +1528,7 @@ def test_gap4_skills_external_only_excludes_local_bundled_plugin_and_stale_snaps
     assert "local-untrusted-skill" not in prompt_index
     assert "Local shadow override description" not in prompt_index
     assert "stale-snapshot-ghost" not in prompt_index
+    assert "Stale snapshot skill that must not appear" not in prompt_index
 
     # 4. Namespaced plugin skill lookup outside external_dirs must be rejected
     outside_plugin_md = _write_skill(
