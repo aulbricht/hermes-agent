@@ -237,3 +237,31 @@ print(json.dumps({'callable_names': sorted(names), 'trees_unchanged': True, 'pri
         assert completed.returncode == 0, completed.stdout + completed.stderr
         results.append(json.loads(completed.stdout.strip().splitlines()[-1]))
     assert results[0] == results[1]
+
+
+@pytest.mark.parametrize('workflow', ['ownership', 'query'])
+@pytest.mark.parametrize('denied, keep_skills', [
+    ([], False),
+    (['skill_manage'], True),
+    (['skill_manage', 'skills_list', 'skill_view'], False),
+])
+def test_workflow_scope_retains_only_policy_bounded_skill_reads(
+        tmp_path, monkeypatch, workflow, denied, keep_skills):
+    from unittest.mock import patch
+    from gateway.config import PlatformConfig
+    from gateway.platforms.api_server import APIServerAdapter
+
+    _configure(tmp_path, monkeypatch, {
+        'agent': {'tool_policy': {'version': 1, 'denied_tools': denied}},
+    })
+    adapter = APIServerAdapter(PlatformConfig(enabled=True))
+    monkeypatch.setattr(adapter, '_ensure_session_db', lambda: None)
+    configured = ['skills', 'web', 'memory', 'delegation']
+    with patch('gateway.run._resolve_runtime_agent_kwargs', return_value={}), \
+         patch('gateway.run._resolve_gateway_model', return_value='test/offline-model'), \
+         patch('gateway.run._load_gateway_config', return_value={}), \
+         patch('hermes_cli.tools_config._get_platform_tools', return_value=configured), \
+         patch('run_agent.AIAgent') as constructor:
+        adapter._create_agent(**{f'atlas_{workflow}_authorized': True})
+    expected = (['skills'] if keep_skills else []) + [f'atlas_{workflow}']
+    assert constructor.call_args.kwargs['enabled_toolsets'] == expected

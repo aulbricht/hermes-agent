@@ -227,3 +227,80 @@ The duplicate scope block is removed as finding 4 requests; the earlier shared
 validator retains its behavior. Prior PM amendments are quoted and mapped above;
 the latest resume direction is met by these repairs. Exact-head CI and independent
 reviews remain incomplete until their actual receipts exist.
+
+
+## Same-PR CI repair at 53d70e1a
+
+PM released this repair in comments `bdee343e-6243-4aeb-8d9e-8f886f232e20`
+and `c9cacdaa-0b30-4e8f-86a3-68c63816c49f`. Their direction supersedes the
+historical publication hold above. Workflow 44731204175 failed at exact head
+53d70e1a03a217d113b59b0894de5d665dd5abda; the four failing files were traced:
+
+- `tests/tools/test_code_execution.py`: two old assertions required empty or
+  nonoverlapping enabled names to grant every sandbox tool. Those expectations
+  conflict with the adopted directive, "Enforce supplied enabled_tools membership,
+  treating [] as empty." Replaced them with ImportError and zero-dispatch
+  assertions. The None/default positive control and subset tests remain.
+- `tests/run_agent/test_run_agent.py`: seventeen failures came from the fixture
+  advertising only web_search, then exercising unadvertised memory, browser_type,
+  todo or write_file calls, or mutating a frozen callable set. The fixture now
+  advertises those tools at construction; three obsolete post-construction add
+  calls are removed. Every existing behavior assertion remains unchanged.
+- `tests/run_agent/test_token_persistence_non_cli.py`: the lazy database test
+  constructed an agent advertising zero tools. Only that caller now advertises
+  session_search before initialization; token persistence callers still have no
+  tools, and all existing assertions remain.
+- `tests/gateway/test_atlas_ownership_tool.py`: twenty-four failures exposed the
+  unrestricted profile's writable skills toolset surviving ownership narrowing.
+  Ownership and query now use the same read-only-skill predicate as email taint:
+  retain requested/configured skills only when policy removes every unsafe tool.
+  This preserves the default capability-only boundary and the opted-in contract.
+  That entire test file stays unchanged. Six added controls cover both workflows
+  with writable, read-only and fully denied skill inventories. Signed real-agent
+  workflow cases remain unchanged and cover actual callable schemas/dispatch.
+
+Choice: fix fixture construction instead of allowing unadvertised calls, because
+per-agent callable ceilings are immutable. Preserve the old ordinary capability
+boundary instead of granting skill_manage during ownership/query. Flag either
+choice for independent review if a different contract is intended.
+
+Current repair validation:
+
+```text
+scripts/run_tests.sh -j 2 tests/run_agent/test_run_agent.py tests/run_agent/test_token_persistence_non_cli.py tests/tools/test_code_execution.py tests/gateway/test_atlas_ownership_tool.py tests/gateway/test_profile_policy_regressions.py tests/gateway/test_profile_policy_and_scope_sno4027_attack.py -q
+error: no virtualenv found (.venv points to missing /tmp/sno4028_venv)
+.venv/bin/python -m ruff check gateway/platforms/api_server.py tests/run_agent/test_run_agent.py tests/run_agent/test_token_persistence_non_cli.py tests/tools/test_code_execution.py tests/gateway/test_profile_policy_regressions.py
+No such file or directory
+python3 -m py_compile gateway/platforms/api_server.py tests/run_agent/test_run_agent.py tests/run_agent/test_token_persistence_non_cli.py tests/tools/test_code_execution.py tests/gateway/test_profile_policy_regressions.py
+exit 0
+git diff --check
+exit 0
+sha256sum tests/gateway/test_profile_policy_and_scope_sno4027_attack.py
+8c210dede0a2a65415fa1040939e3b76be42f36ab78f5a98dea630ec84b7fc96
+```
+
+Pytest and Ruff are **not verified locally** for this repair. No install, heavy
+suite or live/provider operation ran. Required CI must run the four failure files,
+new controls, frozen packet and sibling email/query paths before acceptance.
+
+Rework accounting uses `git diff 0c1d77b8048c6e61abfb2c90bcae0ec37cfcbec7 HEAD --stat`
+(last reviewed checkpoint) and `git diff 53d70e1a HEAD --stat` (CI repair delta).
+No deleted tests, weakened assertions, signed-packet edits or reverted accepted
+source changes. Two sandbox allowance expectations are explicitly replaced with
+stricter refusal expectations as authorized by the directive quoted above and
+PM's "distinguish obsolete expectations from regressions using the adopted
+contract". Three fixture mutations are retired under the immutable-ceiling
+contract; their tests and assertions remain. Existing email and ownership tests
+are unchanged.
+
+Latest PM amendments: "Trace and repair all failures and sibling paths" is met by
+the four-file diagnosis and shared ownership/query/email predicate; runtime
+success remains for CI to establish. "Continue the existing branch/PR, update
+same-PR as-built, push the repair" is met by this additive repair on PR 35.
+"Preserve frozen tests and security ceilings" is met by unchanged signed bytes,
+no broadened production permissions and fixture-only setup repairs. "All three
+stages were retained; final acceptance requires their verdicts and exact-head
+green CI" remains a gate, not a completion claim. No re-attack or extra PM
+checkpoint is introduced. Atlas packaging, original fixture installation and
+compatible reviewed pin stay with SNO-3379; source acceptance does not depend
+cyclically on that downstream pin.

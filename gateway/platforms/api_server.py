@@ -1611,6 +1611,20 @@ class APIServerAdapter(BasePlatformAdapter):
             # Request scope can only remove configured tools. Keep it local to
             # this agent instance; the API server's default remains unchanged.
             enabled_toolsets = sorted(set(enabled_toolsets).intersection(toolset_scope))
+        from tools.atlas_email_tool import TAINT_ALLOWED_READ_ONLY_TOOLS
+        from tools.profile_policy import effective_tool_policy
+        from toolsets import resolve_toolset
+        policy = effective_tool_policy()
+
+        def safe_skill_reads(name):
+            # Retain the requested skills toolset only when profile policy
+            # has removed every tool other than the existing safe reads.
+            # Writable skills stay excluded from capability-restricted turns.
+            if name != 'skills':
+                return False
+            callable_names = set(resolve_toolset(name)) - policy.denied_tools
+            return bool(callable_names) and callable_names <= TAINT_ALLOWED_READ_ONLY_TOOLS
+
         if atlas_import_authorized:
             enabled_toolsets.append("atlas_import")
         ownership_luna = (atlas_ownership_authorized and model == "openai/gpt-6-luna"
@@ -1619,7 +1633,7 @@ class APIServerAdapter(BasePlatformAdapter):
             # Ownership evidence is untrusted input and may contain personal
             # data. Enforce its boundary here even if caller scope is absent
             # or broad; configured outbound/persistent tools must not survive.
-            enabled_toolsets = [n for n in enabled_toolsets if n == "skills"] + ["atlas_ownership"]
+            enabled_toolsets = [n for n in enabled_toolsets if safe_skill_reads(n)] + ["atlas_ownership"]
             if ownership_luna:
                 # Ownership must emit a proposal after reasoning: the shared
                 # 8192/xhigh profile exhausted its budget before the save call.
@@ -1629,8 +1643,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 runtime_kwargs["max_tokens"] = 65536
                 reasoning_config = {"enabled": True, "effort": "medium"}
         if atlas_query_authorized:
-            # Query turns see only the Atlas query tool, whatever scope was sent.
-            enabled_toolsets = [n for n in enabled_toolsets if n == "skills"] + ["atlas_query"]
+            # Query retains only policy-bounded skill reads beside its capability.
+            enabled_toolsets = [n for n in enabled_toolsets if safe_skill_reads(n)] + ["atlas_query"]
             runtime_kwargs["max_tokens"] = ATLAS_QUERY_TURN_MAX_OUTPUT_TOKENS
         if atlas_email_authorized and not (atlas_ownership_authorized or atlas_query_authorized):
             # Unlike Queries, an email turn is an ordinary chat turn: the email
@@ -1641,19 +1655,7 @@ class APIServerAdapter(BasePlatformAdapter):
         if atlas_email_mailbox_tainted:
             # An earlier turn read mailbox content: no egress-capable toolset, however
             # it was configured or requested through toolset_scope.
-            from tools.atlas_email_tool import taint_blocks_toolset, TAINT_ALLOWED_READ_ONLY_TOOLS
-            from tools.profile_policy import effective_tool_policy
-            from toolsets import resolve_toolset
-            policy = effective_tool_policy()
-
-            def safe_skill_reads(name):
-                # Retain the requested skills toolset only when profile policy
-                # has removed every tool other than the existing safe reads.
-                # The ordinary profile's skill_manage remains taint-blocked.
-                if name != 'skills':
-                    return False
-                callable_names = set(resolve_toolset(name)) - policy.denied_tools
-                return bool(callable_names) and callable_names <= TAINT_ALLOWED_READ_ONLY_TOOLS
+            from tools.atlas_email_tool import taint_blocks_toolset
 
             enabled_toolsets = sorted(
                 name for name in enabled_toolsets

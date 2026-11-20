@@ -100,7 +100,13 @@ def agent():
     """Minimal AIAgent with mocked OpenAI client and tool loading."""
     with (
         patch(
-            "run_agent.get_tool_definitions", return_value=_make_tool_defs("web_search")
+            "run_agent.get_tool_definitions",
+            # Execution controls must advertise their tools before the agent
+            # freezes its callable ceiling; assertions still exercise the real
+            # middleware, redaction, hooks and truncation-recovery paths.
+            return_value=_make_tool_defs(
+                "web_search", "memory", "todo", "browser_type", "write_file"
+            )
         ),
         patch("run_agent.check_toolset_requirements", return_value={}),
         patch("run_agent.OpenAI"),
@@ -5158,7 +5164,6 @@ class TestRunConversation:
         (up to 3 times). If a retry succeeds (valid JSON args), tool execution
         proceeds."""
         self._setup_agent(agent)
-        agent.valid_tool_names.add("write_file")
         bad_tc = _mock_tool_call(
             name="write_file",
             arguments='{"path":"report.md","content":"partial',
@@ -5201,7 +5206,6 @@ class TestRunConversation:
         from hermes_constants import PARTIAL_STREAM_STUB_ID
 
         self._setup_agent(agent)
-        agent.valid_tool_names.add("write_file")
         bad_tc = _mock_tool_call(
             name="write_file",
             arguments='{"path":"report.md","content":"partial',
@@ -5240,7 +5244,6 @@ class TestRunConversation:
         truncated JSON arguments should still be detected and refused rather
         than wasting 3 retry attempts."""
         self._setup_agent(agent)
-        agent.valid_tool_names.add("write_file")
         bad_tc = _mock_tool_call(
             name="write_file",
             arguments='{"path":"report.md","content":"partial',
