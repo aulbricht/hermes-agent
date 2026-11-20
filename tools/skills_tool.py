@@ -1172,7 +1172,7 @@ def skill_view(
             # Exclude skill support docs: references/templates/assets/scripts
             # are loaded through skill_view(skill, file_path=...) and must not
             # shadow or collide with real skills that share the same basename.
-            for found_md in search_dir.rglob(f"{name}.md"):
+            for found_md in iter_skill_index_files(search_dir, f"{name}.md"):
                 if found_md.name != "SKILL.md" and not _is_skill_support_path(
                     found_md
                 ):

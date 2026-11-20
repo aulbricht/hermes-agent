@@ -1,9 +1,10 @@
 # Read-only skills and workflow scopes: implementation checkpoint
 
-Source work for SNO-4027. Not accepted, published, pinned or deployed. Publication is
-held on the frozen Atlas integration fixture conflict described below. The code
-roles are capability/privacy guardrails and platform plumbing; no workflow judgment
-or new model tool is introduced.
+Source work for SNO-4027. Not accepted, pinned or deployed. The Chief PM directed
+the same builder to resume requested review changes from checkpoint `0c1d77b80`
+in comment `dbcb050a-cd64-48f5-a7f3-566599e6bc95`. The code roles are capability/privacy
+guardrails and platform plumbing; no workflow judgment or new model tool is introduced.
+The earlier fixture dispute and test receipts below are historical evidence.
 
 ## Configuration and callable contract
 
@@ -171,3 +172,58 @@ work. No second launcher, privileged helper or startup monkey patch was added.
 Concrete live MCP inventory, installed permissions and compatible reviewed Atlas
 pin remain unverified downstream release gates. Independent Argon review,
 Security, Verifier and exact-head required CI are outstanding; no Hostile QA.
+
+
+## Requested review repairs after checkpoint 0c1d77b80
+
+The Chief PM's latest direction is: "Builder: please resume the requested review
+changes from the preserved checkpoint." This supersedes the earlier source hold
+for these repairs. The three configured reviews, exact-head CI, frozen test
+ownership, and downstream packaging/pin gates remain. No attack stage was reset.
+
+- Finding 2 / AC2: legacy flat markdown lookup now uses `iter_skill_index_files`,
+  the same excluded-directory and release-root traversal as normal skill discovery.
+  Complementary tests place same-named markdown under `.git`, `node_modules/pkg`
+  and `.venv`, assert that the released skill loads, and preserve permitted nested
+  legacy markdown as a positive control.
+- Finding 3 / AC2: slash discovery uses approved roots in external-only profiles.
+  Ordinary profiles retain local-first discovery and explicit directory overrides.
+  A parameterized control checks both configurations against actual temporary
+  local/released skill files.
+- Finding 4 / AC5: removed the duplicate session scope check. The shared validator
+  still runs first and retains list/type/length/distinct/configured/known checks.
+  The unchanged signed endpoint cases cover rejection before agent work.
+- Finding 1 / AC7-8: draft publication and exact-head CI are still pending at this
+  local record. SNO-3781 revision 6 `a5e9c78f-d703-43c7-8c2c-9090d91e9738` has Security
+  sign-off in comment `48c47bf8-00b4-44d6-874d-d5f611c1da78`. Its one setup line belongs
+  to the Atlas packet; this Hermes branch does not edit Atlas files. Security's
+  recorded candidate result remains 5 failed / 4 passed, now reaching the scope
+  assertion; packaging is owned by SNO-3379. This is not released-pin proof.
+
+Current-run commands and outputs:
+
+```text
+scripts/run_tests.sh -j 1 tests/gateway/test_profile_policy_regressions.py -k 'legacy_skill_lookup or slash_discovery' -q
+error: no virtualenv found (the existing .venv -> /tmp/sno4028_venv is dangling)
+.venv/bin/python -m ruff --version
+No such file or directory
+python3 -m py_compile agent/skill_commands.py tools/skills_tool.py gateway/platforms/api_server.py tests/gateway/test_profile_policy_regressions.py
+exit 0
+git diff --check
+exit 0
+sha256sum tests/gateway/test_profile_policy_and_scope_sno4027_attack.py
+8c210dede0a2a65415fa1040939e3b76be42f36ab78f5a98dea630ec84b7fc96
+```
+
+The new pytest cases and Ruff are **not verified locally** in this run. No installs
+or heavy suites were run. Required CI must execute the focused and unchanged
+signed Hermes tests. No cross-repository rerun was possible without the test
+environment; the previous and Security-attributed receipts are not new results.
+
+Rework accounting: `git diff 0c1d77b8048c6e61abfb2c90bcae0ec37cfcbec7 HEAD --stat`
+is the delivery comparison from the last reviewed checkpoint. No deleted or
+weakened tests, no reverted accepted source changes, and no frozen test edits.
+The duplicate scope block is removed as finding 4 requests; the earlier shared
+validator retains its behavior. Prior PM amendments are quoted and mapped above;
+the latest resume direction is met by these repairs. Exact-head CI and independent
+reviews remain incomplete until their actual receipts exist.

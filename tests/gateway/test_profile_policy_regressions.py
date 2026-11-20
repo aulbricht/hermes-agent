@@ -44,6 +44,57 @@ def test_agent_rejects_missing_release_root_before_runtime_setup(tmp_path, monke
         _offline_agent(enabled_toolsets=['skills'])
 
 
+@pytest.mark.parametrize('excluded_dir', ['.git', 'node_modules/pkg', '.venv'])
+def test_legacy_skill_lookup_ignores_excluded_directories(tmp_path, monkeypatch, excluded_dir):
+    from tools.skills_tool import skill_view
+
+    release = tmp_path / 'release'
+    released_skill = release / 'fixture'
+    released_skill.mkdir(parents=True)
+    (released_skill / 'SKILL.md').write_text('RELEASED_BODY', encoding='utf-8')
+    hidden = release / excluded_dir
+    hidden.mkdir(parents=True)
+    (hidden / 'fixture.md').write_text('HIDDEN_BODY', encoding='utf-8')
+    legacy = release / 'category'
+    legacy.mkdir()
+    (legacy / 'legacy.md').write_text('LEGACY_BODY', encoding='utf-8')
+    _configure(tmp_path, monkeypatch, {
+        'skills': {'external_only': True, 'external_dirs': [str(release)]},
+    })
+
+    result = json.loads(skill_view('fixture', preprocess=False))
+    assert result['success'] is True
+    assert 'RELEASED_BODY' in result['content']
+    assert 'HIDDEN_BODY' not in result['content']
+    assert 'LEGACY_BODY' in json.loads(skill_view('legacy', preprocess=False))['content']
+
+
+@pytest.mark.parametrize('external_only', [True, False])
+def test_slash_discovery_respects_external_only_profile(tmp_path, monkeypatch, external_only):
+    from agent import skill_commands
+    from tools import skills_tool
+
+    release = tmp_path / 'release'
+    local = tmp_path / 'skills'
+    for root, name in [(release, 'released-fixture'), (local, 'local-fixture')]:
+        skill = root / name
+        skill.mkdir(parents=True)
+        (skill / 'SKILL.md').write_text(
+            f'---\nname: {name}\ndescription: Read fixture.\n---\nBODY\n', encoding='utf-8',
+        )
+    _configure(tmp_path, monkeypatch, {
+        'skills': {'external_only': external_only, 'external_dirs': [str(release)]},
+    })
+    monkeypatch.setattr(skills_tool, 'SKILLS_DIR', local)
+    monkeypatch.setattr(skill_commands, '_skill_commands', {})
+    monkeypatch.setattr(skill_commands, '_skill_commands_platform', None)
+
+    commands = skill_commands.scan_skill_commands()
+    assert '/released-fixture' in commands
+    assert ('/local-fixture' in commands) is (not external_only)
+    assert commands['/released-fixture']['skill_dir'] == str(release / 'released-fixture')
+
+
 def test_schema_cache_intersects_each_active_callable_ceiling(tmp_path, monkeypatch):
     _configure(tmp_path, monkeypatch)
     policy = get_profile_tool_policy()

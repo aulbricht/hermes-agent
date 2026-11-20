@@ -2317,21 +2317,6 @@ class APIServerAdapter(BasePlatformAdapter):
         if atlas_email_mailbox_tainted is not None and atlas_email_mailbox_tainted is not True:
             return None, web.json_response(_openai_error(
                 "Invalid mailbox taint flag", code="invalid_email_mailbox_tainted"), status=400)
-        if toolset_scope is not None:
-            if (not isinstance(toolset_scope, list) or len(toolset_scope) > 32
-                    or any(not isinstance(name, str) or not name or len(name) > 80
-                           for name in toolset_scope)
-                    or len(toolset_scope) != len(set(toolset_scope))):
-                return None, web.json_response(_openai_error(
-                    "toolset_scope must be a list of distinct toolset names",
-                    code="invalid_toolset_scope"), status=400)
-            from gateway.run import _load_gateway_config
-            from hermes_cli.tools_config import _get_platform_tools
-            configured = set(_get_platform_tools(_load_gateway_config(), "api_server")) - {"atlas_import", "atlas_ownership", "atlas_query", "atlas_email"}
-            if not set(toolset_scope).issubset(configured):
-                return None, web.json_response(_openai_error(
-                    "toolset_scope cannot enable unconfigured toolsets",
-                    code="invalid_toolset_scope"), status=400)
         return {
             "toolset_scope": toolset_scope,
             "atlas_import_capability": atlas_import_capability,
