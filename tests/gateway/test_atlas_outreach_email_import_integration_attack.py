@@ -1011,6 +1011,10 @@ async def test_cross_turn_taint_survives_executor_session_replayed_history_and_o
 
     monkeypatch.setattr(run_agent, "OpenAI", _Client)
     monkeypatch.setattr(run_agent, "AIAgent", _SyntheticAgent)
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"agent": {"environment_probe": outreach_tool.outreach_capability_available()}},
+    )
     monkeypatch.setattr("agent.agent_init.fetch_model_metadata", lambda *a, **k: None)
     monkeypatch.setattr(
         "agent.context_compressor.get_model_context_length",
