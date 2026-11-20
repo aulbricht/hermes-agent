@@ -16,9 +16,14 @@ def _mock_response(*, usage: dict, content: str = "done"):
     )
 
 
-def _make_agent(session_db, *, platform: str):
+def _make_agent(session_db, *, platform: str, tools=()):
     with (
-        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.get_tool_definitions", return_value=[
+            {"type": "function", "function": {
+                "name": name, "description": name,
+                "parameters": {"type": "object", "properties": {}},
+            }} for name in tools
+        ]),
         patch("run_agent.check_toolset_requirements", return_value={}),
         patch("run_agent.OpenAI"),
     ):
@@ -86,7 +91,7 @@ def test_session_search_lazily_opens_db_when_entrypoint_did_not_pass_one(monkeyp
     session_search_mod.session_search = fake_session_search
     monkeypatch.setitem(sys.modules, "tools.session_search_tool", session_search_mod)
 
-    agent = _make_agent(None, platform="acp")
+    agent = _make_agent(None, platform="acp", tools=("session_search",))
     result = json.loads(agent._invoke_tool("session_search", {"query": "Hermes"}, "task-id"))
 
     assert result["success"] is True

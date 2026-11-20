@@ -500,12 +500,39 @@ def get_external_skills_dirs() -> List[Path]:
     return result
 
 
+def external_only_skills() -> bool:
+    """Whether this profile permits discovery only from explicit release roots."""
+    cfg = _load_raw_config().get("skills", {})
+    value = cfg.get("external_only", False)
+    if type(value) is not bool:
+        raise ValueError("skills.external_only must be a boolean")
+    return value
+
+
+def approved_skill_roots() -> List[Path]:
+    # Discovery must stay empty if a release root disappears after startup.
+    # Initialization validates the roots separately; never fall back to local skills.
+    return [d.resolve() for d in get_external_skills_dirs() if d.is_dir()]
+
+
+def approved_skill_path(path) -> bool:
+    if not external_only_skills():
+        return True
+    try:
+        target = Path(path).resolve()
+        return any(target.is_relative_to(root) for root in approved_skill_roots())
+    except (OSError, RuntimeError):
+        return False
+
+
 def get_all_skills_dirs() -> List[Path]:
     """Return all skill directories: local ``~/.hermes/skills/`` first, then external.
 
     The local dir is always first (and always included even if it doesn't exist
     yet — callers handle that).  External dirs follow in config order.
     """
+    if external_only_skills():
+        return approved_skill_roots()
     dirs = [get_skills_dir()]
     dirs.extend(get_external_skills_dirs())
     return dirs
@@ -793,15 +820,23 @@ def iter_skill_index_files(skills_dir: Path, filename: str):
     """
     skills_dir_str = str(skills_dir)
     matches: list[str] = []
+    strict = external_only_skills()
+    seen = set()
     for root, dirs, files in os.walk(skills_dir_str, followlinks=True):
+        resolved = Path(root).resolve()
+        if strict and (resolved in seen or not approved_skill_path(root)):
+            dirs[:] = []
+            continue
+        seen.add(resolved)
         has_skill_md = "SKILL.md" in files
         dirs[:] = [
             d
             for d in dirs
-            if d not in EXCLUDED_SKILL_DIRS
+            if (not strict or approved_skill_path(Path(root) / d))
+            and d not in EXCLUDED_SKILL_DIRS
             and not (has_skill_md and d in SKILL_SUPPORT_DIRS)
         ]
-        if filename in files:
+        if filename in files and (not strict or approved_skill_path(Path(root) / filename)):
             matches.append(os.path.join(root, filename))
     for path in sorted(matches):
         yield Path(path)

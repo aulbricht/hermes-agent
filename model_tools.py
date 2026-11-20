@@ -316,6 +316,8 @@ def get_tool_definitions(
     # user-visible config edits that affect dynamic schemas (execute_code
     # mode, discord action allowlist, etc.) without needing an explicit
     # invalidate hook on every config-writer.
+    from tools.profile_policy import effective_tool_policy, tool_refusal, active_callable_names
+    policy = effective_tool_policy()
     if quiet_mode:
         try:
             from hermes_cli.config import get_config_path
@@ -328,6 +330,8 @@ def get_tool_definitions(
             frozenset(enabled_toolsets) if enabled_toolsets is not None else None,
             frozenset(disabled_toolsets) if disabled_toolsets else None,
             registry._generation,
+            policy,
+            active_callable_names(),
             cfg_fp,
             bool(os.environ.get("HERMES_KANBAN_TASK")),
             bool(skip_tool_search_assembly),
@@ -472,6 +476,8 @@ def _compute_tool_definitions(
     # other toolset.
 
     # Ask the registry for schemas (only returns tools whose check_fn passes)
+    from tools.profile_policy import tool_refusal
+    tools_to_include = {name for name in tools_to_include if tool_refusal(name) is None}
     filtered_tools = registry.get_definitions(tools_to_include, quiet=quiet_mode)
 
     # The set of tool names that actually passed check_fn filtering.
@@ -594,7 +600,7 @@ def _compute_tool_definitions(
     except Exception as e:  # pragma: no cover — never break tool loading
         logger.warning("Tool search assembly skipped: %s", e)
 
-    return filtered_tools
+    return [t for t in filtered_tools if tool_refusal(t['function']['name']) is None]
 
 
 def _resolve_active_context_length() -> int:
@@ -1092,6 +1098,10 @@ def handle_function_call(
     Returns:
         Function result as a JSON string.
     """
+    from tools.profile_policy import tool_refusal
+    refusal = tool_refusal(function_name, allowed_tools=enabled_tools)
+    if refusal is not None:
+        return refusal
     # Coerce string arguments to their schema-declared types (e.g. "42"→42)
     function_args = coerce_tool_args(function_name, function_args)
     if not isinstance(function_args, dict):
@@ -1131,6 +1141,7 @@ def handle_function_call(
             ) or []
         except Exception:
             current_defs = []
+        current_defs = [d for d in current_defs if tool_refusal(d["function"]["name"], allowed_tools=enabled_tools) is None]
         if function_name == _ts_mod.TOOL_SEARCH_NAME:
             return _ts_mod.dispatch_tool_search(function_args or {},
                                                 current_tool_defs=current_defs)
@@ -1290,7 +1301,7 @@ def handle_function_call(
             if function_name == "execute_code":
                 # Prefer the caller-provided list so subagents can't overwrite
                 # the parent's tool set via the process-global.
-                sandbox_enabled = enabled_tools if enabled_tools is not None else _last_resolved_tool_names
+                sandbox_enabled = enabled_tools
                 def _dispatch(next_args: Dict[str, Any]) -> Any:
                     return registry.dispatch(
                         function_name, next_args,
