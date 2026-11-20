@@ -73,6 +73,11 @@ def _read_arguments(operation: str, arguments: dict) -> tuple[dict | None, str |
 
 
 def _forward_operation(operation: str, arguments: dict) -> str:
+    # Enforce mailbox taint here too: direct handlers bypass registry dispatch.
+    from tools.atlas_email_tool import refuse_if_tainted
+    refused = refuse_if_tainted("atlas_import", "atlas_import")
+    if refused is not None:
+        return refused
     token = _capability.get()
     if not token:
         return json.dumps({"error": "Import capability unavailable"})

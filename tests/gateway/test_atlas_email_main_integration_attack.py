@@ -193,7 +193,18 @@ async def _post_session_chat(tmp_path, path_suffix, fields):
         {"atlas_email_capability": "bad"},
         {"atlas_email_capability": 42},
         {"atlas_email_capability": QRY_TOKEN},
-        {"atlas_email_capability": EMAIL_TOKEN, "atlas_import_capability": IMP_TOKEN},
+        {"atlas_email_capability": EMAIL_TOKEN, "atlas_import_capability": "bad"},
+        {"atlas_email_capability": "bad", "atlas_import_capability": IMP_TOKEN},
+        {
+            "atlas_email_capability": EMAIL_TOKEN,
+            "atlas_import_capability": IMP_TOKEN,
+            "atlas_ownership_capability": OWN_TOKEN,
+        },
+        {
+            "atlas_email_capability": EMAIL_TOKEN,
+            "atlas_import_capability": IMP_TOKEN,
+            "atlas_query_capability": QRY_TOKEN,
+        },
         {"atlas_email_capability": EMAIL_TOKEN, "atlas_ownership_capability": OWN_TOKEN},
         {"atlas_email_capability": EMAIL_TOKEN, "atlas_query_capability": QRY_TOKEN},
         {"atlas_email_mailbox_tainted": False},
@@ -240,6 +251,39 @@ async def test_session_chat_endpoints_refuse_malformed_or_combined_capabilities(
             ["web", "todo"],
         ),
         (
+            {
+                "atlas_email_capability": EMAIL_TOKEN,
+                "atlas_import_capability": IMP_TOKEN,
+                "toolset_scope": ["web"],
+            },
+            "atlas_email_capability",
+            EMAIL_TOKEN,
+            False,
+            ["web"],
+        ),
+        (
+            {
+                "atlas_email_capability": EMAIL_TOKEN,
+                "atlas_import_capability": IMP_TOKEN,
+                "atlas_email_mailbox_tainted": True,
+                "toolset_scope": ["web", "todo"],
+            },
+            "atlas_email_capability",
+            EMAIL_TOKEN,
+            True,
+            ["web", "todo"],
+        ),
+        (
+            {
+                "atlas_import_capability": IMP_TOKEN,
+                "atlas_email_mailbox_tainted": True,
+            },
+            "atlas_import_capability",
+            IMP_TOKEN,
+            True,
+            None,
+        ),
+        (
             {"atlas_email_mailbox_tainted": True},
             "atlas_email_capability",
             None,
@@ -282,6 +326,11 @@ async def test_session_chat_endpoints_forward_valid_capabilities_taint_and_scope
     assert status == 200 and len(captured) == 1
     call_kwargs = captured[0]
     assert call_kwargs.get(expected_cap_key) == expected_cap_val
+    if "atlas_import_capability" in fields:
+        assert (
+            call_kwargs.get("atlas_import_capability")
+            == fields["atlas_import_capability"]
+        )
     assert call_kwargs.get("atlas_email_mailbox_tainted") is expected_tainted
     assert call_kwargs.get("toolset_scope") == expected_scope
 
@@ -322,34 +371,107 @@ def extended_egress_probes():
 
 
 def test_tainted_run_refuses_mcp_and_external_toolsets_while_preserving_local_control(
-    email_callback, extended_egress_probes
+    email_callback, import_callback, extended_egress_probes
 ):
     _, response = email_callback
+    imp_obs, _ = import_callback
     ran, blocked_names = extended_egress_probes
+    imp_bound = import_tool.bind_import_capability(IMP_TOKEN)
+    try:
+        # Control before any mailbox read: propose does not taint, and import + probes can run.
+        assert json.loads(
+            handle_function_call("atlas_email", {"operation": "propose", "arguments": PROPOSE})
+        ) == APPROVAL
+        assert json.loads(
+            handle_function_call(
+                "atlas_import",
+                {"operation": "lookup", "arguments": {"property_query": "Wheatland"}},
+            )
+        ) == {"ok": True, "items": []}
+        assert json.loads(
+            handle_function_call(
+                "atlas_import_proposal",
+                {
+                    "operation": "change_set",
+                    "property_id": "PRO-" + "a" * 36,
+                    "change_set": [{"id": "a"}],
+                },
+            )
+        ) == {"ok": True, "items": []}
+        assert len(imp_obs) == 2
+        imp_obs.clear()
+        assert _run_tool("zz_mcp_github_probe") == {"ok": "zz_mcp_github_probe"}
+        assert _run_tool("zz_todo_control_probe") == {"ok": "zz_todo_control_probe"}
+        ran.clear()
 
-    # Control before any mailbox read: propose does not taint, and probes can run.
-    assert json.loads(
-        handle_function_call("atlas_email", {"operation": "propose", "arguments": PROPOSE})
-    ) == APPROVAL
-    assert _run_tool("zz_mcp_github_probe") == {"ok": "zz_mcp_github_probe"}
-    assert _run_tool("zz_todo_control_probe") == {"ok": "zz_todo_control_probe"}
-    ran.clear()
-
-    # Reading mailbox content taints the run.
-    response[0] = lambda request: httpx.Response(
-        200, json={"message": {"id": "m1", "body": "Untrusted body"}}
-    )
-    read_result = json.loads(
-        handle_function_call(
-            "atlas_email", {"operation": "read_message", "arguments": {"message_id": "m1"}}
+        # Reading mailbox content taints the run.
+        response[0] = lambda request: httpx.Response(
+            200, json={"message": {"id": "m1", "body": "Untrusted body"}}
         )
-    )
-    assert "untrusted_email_content" in read_result
+        read_result = json.loads(
+            handle_function_call(
+                "atlas_email", {"operation": "read_message", "arguments": {"message_id": "m1"}}
+            )
+        )
+        assert "untrusted_email_content" in read_result
 
-    for blocked_name in blocked_names:
-        assert _run_tool(blocked_name) == TAINT_REFUSED
-    assert _run_tool("zz_todo_control_probe") == {"ok": "zz_todo_control_probe"}
-    assert ran == ["zz_todo_control_probe"]
+        # Tainted run denies atlas_import and atlas_import_proposal across dispatch and direct handlers.
+        assert email_tool.taint_blocks_toolset("atlas_import") is True
+        assert "atlas_import" not in email_tool.TAINT_ALLOWED_TOOLSETS
+        assert "atlas_import" in email_tool.TAINT_BLOCKED_TOOLSETS
+        for imp_call in (
+            lambda: json.loads(
+                handle_function_call(
+                    "atlas_import",
+                    {"operation": "lookup", "arguments": {"property_query": "Wheatland"}},
+                )
+            ),
+            lambda: json.loads(
+                handle_function_call(
+                    "atlas_import_proposal",
+                    {
+                        "operation": "change_set",
+                        "property_id": "PRO-" + "a" * 36,
+                        "change_set": [{"id": "a"}],
+                    },
+                )
+            ),
+            lambda: _run_tool(
+                "atlas_import",
+                {"operation": "evidence", "arguments": {"offset": 0, "limit": 10}},
+            ),
+            lambda: _run_tool(
+                "atlas_import_proposal",
+                {
+                    "operation": "change_set",
+                    "property_id": "PRO-" + "a" * 36,
+                    "change_set": [{"id": "a"}],
+                },
+            ),
+            lambda: json.loads(
+                import_tool._handle_atlas_import(
+                    {"operation": "catalog", "arguments": {}}
+                )
+            ),
+            lambda: json.loads(
+                import_tool._handle_atlas_import_proposal(
+                    {
+                        "operation": "change_set",
+                        "property_id": "PRO-" + "a" * 36,
+                        "change_set": [{"id": "a"}],
+                    }
+                )
+            ),
+        ):
+            assert imp_call() == TAINT_REFUSED
+        assert imp_obs == []
+
+        for blocked_name in blocked_names:
+            assert _run_tool(blocked_name) == TAINT_REFUSED
+        assert _run_tool("zz_todo_control_probe") == {"ok": "zz_todo_control_probe"}
+        assert ran == ["zz_todo_control_probe"]
+    finally:
+        import_tool.clear_import_capability(imp_bound)
 
 
 def test_create_agent_strips_mcp_composite_and_external_toolsets_when_mailbox_tainted():
@@ -417,6 +539,42 @@ def test_create_agent_strips_mcp_composite_and_external_toolsets_when_mailbox_ta
             "session_search",
         } <= untainted
 
+        # Clean import and combined email+import controls (d744): untainted turns retain atlas_import
+        # (and atlas_email when both capabilities are authorized) alongside configured ambient toolsets.
+        adapter._create_agent(
+            atlas_import_authorized=True, atlas_email_mailbox_tainted=False
+        )
+        untainted_import = set(agent.call_args.kwargs["enabled_toolsets"])
+        assert {
+            "atlas_import",
+            "web",
+            "mcp-github",
+            "todo",
+            "file",
+            "memory",
+            "skills",
+            "session_search",
+        } <= untainted_import
+        assert "atlas_email" not in untainted_import
+
+        adapter._create_agent(
+            atlas_import_authorized=True,
+            atlas_email_authorized=True,
+            atlas_email_mailbox_tainted=False,
+        )
+        untainted_email_import = set(agent.call_args.kwargs["enabled_toolsets"])
+        assert {
+            "atlas_email",
+            "atlas_import",
+            "web",
+            "mcp-github",
+            "todo",
+            "file",
+            "memory",
+            "skills",
+            "session_search",
+        } <= untainted_email_import
+
         # Tainted run strips egress, persistence (file, memory, skills), transcript-reader (session_search),
         # multi-agent/plugin (kanban, project, google_meet), composite, and MCP toolsets, keeping only allow-listed toolsets.
         adapter._create_agent(
@@ -425,12 +583,23 @@ def test_create_agent_strips_mcp_composite_and_external_toolsets_when_mailbox_ta
         tainted = sorted(agent.call_args.kwargs["enabled_toolsets"])
         assert tainted == ["atlas_email", "todo"]
 
-        # Pinned ed377 control (not d744): tainted import turn keeps atlas_import and todo only.
+        # Tainted import and combined email+import controls (d744): mailbox taint strips atlas_import
+        # alongside egress/persistence/MCP toolsets, keeping only todo (and atlas_email when authorized).
         adapter._create_agent(
             atlas_import_authorized=True, atlas_email_mailbox_tainted=True
         )
         tainted_import = sorted(agent.call_args.kwargs["enabled_toolsets"])
-        assert tainted_import == ["atlas_import", "todo"]
+        assert tainted_import == ["todo"]
+        assert "atlas_import" not in tainted_import
+
+        adapter._create_agent(
+            atlas_import_authorized=True,
+            atlas_email_authorized=True,
+            atlas_email_mailbox_tainted=True,
+        )
+        tainted_email_import = sorted(agent.call_args.kwargs["enabled_toolsets"])
+        assert tainted_email_import == ["atlas_email", "todo"]
+        assert "atlas_import" not in tainted_email_import
 
 
 # ---- (a.3) Same-batch taint pre-scan under Tool Search bridge & single-line message_id ------

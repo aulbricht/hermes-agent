@@ -1499,6 +1499,7 @@ class APIServerAdapter(BasePlatformAdapter):
         atlas_ownership_authorized: bool = False,
         atlas_query_authorized: bool = False,
         atlas_email_authorized: bool = False,
+        atlas_outreach_authorized: bool = False,
         atlas_email_mailbox_tainted: bool = False,
     ) -> Any:
         """
@@ -1603,7 +1604,7 @@ class APIServerAdapter(BasePlatformAdapter):
             )
 
         user_config = _load_gateway_config()
-        enabled_toolsets = sorted(set(_get_platform_tools(user_config, "api_server")) - {"atlas_import", "atlas_ownership", "atlas_query", "atlas_email"})
+        enabled_toolsets = sorted(set(_get_platform_tools(user_config, "api_server")) - {"atlas_import", "atlas_ownership", "atlas_query", "atlas_email", "atlas_outreach"})
         if toolset_scope is not None:
             # Request scope can only remove configured tools. Keep it local to
             # this agent instance; the API server's default remains unchanged.
@@ -1629,7 +1630,7 @@ class APIServerAdapter(BasePlatformAdapter):
             # Query turns see only the Atlas query tool, whatever scope was sent.
             enabled_toolsets = ["atlas_query"]
             runtime_kwargs["max_tokens"] = ATLAS_QUERY_TURN_MAX_OUTPUT_TOKENS
-        if atlas_email_authorized and not (atlas_ownership_authorized or atlas_query_authorized):
+        if atlas_email_authorized and not (atlas_ownership_authorized or atlas_query_authorized or atlas_outreach_authorized):
             # Unlike Queries, an email turn is an ordinary chat turn: the email
             # tool is added to the ambient tools, nothing is narrowed. The
             # toolset only yields a tool while the capability is bound
@@ -1643,6 +1644,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 name for name in enabled_toolsets
                 if not taint_blocks_toolset(name)
             )
+        if atlas_outreach_authorized:
+            # Outreach turns see only the save-only Atlas outreach tool, whatever
+            # scope was sent or configured.
+            enabled_toolsets = ["atlas_outreach"]
 
         max_iterations = _current_max_iterations()
         if route and not session_override and route.get("max_iterations"):
@@ -1672,6 +1677,7 @@ class APIServerAdapter(BasePlatformAdapter):
             fallback_model=fallback_model,
             reasoning_config=reasoning_config,
             gateway_session_key=gateway_session_key,
+            skip_memory=bool(atlas_outreach_authorized),
         )
         # A Query turn that uses its last model turn ends without a summary call.
         if atlas_query_authorized:
@@ -2265,10 +2271,19 @@ class APIServerAdapter(BasePlatformAdapter):
         if (atlas_email_capability is not None and (
                 not isinstance(atlas_email_capability, str) or not re.fullmatch(
                     r"atmail_[A-Za-z0-9_-]{32,128}", atlas_email_capability)
-                or atlas_import_capability is not None or atlas_ownership_capability is not None
+                # Email may ride on an import chat turn; never with ownership or Queries.
+                or atlas_ownership_capability is not None
                 or atlas_query_capability is not None)):
             return None, web.json_response(_openai_error(
                 "Invalid email capability", code="invalid_email_capability"), status=400)
+        atlas_outreach_capability = body.get("atlas_outreach_capability")
+        if ("atlas_outreach_capability" in body and (
+                not isinstance(atlas_outreach_capability, str) or not re.fullmatch(
+                    r"atout_[A-Za-z0-9_-]{32,128}", atlas_outreach_capability)
+                or atlas_import_capability is not None or atlas_ownership_capability is not None
+                or atlas_query_capability is not None or atlas_email_capability is not None)):
+            return None, web.json_response(_openai_error(
+                "Invalid outreach capability", code="invalid_outreach_capability"), status=400)
         atlas_email_mailbox_tainted = body.get("atlas_email_mailbox_tainted")
         # Only restricts, so it may accompany any atlas_* capability.
         if atlas_email_mailbox_tainted is not None and atlas_email_mailbox_tainted is not True:
@@ -2282,19 +2297,23 @@ class APIServerAdapter(BasePlatformAdapter):
                 return None, web.json_response(_openai_error(
                     "toolset_scope must be a list of distinct toolset names",
                     code="invalid_toolset_scope"), status=400)
-            from gateway.run import _load_gateway_config
-            from hermes_cli.tools_config import _get_platform_tools
-            configured = set(_get_platform_tools(_load_gateway_config(), "api_server")) - {"atlas_import", "atlas_ownership", "atlas_query", "atlas_email"}
-            if not set(toolset_scope).issubset(configured):
-                return None, web.json_response(_openai_error(
-                    "toolset_scope cannot enable unconfigured toolsets",
-                    code="invalid_toolset_scope"), status=400)
+            if atlas_outreach_capability is None:
+                from gateway.run import _load_gateway_config
+                from hermes_cli.tools_config import _get_platform_tools
+                configured = set(_get_platform_tools(_load_gateway_config(), "api_server")) - {
+                    "atlas_import", "atlas_ownership", "atlas_query", "atlas_email", "atlas_outreach"
+                }
+                if not set(toolset_scope).issubset(configured):
+                    return None, web.json_response(_openai_error(
+                        "toolset_scope cannot enable unconfigured toolsets",
+                        code="invalid_toolset_scope"), status=400)
         return {
             "toolset_scope": toolset_scope,
             "atlas_import_capability": atlas_import_capability,
             "atlas_ownership_capability": atlas_ownership_capability,
             "atlas_query_capability": atlas_query_capability,
             "atlas_email_capability": atlas_email_capability,
+            "atlas_outreach_capability": atlas_outreach_capability,
             "atlas_email_mailbox_tainted": atlas_email_mailbox_tainted is True,
         }, None
 
@@ -4557,6 +4576,7 @@ class APIServerAdapter(BasePlatformAdapter):
         atlas_ownership_capability: Optional[str] = None,
         atlas_query_capability: Optional[str] = None,
         atlas_email_capability: Optional[str] = None,
+        atlas_outreach_capability: Optional[str] = None,
         atlas_email_mailbox_tainted: bool = False,
     ) -> tuple:
         """
@@ -4599,6 +4619,8 @@ class APIServerAdapter(BasePlatformAdapter):
             from tools.atlas_email_tool import bind_email_capability, clear_email_capability
             email_token = bind_email_capability(
                 atlas_email_capability or "", tainted=atlas_email_mailbox_tainted)
+            from tools.atlas_outreach_tool import bind_outreach_capability, clear_outreach_capability
+            outreach_token = bind_outreach_capability(atlas_outreach_capability or "")
             try:
                 agent = self._create_agent(
                     ephemeral_system_prompt=ephemeral_system_prompt,
@@ -4614,6 +4636,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     atlas_ownership_authorized=bool(atlas_ownership_capability),
                     atlas_query_authorized=bool(atlas_query_capability),
                     atlas_email_authorized=bool(atlas_email_capability),
+                    atlas_outreach_authorized=bool(atlas_outreach_capability),
                     atlas_email_mailbox_tainted=atlas_email_mailbox_tainted,
                 )
                 if atlas_route_request_id:
@@ -4661,6 +4684,7 @@ class APIServerAdapter(BasePlatformAdapter):
             finally:
                 # Retain taint even if the run raises after reading a transcript.
                 self._record_mailbox_taint(None, session_id, tainted=atlas_email_mailbox_tainted)
+                clear_outreach_capability(outreach_token)
                 clear_email_capability(email_token)
                 clear_query_capability(query_token)
                 clear_ownership_capability(ownership_token)

@@ -620,15 +620,19 @@ class ToolRegistry:
         * All exceptions are caught and returned as ``{"error": "..."}``
           for consistent error format.
         """
+        from tools.atlas_outreach_tool import outreach_capability_available
+        if outreach_capability_available() and name != "atlas_outreach_save":
+            return json.dumps({"error": "Outreach operation unavailable"})
         entry = self.get_entry(name)
         if not entry:
             return json.dumps({"error": f"Unknown tool: {name}"})
         # Atlas email taint: after mailbox content is read in a run, egress-capable
         # tools are refused here, the one point every tool call passes through.
         from tools.atlas_email_tool import refuse_if_tainted
-        refused = refuse_if_tainted(name, entry.toolset)
-        if refused is not None:
-            return refused
+        if not outreach_capability_available():
+            refused = refuse_if_tainted(name, entry.toolset)
+            if refused is not None:
+                return refused
         try:
             if entry.is_async:
                 from model_tools import _run_async

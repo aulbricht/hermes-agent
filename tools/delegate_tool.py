@@ -54,6 +54,7 @@ DELEGATE_BLOCKED_TOOLS = frozenset(
         "atlas_ownership_proposal",
         "atlas_query",  # query authority is never delegated
         "atlas_email",  # mailbox authority is never delegated
+        "atlas_outreach_save",  # outreach authority is never delegated
     ]
 )
 

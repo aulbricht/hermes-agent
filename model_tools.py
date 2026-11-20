@@ -308,6 +308,9 @@ def get_tool_definitions(
     query_allowed = query_capability_available() and enabled_toolsets is not None and "atlas_query" in enabled_toolsets
     from tools.atlas_email_tool import email_capability_available
     email_allowed = email_capability_available() and enabled_toolsets is not None and "atlas_email" in enabled_toolsets
+    from tools.atlas_outreach_tool import outreach_capability_available
+    outreach_bound = outreach_capability_available()
+    outreach_allowed = outreach_bound and enabled_toolsets is not None and "atlas_outreach" in enabled_toolsets
     # Fast path: memoized result when the caller doesn't need stdout prints.
     # The cache key captures every argument-level input; the registry
     # generation captures registry mutations (MCP refresh, plugin load).
@@ -335,6 +338,8 @@ def get_tool_definitions(
             ownership_allowed,
             query_allowed,
             email_allowed,
+            outreach_bound,
+            outreach_allowed,
         )
         cached = _tool_defs_cache.get(cache_key)
         if cached is not None:
@@ -383,6 +388,9 @@ def _compute_tool_definitions(
     query_allowed = query_capability_available() and enabled_toolsets is not None and "atlas_query" in enabled_toolsets
     from tools.atlas_email_tool import email_capability_available
     email_allowed = email_capability_available() and enabled_toolsets is not None and "atlas_email" in enabled_toolsets
+    from tools.atlas_outreach_tool import outreach_capability_available
+    outreach_bound = outreach_capability_available()
+    outreach_allowed = outreach_bound and enabled_toolsets is not None and "atlas_outreach" in enabled_toolsets
 
     if enabled_toolsets is not None:
         effective_enabled_toolsets = list(enabled_toolsets)
@@ -415,6 +423,8 @@ def _compute_tool_definitions(
         tools_to_include.discard("atlas_query")
     if not email_allowed:
         tools_to_include.discard("atlas_email")
+    if not outreach_allowed:
+        tools_to_include.discard("atlas_outreach_save")
     if not ownership_allowed:
         tools_to_include.discard("atlas_ownership")
         tools_to_include.discard("atlas_ownership_proposal")
@@ -464,6 +474,8 @@ def _compute_tool_definitions(
                     print(f"🚫 Disabled legacy toolset '{toolset_name}': {', '.join(legacy_tools)}")
             elif not quiet_mode:
                 print(f"⚠️  Unknown toolset: {toolset_name}")
+    if outreach_bound:
+        tools_to_include = {"atlas_outreach_save"} if outreach_allowed else set()
 
     # Plugin-registered tools are now resolved through the normal toolset
     # path — validate_toolset() / resolve_toolset() / get_all_toolsets()
@@ -577,7 +589,7 @@ def _compute_tool_definitions(
     try:
         from tools.tool_search import assemble_tool_defs, load_config as _load_ts_config
         ts_cfg = _load_ts_config()
-        if not skip_tool_search_assembly and ts_cfg.enabled != "off":
+        if not skip_tool_search_assembly and not outreach_bound and ts_cfg.enabled != "off":
             context_length = _resolve_active_context_length()
             assembly = assemble_tool_defs(
                 filtered_tools,
@@ -725,7 +737,12 @@ def coerce_tool_args(tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         # ``None`` itself is preserved — we don't know whether the model
         # meant "omit" or "empty list", and tools with sensible defaults
         # (e.g. read_file's normalize_read_pagination) already handle it.
-        if expected == "array" and value is not None and not isinstance(value, (list, tuple)):
+        if (
+            expected == "array"
+            and tool_name != "atlas_outreach_save"
+            and value is not None
+            and not isinstance(value, (list, tuple))
+        ):
             if isinstance(value, str):
                 coerced = _coerce_value(value, expected, schema=prop_schema)
                 if coerced is not value:
@@ -1092,8 +1109,13 @@ def handle_function_call(
     Returns:
         Function result as a JSON string.
     """
+    from tools.atlas_outreach_tool import outreach_capability_available
+    if outreach_capability_available() and function_name != "atlas_outreach_save":
+        return json.dumps({"error": "Outreach operation unavailable"})
+
     # Coerce string arguments to their schema-declared types (e.g. "42"→42)
-    function_args = coerce_tool_args(function_name, function_args)
+    if function_name != "atlas_outreach_save":
+        function_args = coerce_tool_args(function_name, function_args)
     if not isinstance(function_args, dict):
         function_args = {}
     _tool_middleware_trace = list(tool_request_middleware_trace or [])

@@ -547,8 +547,11 @@ def build_turn_context(
         agent._interrupt_message = None
         agent._interrupt_thread_signal_pending = False
 
+    from tools.atlas_outreach_tool import outreach_capability_available
+    outreach_bound = outreach_capability_available()
+
     # Notify memory providers of the new turn (BEFORE prefetch_all).
-    if agent._memory_manager:
+    if agent._memory_manager and not outreach_bound:
         try:
             _turn_msg = original_user_message if isinstance(original_user_message, str) else ""
             agent._memory_manager.on_turn_start(agent._user_turn_count, _turn_msg)
@@ -557,7 +560,7 @@ def build_turn_context(
 
     # External memory provider: prefetch once before the tool loop.
     ext_prefetch_cache = ""
-    if agent._memory_manager:
+    if agent._memory_manager and not outreach_bound:
         try:
             _query = original_user_message if isinstance(original_user_message, str) else ""
             ext_prefetch_cache = agent._memory_manager.prefetch_all(_query) or ""

@@ -426,7 +426,9 @@ def finalize_turn(
             break
 
     from tools.atlas_email_tool import mailbox_read_this_run
+    from tools.atlas_outreach_tool import outreach_capability_available
     mailbox_tainted = mailbox_read_this_run()
+    outreach_bound = outreach_capability_available()
 
     # Build result with interrupt info if applicable
     result = {
@@ -501,7 +503,7 @@ def finalize_turn(
         agent._iters_since_skill = 0
 
     # External memory provider: sync the completed turn + queue next prefetch.
-    if not mailbox_tainted:
+    if not mailbox_tainted and not outreach_bound:
         agent._sync_external_memory_for_turn(
             original_user_message=original_user_message,
             final_response=final_response,
@@ -511,7 +513,7 @@ def finalize_turn(
 
     # Background memory/skill review — runs AFTER the response is delivered
     # so it never competes with the user's task for model attention.
-    if not mailbox_tainted and final_response and not interrupted and (_should_review_memory or _should_review_skills):
+    if not mailbox_tainted and not outreach_bound and final_response and not interrupted and (_should_review_memory or _should_review_skills):
         try:
             agent._spawn_background_review(
                 messages_snapshot=list(messages),

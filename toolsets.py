@@ -103,6 +103,11 @@ TOOLSETS = {
         "tools": ["atlas_email"],
         "includes": [],
     },
+    "atlas_outreach": {
+        "description": "Save-only Atlas neighbor outreach draft tool (requires request capability)",
+        "tools": ["atlas_outreach_save"],
+        "includes": [],
+    },
     "atlas_ownership": {
         "description": "One-turn Atlas ownership previews (requires request capability)",
         "tools": ["atlas_ownership", "atlas_ownership_proposal"],

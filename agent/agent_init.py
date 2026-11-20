@@ -1360,6 +1360,8 @@ def init_agent(
     agent._memory_nudge_interval = 10
     agent._turns_since_memory = 0
     agent._iters_since_skill = 0
+    from tools.atlas_outreach_tool import outreach_capability_available
+    skip_memory = bool(skip_memory or outreach_capability_available())
     if not skip_memory:
         try:
             mem_config = _agent_cfg.get("memory", {})

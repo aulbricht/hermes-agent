@@ -221,6 +221,9 @@ def get_environment_probe_line(*, force_refresh: bool = False) -> str:
 
     ``force_refresh`` is for tests; real callers should never need it.
     """
+    from tools.atlas_outreach_tool import outreach_capability_available
+    if outreach_capability_available():
+        return ""
     global _CACHED_LINE
     if force_refresh:
         with _CACHE_LOCK:
@@ -256,6 +259,9 @@ def warm_environment_probe_async() -> None:
     recomputing.  Called from agent init (all platforms); safe to call
     from anywhere.
     """
+    from tools.atlas_outreach_tool import outreach_capability_available
+    if outreach_capability_available():
+        return
     global _warm_started
     if _warm_started or _CACHED_LINE is not None:
         return
