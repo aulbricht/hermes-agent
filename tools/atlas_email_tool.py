@@ -51,7 +51,7 @@ _TAINT_REFUSED = '{"error":"Web tools are switched off after reading email in th
 # Start-of-turn schemas are restricted to capability-bound Atlas tools and local
 # controls. Mid-turn checks preserve the cached schema and permit safe reads.
 TAINT_ALLOWED_TOOLSETS = frozenset({
-    "atlas_email", "atlas_import", "atlas_ownership", "atlas_query", "todo", "clarify",
+    "atlas_email", "atlas_ownership", "atlas_query", "todo", "clarify",
 })
 TAINT_ALLOWED_READ_ONLY_TOOLS = frozenset({
     "read_file", "search_files", "skills_list", "skill_view", "session_search",
@@ -65,6 +65,8 @@ TAINT_BLOCKED_TOOLSETS = frozenset({
     "search", "tts", "spotify", "discord", "discord_admin", "yuanbao", "feishu_doc",
     "feishu_drive", "computer_use", "debugging", "safe", "coding", "file", "memory",
     "skills", "session_search", "kanban", "project", "context_engine",
+    # Mail read earlier in the session must not steer an Acre import proposal either.
+    "atlas_import",
 })
 
 

@@ -2271,7 +2271,8 @@ class APIServerAdapter(BasePlatformAdapter):
         if (atlas_email_capability is not None and (
                 not isinstance(atlas_email_capability, str) or not re.fullmatch(
                     r"atmail_[A-Za-z0-9_-]{32,128}", atlas_email_capability)
-                or atlas_import_capability is not None or atlas_ownership_capability is not None
+                # Email may ride on an import chat turn; never with ownership or Queries.
+                or atlas_ownership_capability is not None
                 or atlas_query_capability is not None)):
             return None, web.json_response(_openai_error(
                 "Invalid email capability", code="invalid_email_capability"), status=400)
