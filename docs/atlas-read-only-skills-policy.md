@@ -304,3 +304,79 @@ green CI" remains a gate, not a completion claim. No re-attack or extra PM
 checkpoint is introduced. Atlas packaging, original fixture installation and
 compatible reviewed pin stay with SNO-3379; source acceptance does not depend
 cyclically on that downstream pin.
+
+
+## Publication receipt for CI repair
+
+Pushed head `57cc65368` to existing draft PR 35. Exact-head CI is pending and
+has not been polled after the push. The monitor PATCH returned HTTP 400,
+Validation error: monitor.nextCheckAt and monitor.timeoutAt "Invalid ISO
+datetime" (offset-form strings rejected; the validator requires the Z form).
+No monitor timestamp was confirmed, no retry made. Returning the ticket to PM
+under the explicit failed-monitor rule. The request copied all three existing
+stages unchanged. Next actor makes one PR view request, compares headRefOid to
+the full SHA in the push comment, and checks all required checks at that head.
+No final review or completion is claimed.
+
+## Remaining prompt-fixture CI repair at 57cc65368
+
+PM amendment `64629e6e-92f7-4499-a852-b521c89fe392` says: "Trace fixture tool
+inventory and real prompt eligibility against the contract; preserve the
+negative assertion, authorized positive controls, frozen packets and immutable
+callable ceilings." Workflow 44733176494 at that head reported seven passing
+Python slices and blocking lints; slice 4 had 6,179 passes and one failure.
+Those are PM-attributed CI receipts, not new local test results.
+
+Root cause: the previous repair broadened the shared `agent` fixture's advertised
+schemas to include memory so execution tests could exercise authorized calls.
+`test_no_memory_guidance_without_tool` still consumed that shared fixture, so its
+premise was false. The real prompt builder at `agent/system_prompt.py:223` adds
+MEMORY_GUIDANCE exactly when memory belongs to `valid_tool_names`; that behavior
+is correct. The positive fixture already advertises memory before construction.
+
+Chose a dedicated `agent_without_memory_tool` fixture over changing production
+prompt eligibility or mutating an agent after initialization because the callable
+ceiling must remain immutable. It advertises only web_search before real offline
+AIAgent initialization. The negative assertion is unchanged; both positive and
+negative tests also assert the tool inventory that establishes their premise.
+The shared execution fixture retains its authorized memory tool. Existing frozen
+memory-denial controls still assert no memory/provider tools or guidance under
+the restricted profile; no signed bytes or production paths changed.
+
+Current commands and results:
+
+```text
+scripts/run_tests.sh -j 1 tests/run_agent/test_run_agent.py -k 'memory_guidance' -q
+error: no virtualenv found (.venv -> /tmp/sno4028_venv is dangling)
+.venv/bin/python -m ruff check tests/run_agent/test_run_agent.py
+No such file or directory
+python3 -m py_compile tests/run_agent/test_run_agent.py
+exit 0
+git diff --check
+exit 0
+sha256sum tests/gateway/test_profile_policy_and_scope_sno4027_attack.py
+8c210dede0a2a65415fa1040939e3b76be42f36ab78f5a98dea630ec84b7fc96
+```
+
+Pytest and Ruff are **not verified locally** for this follow-up. No installs,
+heavy local suites or provider calls ran. CI must run the complete test file,
+positive/negative memory controls, unchanged signed denial cases and all required
+checks at the new pushed head. All three native stages remain mandatory.
+
+Rework accounting: `git diff 0c1d77b8048c6e61abfb2c90bcae0ec37cfcbec7 HEAD --stat`
+uses the last reviewed checkpoint. `git diff 57cc653685b2534526176b473e2330b19ccee813 HEAD --stat`
+is this repair delta. This follow-up deletes no tests, weakens no assertions and
+reverts no accepted changes; one fixture argument is replaced to restore the
+negative test's original premise. Earlier sandbox expectation replacements and
+fixture mutation removals remain enumerated with directive authority above.
+
+Latest PM amendments: "preserve the negative assertion, authorized positive
+controls, frozen packets and immutable callable ceilings" is met by fixture-only
+setup correction and stronger premise assertions. "Continue this same branch/PR,
+update same-PR as-built, push" is delivered as an additive commit on PR 35.
+"submit the actual head through existing Argon -> Security -> Verifier" and
+"exact-head green required CI and all applicable verdicts remain mandatory"
+remain gates for the monitor continuation, not claimed results. No new attack,
+checkpoint or review stage is introduced. AC3/6/7 retain their negative/positive
+memory coverage; AC8 requires actual green CI and independent verdicts. Atlas
+integration and compatible reviewed pin remain downstream with SNO-3379.

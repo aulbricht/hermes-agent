@@ -150,6 +150,26 @@ def test_persist_user_message_override_preserves_multimodal_turns(agent):
 
 
 @pytest.fixture()
+def agent_without_memory_tool():
+    """Prompt control with memory absent from the frozen callable inventory."""
+    with (
+        patch(
+            "run_agent.get_tool_definitions",
+            return_value=_make_tool_defs("web_search"),
+        ),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        return AIAgent(
+            api_key="test-k...7890",
+            base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+
+
+@pytest.fixture()
 def agent_with_memory_tool():
     """Agent whose valid_tool_names includes 'memory'."""
     with (
@@ -1264,12 +1284,15 @@ class TestBuildSystemPrompt:
     def test_memory_guidance_when_memory_tool_loaded(self, agent_with_memory_tool):
         from agent.prompt_builder import MEMORY_GUIDANCE
 
+        assert "memory" in agent_with_memory_tool.valid_tool_names
         prompt = agent_with_memory_tool._build_system_prompt()
         assert MEMORY_GUIDANCE in prompt
 
-    def test_no_memory_guidance_without_tool(self, agent):
+    def test_no_memory_guidance_without_tool(self, agent_without_memory_tool):
         from agent.prompt_builder import MEMORY_GUIDANCE
 
+        agent = agent_without_memory_tool
+        assert "memory" not in agent.valid_tool_names
         prompt = agent._build_system_prompt()
         assert MEMORY_GUIDANCE not in prompt
 
