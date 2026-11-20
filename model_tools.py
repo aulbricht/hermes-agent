@@ -737,7 +737,12 @@ def coerce_tool_args(tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         # ``None`` itself is preserved — we don't know whether the model
         # meant "omit" or "empty list", and tools with sensible defaults
         # (e.g. read_file's normalize_read_pagination) already handle it.
-        if expected == "array" and value is not None and not isinstance(value, (list, tuple)):
+        if (
+            expected == "array"
+            and tool_name != "atlas_outreach_save"
+            and value is not None
+            and not isinstance(value, (list, tuple))
+        ):
             if isinstance(value, str):
                 coerced = _coerce_value(value, expected, schema=prop_schema)
                 if coerced is not value:
@@ -1109,7 +1114,8 @@ def handle_function_call(
         return json.dumps({"error": "Outreach operation unavailable"})
 
     # Coerce string arguments to their schema-declared types (e.g. "42"→42)
-    function_args = coerce_tool_args(function_name, function_args)
+    if function_name != "atlas_outreach_save":
+        function_args = coerce_tool_args(function_name, function_args)
     if not isinstance(function_args, dict):
         function_args = {}
     _tool_middleware_trace = list(tool_request_middleware_trace or [])

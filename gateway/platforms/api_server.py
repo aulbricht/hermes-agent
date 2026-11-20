@@ -1677,6 +1677,7 @@ class APIServerAdapter(BasePlatformAdapter):
             fallback_model=fallback_model,
             reasoning_config=reasoning_config,
             gateway_session_key=gateway_session_key,
+            skip_memory=bool(atlas_outreach_authorized),
         )
         # A Query turn that uses its last model turn ends without a summary call.
         if atlas_query_authorized:
