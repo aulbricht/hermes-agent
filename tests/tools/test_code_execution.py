@@ -858,35 +858,36 @@ class TestExecuteCodeEdgeCases(unittest.TestCase):
         self.assertIn("all imports ok", result["output"])
 
     @unittest.skipIf(sys.platform == "win32", "UDS not available on Windows")
-    def test_empty_enabled_tools_uses_all(self):
-        """When enabled_tools is [] (empty), all sandbox tools should be available."""
+    def test_empty_enabled_tools_grants_no_tools(self):
+        """An explicit empty callable ceiling must not grant sandbox tools."""
         code = (
             "from hermes_tools import terminal, web_search\n"
             "print('imports ok')\n"
         )
         with patch("model_tools.handle_function_call",
-                    return_value=json.dumps({"ok": True})):
+                    return_value=json.dumps({"ok": True})) as dispatch:
             result = json.loads(execute_code(code, task_id="test-empty",
                                              enabled_tools=[]))
-        self.assertEqual(result["status"], "success")
-        self.assertIn("imports ok", result["output"])
+        self.assertEqual(result["status"], "error")
+        self.assertIn("ImportError", result["error"])
+        dispatch.assert_not_called()
 
     @unittest.skipIf(sys.platform == "win32", "UDS not available on Windows")
-    def test_nonoverlapping_tools_fallback(self):
-        """When enabled_tools has no overlap with SANDBOX_ALLOWED_TOOLS,
-        should fall back to all allowed tools."""
+    def test_nonoverlapping_tools_grants_no_tools(self):
+        """Unsupported names must not widen the sandbox callable ceiling."""
         code = (
             "from hermes_tools import terminal\n"
             "print('fallback ok')\n"
         )
         with patch("model_tools.handle_function_call",
-                    return_value=json.dumps({"ok": True})):
+                    return_value=json.dumps({"ok": True})) as dispatch:
             result = json.loads(execute_code(
                 code, task_id="test-nonoverlap",
                 enabled_tools=["vision_analyze", "browser_snapshot"],
             ))
-        self.assertEqual(result["status"], "success")
-        self.assertIn("fallback ok", result["output"])
+        self.assertEqual(result["status"], "error")
+        self.assertIn("ImportError", result["error"])
+        dispatch.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

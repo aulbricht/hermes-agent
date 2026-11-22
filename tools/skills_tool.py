@@ -66,6 +66,8 @@ Usage:
     content = skill_view("axolotl", "references/dataset-formats.md")
 """
 
+from agent.skill_utils import external_only_skills, approved_skill_path, get_all_skills_dirs
+
 import json
 import logging
 import time
@@ -692,11 +694,8 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
     # Collect directories to scan — same resolution as the scan loop below
     # (_skills_dir() resolves the LIVE profile HERMES_HOME; the module-level
     # SKILLS_DIR can be stale in long-lived runtimes).
-    dirs_to_scan: list = []
-    active_skills_dir = _skills_dir()
-    if active_skills_dir.exists():
-        dirs_to_scan.append(active_skills_dir)
-    dirs_to_scan.extend(get_external_skills_dirs())
+    dirs_to_scan = (get_all_skills_dirs() if external_only_skills()
+                    else [_skills_dir(), *get_external_skills_dirs()])
 
     signature = _skills_scan_signature(dirs_to_scan, disabled)
     now = time.monotonic()
@@ -798,7 +797,7 @@ def skills_list(category: str = None, task_id: str = None) -> str:
     """
     try:
         active_skills_dir = _skills_dir()
-        if not active_skills_dir.exists():
+        if not active_skills_dir.exists() and not external_only_skills():
             active_skills_dir.mkdir(parents=True, exist_ok=True)
             return json.dumps(
                 {
@@ -1021,6 +1020,8 @@ def skill_view(
             plugin_skill_md = pm.find_plugin_skill(name)
 
             if plugin_skill_md is not None:
+                if not approved_skill_path(plugin_skill_md):
+                    return json.dumps({"success": False, "error": "Skill outside approved release roots"})
                 if not plugin_skill_md.exists():
                     # Stale registry entry — file deleted out of band
                     pm.remove_plugin_skill(name)
@@ -1080,11 +1081,9 @@ def skill_view(
                 )
 
         # Build list of all skill directories to search
-        all_dirs = []
         active_skills_dir = _skills_dir()
-        if active_skills_dir.exists():
-            all_dirs.append(active_skills_dir)
-        all_dirs.extend(get_external_skills_dirs())
+        all_dirs = (get_all_skills_dirs() if external_only_skills()
+                    else [active_skills_dir, *get_external_skills_dirs()])
 
         if not all_dirs:
             return json.dumps(
@@ -1173,7 +1172,7 @@ def skill_view(
             # Exclude skill support docs: references/templates/assets/scripts
             # are loaded through skill_view(skill, file_path=...) and must not
             # shadow or collide with real skills that share the same basename.
-            for found_md in search_dir.rglob(f"{name}.md"):
+            for found_md in iter_skill_index_files(search_dir, f"{name}.md"):
                 if found_md.name != "SKILL.md" and not _is_skill_support_path(
                     found_md
                 ):
@@ -1217,6 +1216,9 @@ def skill_view(
                 },
                 ensure_ascii=False,
             )
+
+        if not approved_skill_path(skill_md):
+            return json.dumps({"success": False, "error": "Skill outside approved release roots"})
 
         # Read the file once — reused for platform check and main content below
         try:
@@ -1305,6 +1307,8 @@ def skill_view(
                 )
 
             target_file = skill_dir / file_path
+            if not approved_skill_path(target_file):
+                return json.dumps({"success": False, "error": "Support file outside approved release roots"})
 
             # Security: Verify resolved path is still within skill directory
             traversal_error = validate_within_dir(target_file, skill_dir)
@@ -1448,6 +1452,12 @@ def skill_view(
                     script_files.extend(
                         [str(f.relative_to(skill_dir)) for f in scripts_dir.glob(ext)]
                     )
+
+        if external_only_skills():
+            reference_files = [f for f in reference_files if approved_skill_path(skill_dir / f)]
+            template_files = [f for f in template_files if approved_skill_path(skill_dir / f)]
+            asset_files = [f for f in asset_files if approved_skill_path(skill_dir / f)]
+            script_files = [f for f in script_files if approved_skill_path(skill_dir / f)]
 
         # Read tags/related_skills with backward compat:
         # Check metadata.hermes.* first (agentskills.io convention), fall back to top-level

@@ -928,7 +928,7 @@ def _execute_remote(
 
     session_tools = set(enabled_tools) if enabled_tools else set()
     sandbox_tools = frozenset(SANDBOX_ALLOWED_TOOLS & session_tools)
-    if not sandbox_tools:
+    if enabled_tools is None:
         sandbox_tools = SANDBOX_ALLOWED_TOOLS
 
     effective_task_id = task_id or "default"
@@ -1193,7 +1193,7 @@ def execute_code(
     session_tools = set(enabled_tools) if enabled_tools else set()
     sandbox_tools = frozenset(SANDBOX_ALLOWED_TOOLS & session_tools)
 
-    if not sandbox_tools:
+    if enabled_tools is None:
         sandbox_tools = SANDBOX_ALLOWED_TOOLS
 
     # --- Set up temp directory with hermes_tools.py and script.py ---

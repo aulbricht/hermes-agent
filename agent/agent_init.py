@@ -273,6 +273,10 @@ def _merge_custom_provider_extra_body(agent, custom_providers: List[Dict[str, An
     agent.request_overrides = overrides
 
 
+from tools.profile_policy import initialize_tool_policy, memory_allowed
+
+
+@initialize_tool_policy
 def init_agent(
     agent,
     base_url: str = None,
@@ -1360,7 +1364,7 @@ def init_agent(
     agent._memory_nudge_interval = 10
     agent._turns_since_memory = 0
     agent._iters_since_skill = 0
-    if not skip_memory:
+    if not skip_memory and memory_allowed(agent):
         try:
             mem_config = _agent_cfg.get("memory", {})
             agent._memory_enabled = mem_config.get("memory_enabled", False)
@@ -1381,7 +1385,7 @@ def init_agent(
     # Memory provider plugin (external — one at a time, alongside built-in)
     # Reads memory.provider from config to select which plugin to activate.
     agent._memory_manager = None
-    if not skip_memory:
+    if not skip_memory and memory_allowed(agent):
         try:
             _mem_provider_name = mem_config.get("provider", "") if mem_config else ""
 

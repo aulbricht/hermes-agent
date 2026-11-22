@@ -25,6 +25,8 @@ Usage in run_agent.py:
 
 from __future__ import annotations
 
+from tools.profile_policy import memory_allowed
+
 import json
 import logging
 import re
@@ -81,6 +83,8 @@ def normalize_tool_schema(schema: Any) -> Optional[Dict[str, Any]]:
 
 def memory_provider_tools_enabled(enabled_toolsets: Optional[List[str]]) -> bool:
     """Return whether external memory-provider tools should be exposed."""
+    if not memory_allowed():
+        return False
     if enabled_toolsets is None:
         return True
     if not enabled_toolsets:
@@ -99,6 +103,8 @@ def memory_provider_tools_enabled(enabled_toolsets: Optional[List[str]]) -> bool
 
 def inject_memory_provider_tools(agent: Any) -> int:
     """Append external memory-provider tool schemas to an agent tool surface."""
+    if not memory_allowed(agent):
+        return 0
     memory_manager = getattr(agent, "_memory_manager", None)
     tools = getattr(agent, "tools", None)
     if not memory_manager or tools is None:
